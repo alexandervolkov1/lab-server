@@ -41,9 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for connection in listener.incoming() {
             match connection {
                 Ok(stream) => {
-                    if let Err(error) = handle_client(stream, &tcp_latest) {
-                        eprintln!("TCP client error: {error}");
-                    }
+                    let client_latest = Arc::clone(&tcp_latest);
+
+                    thread::spawn(move || {
+                        if let Err(error) = handle_client(stream, &client_latest) {
+                            eprintln!("TCP client error: {error}");
+                        }
+                    });
                 }
 
                 Err(error) => {
@@ -84,8 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     for observation in rx {
-        println!("{observation:?}");
-
         let mut guard = latest.lock().expect("Observation lock poisoned");
 
         *guard = Some(observation);
