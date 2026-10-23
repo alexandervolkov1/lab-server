@@ -2,7 +2,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::json;
 
@@ -11,6 +11,7 @@ use crate::model::{Observation, Value};
 
 mod driver;
 mod model;
+mod runtime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = serialport::new("COM3", 57_600)
@@ -19,9 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::thread::sleep(Duration::from_secs(2));
 
-    let mut reader = BufReader::new(port);
+    let reader = BufReader::new(port);
 
-    let mut driver = Arduino;
+    let driver = Arduino;
 
     let description = driver
         .signals()
@@ -31,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let signal_id = format!("arduino.{}", description.id);
 
-    println!("Signal: {} [{}]", description.id, description.unit);
+    println!("Signal: {} [{}]", signal_id, description.unit);
 
     let (tx, rx) = mpsc::channel::<Observation>();
     let latest = Arc::new(Mutex::new(None::<Observation>));
@@ -63,27 +64,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let worker = thread::spawn(move || {
-        loop {
-            let reading = driver.read(&description.id, &mut reader).and_then(|value| {
-                if description.spec.accepts(&value) {
-                    Ok(value)
-                } else {
-                    Err("Temperature out of range".to_string())
-                }
-            });
-
-            let observation = Observation {
-                source: signal_id.clone(),
-                completed_at: SystemTime::now(),
-                reading,
-            };
-
-            if tx.send(observation).is_err() {
-                break;
-            }
-
-            thread::sleep(Duration::from_secs(1));
-        }
+        runtime::run_polling(
+            driver,
+            reader,
+            description,
+            signal_id,
+            Duration::from_secs(1),
+            tx,
+        );
     });
 
     for observation in rx {
