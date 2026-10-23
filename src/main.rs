@@ -1,8 +1,10 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
 
 use crate::model::{Observation, SignalDescription, Spec, Value};
 
@@ -146,6 +148,38 @@ fn read_temperature<P: Read + Write>(reader: &mut BufReader<P>) -> Result<f64, S
     parse_sample_temp(&response).map_err(|error| error.to_string())
 }
 
+fn observation_json(observation: &Observation) -> io::Result<String> {
+    let duration = observation
+        .completed_at
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+
+    let timestamp_ms = u64::try_from(duration.as_millis()).map_err(io::Error::other)?;
+
+    let reading = match &observation.reading {
+        Ok(Value::Float(value)) => json!({
+            "status": "ok",
+            "value": {
+                "type": "float",
+                "value": value
+            }
+        }),
+
+        Err(error) => json!({
+            "status": "error",
+            "message": error
+        }),
+    };
+
+    let message = json!({
+        "source": &observation.source,
+        "completed_at_unix_ms": timestamp_ms,
+        "reading": reading
+    });
+
+    Ok(message.to_string())
+}
+
 fn handle_client(
     mut stream: TcpStream,
     latest: &Mutex<Option<Observation>>,
@@ -153,29 +187,56 @@ fn handle_client(
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
-    let mut request = String::new();
+    let mut reader = BufReader::new(stream.try_clone()?);
 
-    BufReader::new(&stream).take(64).read_line(&mut request)?;
+    loop {
+        let mut request = String::new();
 
-    if request.trim() != "GET" {
-        writeln!(stream, "ERR Unknown command")?;
-        return Ok(());
-    }
+        let bytes = reader.by_ref().take(64).read_line(&mut request)?;
 
-    let response = {
-        let guard = latest
-            .lock()
-            .map_err(|_| std::io::Error::other("Observation lock poisoned"))?;
-
-        match guard.as_ref() {
-            Some(observation) => format!("{observation:?}"),
-            None => "NO_DATA".to_string(),
+        if bytes == 0 {
+            return Ok(());
         }
-    };
 
-    writeln!(stream, "{response}")?;
+        if !request.ends_with('\n') {
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "status": "error",
+                    "message": "invalid_command_framing"
+                })
+            )?;
 
-    Ok(())
+            return Ok(());
+        }
+
+        if request.trim() != "GET" {
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "status": "error",
+                    "message": "unknown_command"
+                })
+            )?;
+
+            continue;
+        }
+
+        let response = {
+            let guard = latest
+                .lock()
+                .map_err(|_| std::io::Error::other("Observation lock poisoned"))?;
+
+            match guard.as_ref() {
+                Some(observation) => observation_json(observation)?,
+                None => json!({"status": "no_data"}).to_string(),
+            }
+        };
+
+        writeln!(stream, "{response}")?;
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +300,30 @@ mod tests {
         assert!(parse_sample_temp("SAMPLE_TEMP abc").is_err());
         assert!(parse_sample_temp("ERR").is_err());
         assert!(parse_sample_temp("SAMPLE_TEMP 23.75 extra").is_err());
+    }
+
+    #[test]
+    fn serializes_observation_as_json() {
+        let mut observation = Observation {
+            source: "arduino.sample_temperature".to_string(),
+            completed_at: UNIX_EPOCH + Duration::from_millis(1234),
+            reading: Ok(Value::Float(20.0)),
+        };
+
+        let text = observation_json(&observation).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["source"], "arduino.sample_temperature");
+        assert_eq!(json["completed_at_unix_ms"], 1234);
+        assert_eq!(json["reading"]["status"], "ok");
+        assert_eq!(json["reading"]["value"]["value"], 20.0);
+
+        observation.reading = Err("Read timeout".to_string());
+
+        let text = observation_json(&observation).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["reading"]["status"], "error");
+        assert_eq!(json["reading"]["message"], "Read timeout")
     }
 }
