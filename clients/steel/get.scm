@@ -2,6 +2,7 @@
 (require-builtin steel/time)
 (require-builtin steel/json)
 (require-builtin steel/hash)
+(require "collections.scm")
 
 (define (get-latest writer reader)
   (display "GET\n" writer)
@@ -10,21 +11,20 @@
 
 (define (show-response response)
   (if (hash-contains? response 'reading)
-    (let ((reading (hash-ref response 'reading)))
-      (if (equal? (hash-ref reading 'status) "ok")
-        (let* ((value (hash-ref reading 'value))
-               (temperature (hash-ref value 'value)))
+    (let ((reading (hash-> response reading)))
+      (if (equal? (hash-> reading status) "ok")
+        (let ((temperature (hash-> reading value value)))
           (display "Temperature: ")
           (display temperature)
           (display " degC")
           (newline))
         (begin
           (display "Measurement error: ")
-          (display (hash-ref reading 'message))
+          (display (hash-> reading message))
           (newline))))
     (begin
       (display "Server status: ")
-      (display (hash-ref response 'status))
+      (display (hash-> response status))
       (newline))))
 
 (define (poll writer reader remaining)
