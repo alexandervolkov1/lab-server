@@ -63,15 +63,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let tasks = vec![runtime::PollTask {
+        description,
+        source: signal_id,
+        period: Duration::from_secs(1),
+    }];
+
     let worker = thread::spawn(move || {
-        runtime::run_polling(
-            driver,
-            reader,
-            description,
-            signal_id,
-            Duration::from_secs(1),
-            tx,
-        );
+        runtime::run_polling(driver, reader, tasks, tx);
     });
 
     for observation in rx {
