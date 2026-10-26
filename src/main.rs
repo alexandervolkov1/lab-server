@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn observation_json(observation: &Observation) -> io::Result<String> {
+fn observation_json(id: u64, observation: &Observation) -> io::Result<String> {
     let duration = observation
         .completed_at
         .duration_since(UNIX_EPOCH)
@@ -108,12 +108,33 @@ fn observation_json(observation: &Observation) -> io::Result<String> {
     };
 
     let message = json!({
+        "id": id,
         "source": &observation.source,
         "completed_at_unix_ms": timestamp_ms,
         "reading": reading
     });
 
     Ok(message.to_string())
+}
+
+fn parse_tcp_get(line: &str) -> Result<(u64, String), &'static str> {
+    let request: serde_json::Value = serde_json::from_str(line).map_err(|_| "invalid_json")?;
+
+    let id = request["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("invalid_id")?;
+
+    if request["op"].as_str() != Some("get") {
+        return Err("unsupported_op");
+    }
+
+    let key = request["key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .ok_or("invalid_key")?;
+
+    Ok((id, key.to_owned()))
 }
 
 fn handle_client(
@@ -147,13 +168,31 @@ fn handle_client(
             return Ok(());
         }
 
-        if request.trim() != "GET" {
+        let (id, key) = match parse_tcp_get(&request) {
+            Ok(parsed) => parsed,
+
+            Err(error) => {
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "status": "error",
+                        "error": error
+                    })
+                )?;
+
+                continue;
+            }
+        };
+
+        if key != "sample_temperature" {
             writeln!(
                 stream,
                 "{}",
                 json!({
+                    "id": id,
                     "status": "error",
-                    "message": "unknown_command"
+                    "error": "unknown_key"
                 })
             )?;
 
@@ -166,8 +205,11 @@ fn handle_client(
                 .map_err(|_| std::io::Error::other("Observation lock poisoned"))?;
 
             match guard.as_ref() {
-                Some(observation) => observation_json(observation)?,
-                None => json!({"status": "no_data"}).to_string(),
+                Some(observation) => observation_json(id, observation)?,
+                None => json!({
+                    "id": id,
+                    "status": "no_data"})
+                .to_string(),
             }
         };
 
@@ -187,20 +229,43 @@ mod tests {
             reading: Ok(Value::Float(20.0)),
         };
 
-        let text = observation_json(&observation).unwrap();
+        let text = observation_json(7, &observation).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(json["source"], "arduino.sample_temperature");
         assert_eq!(json["completed_at_unix_ms"], 1234);
         assert_eq!(json["reading"]["status"], "ok");
         assert_eq!(json["reading"]["value"]["value"], 20.0);
+        assert_eq!(json["id"], 7);
 
         observation.reading = Err("Read timeout".to_string());
 
-        let text = observation_json(&observation).unwrap();
+        let text = observation_json(7, &observation).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(json["reading"]["status"], "error");
         assert_eq!(json["reading"]["message"], "Read timeout")
+    }
+
+    #[test]
+    fn parses_tcp_get() {
+        let request = r#"{"id":7,"op":"get","key":"sample_temperature"}"#;
+
+        let result = parse_tcp_get(request).unwrap();
+
+        assert_eq!(result.0, 7);
+        assert_eq!(result.1, "sample_temperature");
+
+        assert_eq!(parse_tcp_get("GET"), Err("invalid_json"));
+
+        assert_eq!(
+            parse_tcp_get(r#"{"id":0,"op":"get","key":"power"}"#),
+            Err("invalid_id")
+        );
+
+        assert_eq!(
+            parse_tcp_get(r#"{"id":1,"op":"set","key":"power"}"#),
+            Err("unsupported_op")
+        );
     }
 }
