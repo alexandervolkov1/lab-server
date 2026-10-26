@@ -1,13 +1,14 @@
 use std::time::SystemTime;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value {
     Float(f64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Observation {
     pub source: String,
+    pub unit: String,
     pub completed_at: SystemTime,
     pub reading: Result<Value, String>,
 }

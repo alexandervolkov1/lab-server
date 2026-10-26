@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reader = BufReader::new(port);
 
-    let driver = Arduino;
+    let driver = Arduino::new();
 
     let description = driver
         .signals()
@@ -30,12 +30,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|signal| signal.id == "sample_temperature")
         .expect("Arduino signal not found");
 
-    let signal_id = format!("arduino.{}", description.id);
+    let signal_id = description.id.clone();
 
     println!("Signal: {} [{}]", signal_id, description.unit);
 
     let (tx, rx) = mpsc::channel::<Observation>();
+
     let latest = Arc::new(Mutex::new(None::<Observation>));
+
+    let subscribers = Arc::new(Mutex::new(Vec::<mpsc::Sender<Observation>>::new()));
 
     let listener = TcpListener::bind("127.0.0.1:7240")?;
 
@@ -43,14 +46,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tcp_latest = Arc::clone(&latest);
 
+    let tcp_subscribers = Arc::clone(&subscribers);
+
     let _tcp_worker = thread::spawn(move || {
         for connection in listener.incoming() {
             match connection {
                 Ok(stream) => {
                     let client_latest = Arc::clone(&tcp_latest);
+                    let client_subscribers = Arc::clone(&tcp_subscribers);
 
                     thread::spawn(move || {
-                        if let Err(error) = handle_client(stream, &client_latest) {
+                        if let Err(error) =
+                            handle_client(stream, &client_latest, &client_subscribers)
+                        {
                             eprintln!("TCP client error: {error}");
                         }
                     });
@@ -74,9 +82,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     for observation in rx {
-        let mut guard = latest.lock().expect("Observation lock poisoned");
+        {
+            let mut guard = latest.lock().expect("Observation lock poisoned");
 
-        *guard = Some(observation);
+            *guard = Some(observation.clone());
+        }
+
+        let mut clients = subscribers.lock().expect("Subscribers lock poisoned");
+
+        clients.retain(|sender| sender.send(observation.clone()).is_ok());
     }
 
     worker.join().expect("Reader thread panicked");
@@ -84,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn observation_json(id: u64, observation: &Observation) -> io::Result<String> {
+fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<String> {
     let duration = observation
         .completed_at
         .duration_since(UNIX_EPOCH)
@@ -92,32 +106,38 @@ fn observation_json(id: u64, observation: &Observation) -> io::Result<String> {
 
     let timestamp_ms = u64::try_from(duration.as_millis()).map_err(io::Error::other)?;
 
-    let reading = match &observation.reading {
+    let mut message = match &observation.reading {
         Ok(Value::Float(value)) => json!({
             "status": "ok",
-            "value": {
-                "type": "float",
-                "value": value
-            }
+            "key": &observation.source,
+            "value": value,
+            "unit": &observation.unit,
+            "completed_at_unix_ms": timestamp_ms
         }),
 
         Err(error) => json!({
             "status": "error",
-            "message": error
+            "key": &observation.source,
+            "error": error,
+            "completed_at_unix_ms": timestamp_ms
         }),
     };
 
-    let message = json!({
-        "id": id,
-        "source": &observation.source,
-        "completed_at_unix_ms": timestamp_ms,
-        "reading": reading
-    });
+    match id {
+        Some(id) => message["id"] = json!(id),
+        None => message["event"] = json!("measurement"),
+    }
 
     Ok(message.to_string())
 }
 
-fn parse_tcp_get(line: &str) -> Result<(u64, String), &'static str> {
+#[derive(Debug, PartialEq)]
+enum TcpRequest {
+    Get { id: u64, key: String },
+    Subscribe { id: u64, key: String },
+}
+
+fn parse_tcp_request(line: &str) -> Result<TcpRequest, &'static str> {
     let request: serde_json::Value = serde_json::from_str(line).map_err(|_| "invalid_json")?;
 
     let id = request["id"]
@@ -125,21 +145,23 @@ fn parse_tcp_get(line: &str) -> Result<(u64, String), &'static str> {
         .filter(|id| *id > 0)
         .ok_or("invalid_id")?;
 
-    if request["op"].as_str() != Some("get") {
-        return Err("unsupported_op");
-    }
-
     let key = request["key"]
         .as_str()
         .filter(|key| !key.is_empty())
-        .ok_or("invalid_key")?;
+        .ok_or("invalid_key")?
+        .to_owned();
 
-    Ok((id, key.to_owned()))
+    match request["op"].as_str() {
+        Some("get") => Ok(TcpRequest::Get { id, key }),
+        Some("subscribe") => Ok(TcpRequest::Subscribe { id, key }),
+        _ => Err("unsupported_op"),
+    }
 }
 
 fn handle_client(
     mut stream: TcpStream,
     latest: &Mutex<Option<Observation>>,
+    subscribers: &Mutex<Vec<mpsc::Sender<Observation>>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -168,8 +190,8 @@ fn handle_client(
             return Ok(());
         }
 
-        let (id, key) = match parse_tcp_get(&request) {
-            Ok(parsed) => parsed,
+        let command = match parse_tcp_request(&request) {
+            Ok(command) => command,
 
             Err(error) => {
                 writeln!(
@@ -183,6 +205,10 @@ fn handle_client(
 
                 continue;
             }
+        };
+
+        let (id, key) = match &command {
+            TcpRequest::Get { id, key } | TcpRequest::Subscribe { id, key } => (*id, key.as_str()),
         };
 
         if key != "sample_temperature" {
@@ -199,21 +225,58 @@ fn handle_client(
             continue;
         }
 
-        let response = {
-            let guard = latest
-                .lock()
-                .map_err(|_| std::io::Error::other("Observation lock poisoned"))?;
+        match command {
+            TcpRequest::Get { id, key } => {
+                let response = {
+                    let guard = latest
+                        .lock()
+                        .map_err(|_| io::Error::other("observation lock poisoned"))?;
 
-            match guard.as_ref() {
-                Some(observation) => observation_json(id, observation)?,
-                None => json!({
-                    "id": id,
-                    "status": "no_data"})
-                .to_string(),
+                    match guard.as_ref() {
+                        Some(observation) => observation_json(Some(id), observation)?,
+
+                        None => json!({
+                            "id": id,
+                            "status": "no_data",
+                            "key": key
+                        })
+                        .to_string(),
+                    }
+                };
+
+                writeln!(stream, "{response}")?;
             }
-        };
 
-        writeln!(stream, "{response}")?;
+            TcpRequest::Subscribe { id, key } => {
+                let (tx, rx) = mpsc::channel::<Observation>();
+
+                subscribers
+                    .lock()
+                    .map_err(|_| io::Error::other("Subscribers lock poisoned"))?
+                    .push(tx);
+
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": id,
+                        "status": "ok"
+                    })
+                )?;
+
+                for observation in rx {
+                    if observation.source != key {
+                        continue;
+                    }
+
+                    let event = observation_json(None, &observation)?;
+
+                    writeln!(stream, "{event}")?;
+                }
+
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -224,47 +287,66 @@ mod tests {
     #[test]
     fn serializes_observation_as_json() {
         let mut observation = Observation {
-            source: "arduino.sample_temperature".to_string(),
+            source: "sample_temperature".to_string(),
+            unit: "degC".to_string(),
             completed_at: UNIX_EPOCH + Duration::from_millis(1234),
             reading: Ok(Value::Float(20.0)),
         };
 
-        let text = observation_json(7, &observation).unwrap();
+        let text = observation_json(Some(7), &observation).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
 
-        assert_eq!(json["source"], "arduino.sample_temperature");
-        assert_eq!(json["completed_at_unix_ms"], 1234);
-        assert_eq!(json["reading"]["status"], "ok");
-        assert_eq!(json["reading"]["value"]["value"], 20.0);
         assert_eq!(json["id"], 7);
+        assert_eq!(json["key"], "sample_temperature");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["value"], 20.0);
+        assert_eq!(json["unit"], "degC");
+        assert_eq!(json["completed_at_unix_ms"], 1234);
 
         observation.reading = Err("Read timeout".to_string());
 
-        let text = observation_json(7, &observation).unwrap();
+        let text = observation_json(Some(7), &observation).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
 
-        assert_eq!(json["reading"]["status"], "error");
-        assert_eq!(json["reading"]["message"], "Read timeout")
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"], "Read timeout");
+
+        let text = observation_json(None, &observation).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["event"], "measurement");
+        assert!(json.get("id").is_none());
     }
 
     #[test]
-    fn parses_tcp_get() {
+    fn parses_tcp_requests() {
         let request = r#"{"id":7,"op":"get","key":"sample_temperature"}"#;
 
-        let result = parse_tcp_get(request).unwrap();
-
-        assert_eq!(result.0, 7);
-        assert_eq!(result.1, "sample_temperature");
-
-        assert_eq!(parse_tcp_get("GET"), Err("invalid_json"));
+        assert_eq!(
+            parse_tcp_request(request),
+            Ok(TcpRequest::Get {
+                id: 7,
+                key: "sample_temperature".to_string()
+            })
+        );
 
         assert_eq!(
-            parse_tcp_get(r#"{"id":0,"op":"get","key":"power"}"#),
+            parse_tcp_request(r#"{"id":8,"op":"subscribe","key":"sample_temperature"}"#),
+            Ok(TcpRequest::Subscribe {
+                id: 8,
+                key: "sample_temperature".to_string()
+            })
+        );
+
+        assert_eq!(parse_tcp_request("GET"), Err("invalid_json"));
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":0,"op":"get","key":"power"}"#),
             Err("invalid_id")
         );
 
         assert_eq!(
-            parse_tcp_get(r#"{"id":1,"op":"set","key":"power"}"#),
+            parse_tcp_request(r#"{"id":1,"op":"set","key":"power"}"#),
             Err("unsupported_op")
         );
     }

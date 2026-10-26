@@ -1,7 +1,15 @@
 use crate::driver::{DeviceIo, Driver};
 use crate::model::{SignalDescription, Spec, Value};
 
-pub struct Arduino;
+pub struct Arduino {
+    next_id: u16,
+}
+
+impl Arduino {
+    pub fn new() -> Self {
+        Self { next_id: 1 }
+    }
+}
 
 impl Driver for Arduino {
     fn signals(&self) -> Vec<SignalDescription> {
@@ -20,7 +28,14 @@ impl Driver for Arduino {
             return Err(format!("Unknown Arduino parameter: {parameter}"));
         }
 
-        io.send(b"ts\n").map_err(|error| error.to_string())?;
+        let id = self.next_id;
+
+        self.next_id = if id == u16::MAX { 1 } else { id + 1 };
+
+        let command = format!("o {id} get t.sample\n");
+
+        io.send(command.as_bytes())
+            .map_err(|error| error.to_string())?;
 
         let mut response = String::new();
 
@@ -32,17 +47,23 @@ impl Driver for Arduino {
             return Err("Empty response".to_string());
         }
 
-        let temperature = parse_sample_temp(&response).map_err(|error| error.to_string())?;
+        let temperature = parse_sample_temp(&response, id).map_err(|error| error.to_string())?;
 
         Ok(Value::Float(temperature))
     }
 }
 
-fn parse_sample_temp(line: &str) -> Result<f64, &'static str> {
+fn parse_sample_temp(line: &str, request_id: u16) -> Result<f64, &'static str> {
     let mut parts = line.split_whitespace();
 
-    if parts.next() != Some("SAMPLE_TEMP") {
+    let expected_id = format!("@{request_id}");
+
+    if parts.next() != Some(expected_id.as_str()) {
         return Err("Unexpected response");
+    }
+
+    if parts.next() != Some("ok") {
+        return Err("Arduino request failed");
     }
 
     let raw_value = parts.next().ok_or("Missing temperature")?;
@@ -93,17 +114,17 @@ mod tests {
     #[test]
     fn reads_temperature() {
         let fake = FakePort {
-            input: Cursor::new(b"SAMPLE_TEMP 23.75\r\n".to_vec()),
+            input: Cursor::new(b"@1 ok 23.75\r\n".to_vec()),
             output: Vec::new(),
         };
 
         let mut port = BufReader::new(fake);
-        let mut driver = Arduino;
+        let mut driver = Arduino::new();
 
         let result = driver.read("sample_temperature", &mut port);
 
         assert_eq!(result, Ok(Value::Float(23.75)));
-        assert_eq!(port.get_ref().output, b"ts\n");
+        assert_eq!(port.get_ref().output, b"o 1 get t.sample\n");
     }
 
     #[test]
@@ -114,7 +135,7 @@ mod tests {
         };
 
         let mut port = BufReader::new(fake);
-        let mut driver = Arduino;
+        let mut driver = Arduino::new();
 
         let result = driver.read("sample_temperature", &mut port);
 
@@ -129,7 +150,7 @@ mod tests {
         };
 
         let mut port = BufReader::new(fake);
-        let mut driver = Arduino;
+        let mut driver = Arduino::new();
 
         let result = driver.read("unknown", &mut port);
 
@@ -139,9 +160,38 @@ mod tests {
 
     #[test]
     fn parses_temperature() {
-        assert_eq!(parse_sample_temp("SAMPLE_TEMP 23.75"), Ok(23.75));
-        assert!(parse_sample_temp("SAMPLE_TEMP abc").is_err());
-        assert!(parse_sample_temp("ERR").is_err());
-        assert!(parse_sample_temp("SAMPLE_TEMP 23.75 extra").is_err());
+        assert_eq!(parse_sample_temp("@7 ok 23.75", 7), Ok(23.75));
+
+        assert!(parse_sample_temp("@8 ok 23.75", 7).is_err());
+        assert!(parse_sample_temp("@7 ok abc", 7).is_err());
+        assert!(parse_sample_temp("@7 err key", 7).is_err());
+        assert!(parse_sample_temp("ERR", 7).is_err());
+        assert!(parse_sample_temp("@7 ok 23.75 extra", 7).is_err());
+    }
+
+    #[test]
+    fn increments_request_id() {
+        let fake = FakePort {
+            input: Cursor::new(b"@1 ok 20.00\n@2 ok 21.00\n".to_vec()),
+            output: Vec::new(),
+        };
+
+        let mut port = BufReader::new(fake);
+        let mut driver = Arduino::new();
+
+        assert_eq!(
+            driver.read("sample_temperature", &mut port),
+            Ok(Value::Float(20.0))
+        );
+
+        assert_eq!(
+            driver.read("sample_temperature", &mut port),
+            Ok(Value::Float(21.0))
+        );
+
+        assert_eq!(
+            port.get_ref().output,
+            b"o 1 get t.sample\no 2 get t.sample\n"
+        );
     }
 }

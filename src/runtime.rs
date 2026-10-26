@@ -82,6 +82,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
 
         let observation = Observation {
             source: task.source.clone(),
+            unit: task.description.unit.clone(),
             completed_at: SystemTime::now(),
             reading,
         };
