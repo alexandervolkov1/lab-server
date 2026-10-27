@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver = Arduino::new();
 
     let description = driver
-        .signals()
+        .parameters()
         .into_iter()
         .find(|signal| signal.id == "sample_temperature")
         .expect("Arduino signal not found");
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Signal: {} [{}]", signal_id, description.unit);
 
     let (tx, rx) = mpsc::channel::<Observation>();
+    let (command_tx, command_rx) = mpsc::channel::<runtime::SetCommand>();
 
     let latest = Arc::new(Mutex::new(None::<Observation>));
 
@@ -45,8 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("TCP server listening on {}", listener.local_addr()?);
 
     let tcp_latest = Arc::clone(&latest);
-
     let tcp_subscribers = Arc::clone(&subscribers);
+    let tcp_commands = command_tx.clone();
 
     let _tcp_worker = thread::spawn(move || {
         for connection in listener.incoming() {
@@ -54,11 +55,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(stream) => {
                     let client_latest = Arc::clone(&tcp_latest);
                     let client_subscribers = Arc::clone(&tcp_subscribers);
+                    let client_commands = tcp_commands.clone();
 
                     thread::spawn(move || {
-                        if let Err(error) =
-                            handle_client(stream, &client_latest, &client_subscribers)
-                        {
+                        if let Err(error) = handle_client(
+                            stream,
+                            &client_latest,
+                            &client_subscribers,
+                            &client_commands,
+                        ) {
                             eprintln!("TCP client error: {error}");
                         }
                     });
@@ -78,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }];
 
     let worker = thread::spawn(move || {
-        runtime::run_polling(driver, reader, tasks, tx);
+        runtime::run_polling(driver, reader, tasks, tx, command_rx);
     });
 
     for observation in rx {
@@ -107,13 +112,19 @@ fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<St
     let timestamp_ms = u64::try_from(duration.as_millis()).map_err(io::Error::other)?;
 
     let mut message = match &observation.reading {
-        Ok(Value::Float(value)) => json!({
-            "status": "ok",
-            "key": &observation.source,
-            "value": value,
-            "unit": &observation.unit,
-            "completed_at_unix_ms": timestamp_ms
-        }),
+        Ok(value) => {
+            let json_value = match value {
+                Value::Float(value) => json!(value),
+                Value::Integer(value) => json!(value),
+            };
+            json!({
+                "status": "ok",
+                "key": &observation.source,
+                "value": json_value,
+                "unit": &observation.unit,
+                "completed_at_unix_ms": timestamp_ms
+            })
+        }
 
         Err(error) => json!({
             "status": "error",
@@ -135,6 +146,7 @@ fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<St
 enum TcpRequest {
     Get { id: u64, key: String },
     Subscribe { id: u64, key: String },
+    Set { id: u64, key: String, value: Value },
 }
 
 fn parse_tcp_request(line: &str) -> Result<TcpRequest, &'static str> {
@@ -154,6 +166,17 @@ fn parse_tcp_request(line: &str) -> Result<TcpRequest, &'static str> {
     match request["op"].as_str() {
         Some("get") => Ok(TcpRequest::Get { id, key }),
         Some("subscribe") => Ok(TcpRequest::Subscribe { id, key }),
+
+        Some("set") => {
+            let value = request["value"]
+                .as_i64()
+                .map(Value::Integer)
+                .or_else(|| request["value"].as_f64().map(Value::Float))
+                .ok_or("invalid_value")?;
+
+            Ok(TcpRequest::Set { id, key, value })
+        }
+
         _ => Err("unsupported_op"),
     }
 }
@@ -162,8 +185,8 @@ fn handle_client(
     mut stream: TcpStream,
     latest: &Mutex<Option<Observation>>,
     subscribers: &Mutex<Vec<mpsc::Sender<Observation>>>,
+    commands: &mpsc::Sender<runtime::SetCommand>,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -194,24 +217,33 @@ fn handle_client(
             Ok(command) => command,
 
             Err(error) => {
-                writeln!(
-                    stream,
-                    "{}",
-                    json!({
-                        "status": "error",
-                        "error": error
-                    })
-                )?;
+                let request_id = serde_json::from_str::<serde_json::Value>(&request)
+                    .ok()
+                    .and_then(|value| value["id"].as_u64())
+                    .filter(|id| *id > 0);
+
+                let mut response = json!({
+                    "status": "error",
+                    "error": error
+                });
+
+                if let Some(id) = request_id {
+                    response["id"] = json!(id);
+                }
+
+                writeln!(stream, "{response}")?;
 
                 continue;
             }
         };
 
         let (id, key) = match &command {
-            TcpRequest::Get { id, key } | TcpRequest::Subscribe { id, key } => (*id, key.as_str()),
+            TcpRequest::Get { id, key }
+            | TcpRequest::Subscribe { id, key }
+            | TcpRequest::Set { id, key, .. } => (*id, key.as_str()),
         };
 
-        if key != "sample_temperature" {
+        if key != "sample_temperature" && !matches!(&command, TcpRequest::Set { .. }) {
             writeln!(
                 stream,
                 "{}",
@@ -242,6 +274,57 @@ fn handle_client(
                         })
                         .to_string(),
                     }
+                };
+
+                writeln!(stream, "{response}")?;
+            }
+
+            TcpRequest::Set { id, key, value } => {
+                let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
+
+                let command = runtime::SetCommand {
+                    parameter: key,
+                    value,
+                    reply: reply_tx,
+                };
+
+                if commands.send(command).is_err() {
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({
+                            "id": id,
+                            "status": "error",
+                            "error": "runtime_unavailable"
+                        })
+                    )?;
+
+                    continue;
+                }
+
+                let response = match reply_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Ok(())) => json!({
+                        "id": id,
+                        "status": "ok"
+                    }),
+
+                    Ok(Err(error)) => json!({
+                        "id": id,
+                        "status": "error",
+                        "error": error,
+                    }),
+
+                    Err(mpsc::RecvTimeoutError::Timeout) => json!({
+                        "id": id,
+                        "status": "error",
+                        "error": "runtime_timeout"
+                    }),
+
+                    Err(mpsc::RecvTimeoutError::Disconnected) => json!({
+                        "id": id,
+                        "status": "error",
+                        "error": "runtime_unavailable"
+                    }),
                 };
 
                 writeln!(stream, "{response}")?;
@@ -346,7 +429,30 @@ mod tests {
         );
 
         assert_eq!(
+            parse_tcp_request(r#"{"id":9,"op":"set","key":"power","value":10}"#),
+            Ok(TcpRequest::Set {
+                id: 9,
+                key: "power".to_string(),
+                value: Value::Integer(10),
+            })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":10,"op":"set","key":"power","value":10.5}"#),
+            Ok(TcpRequest::Set {
+                id: 10,
+                key: "power".to_string(),
+                value: Value::Float(10.5),
+            })
+        );
+
+        assert_eq!(
             parse_tcp_request(r#"{"id":1,"op":"set","key":"power"}"#),
+            Err("invalid_value")
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":1,"op":"unknown","key":"power"}"#),
             Err("unsupported_op")
         );
     }

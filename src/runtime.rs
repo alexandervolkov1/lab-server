@@ -1,14 +1,20 @@
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::driver::{DeviceIo, Driver};
-use crate::model::{Observation, SignalDescription};
+use crate::model::{Observation, ParameterDescription, Value};
 
 pub struct PollTask {
-    pub description: SignalDescription,
+    pub description: ParameterDescription,
     pub source: String,
     pub period: Duration,
+}
+
+pub struct SetCommand {
+    pub parameter: String,
+    pub value: Value,
+    pub reply: Sender<Result<(), String>>,
 }
 
 struct ScheduledPoll {
@@ -40,6 +46,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
     mut port: P,
     tasks: Vec<PollTask>,
     tx: Sender<Observation>,
+    commands: Receiver<SetCommand>,
 ) {
     assert!(!tasks.is_empty(), "At least one polling task is required");
 
@@ -65,7 +72,21 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
         let now = Instant::now();
 
         if now < deadline {
-            thread::sleep(deadline - now);
+            match commands.recv_timeout(deadline - now) {
+                Ok(command) => {
+                    let result = driver.write(&command.parameter, &command.value, &mut port);
+
+                    let _ = command.reply.send(result);
+
+                    continue;
+                }
+
+                Err(RecvTimeoutError::Timeout) => {}
+
+                Err(RecvTimeoutError::Disconnected) => {
+                    thread::sleep(deadline - now);
+                }
+            }
         }
 
         let task = &schedule[index].task;
@@ -103,13 +124,14 @@ mod tests {
 
     fn test_task(id: &str, period_ms: u64) -> PollTask {
         PollTask {
-            description: SignalDescription {
+            description: ParameterDescription {
                 id: id.to_string(),
                 spec: Spec::Float {
                     min: 0.0,
                     max: 100.0,
                 },
                 unit: "test".to_string(),
+                writable: false,
             },
 
             source: id.to_string(),

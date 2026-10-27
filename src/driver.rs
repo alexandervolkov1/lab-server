@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 
-use crate::model::{SignalDescription, Value};
+use crate::model::{ParameterDescription, Value};
 
 pub mod arduino;
 
@@ -18,7 +18,14 @@ impl<T: Read + Write> DeviceIo for BufReader<T> {
 }
 
 pub trait Driver {
-    fn signals(&self) -> Vec<SignalDescription>;
+    fn parameters(&self) -> Vec<ParameterDescription>;
 
     fn read(&mut self, parameter: &str, io: &mut dyn DeviceIo) -> Result<Value, String>;
+
+    fn write(
+        &mut self,
+        parameter: &str,
+        value: &Value,
+        io: &mut dyn DeviceIo,
+    ) -> Result<(), String>;
 }

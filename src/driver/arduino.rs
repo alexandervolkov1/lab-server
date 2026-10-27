@@ -1,5 +1,5 @@
 use crate::driver::{DeviceIo, Driver};
-use crate::model::{SignalDescription, Spec, Value};
+use crate::model::{ParameterDescription, Spec, Value};
 
 pub struct Arduino {
     next_id: u16,
@@ -12,15 +12,24 @@ impl Arduino {
 }
 
 impl Driver for Arduino {
-    fn signals(&self) -> Vec<SignalDescription> {
-        vec![SignalDescription {
-            id: "sample_temperature".to_string(),
-            spec: Spec::Float {
-                min: -250.0,
-                max: 1500.0,
+    fn parameters(&self) -> Vec<ParameterDescription> {
+        vec![
+            ParameterDescription {
+                id: "sample_temperature".to_string(),
+                spec: Spec::Float {
+                    min: -250.0,
+                    max: 1500.0,
+                },
+                unit: "degC".to_string(),
+                writable: false,
             },
-            unit: "degC".to_string(),
-        }]
+            ParameterDescription {
+                id: "power".to_string(),
+                spec: Spec::Integer { min: 0, max: 100 },
+                unit: "%".to_string(),
+                writable: true,
+            },
+        ]
     }
 
     fn read(&mut self, parameter: &str, io: &mut dyn DeviceIo) -> Result<Value, String> {
@@ -50,6 +59,68 @@ impl Driver for Arduino {
         let temperature = parse_sample_temp(&response, id).map_err(|error| error.to_string())?;
 
         Ok(Value::Float(temperature))
+    }
+
+    fn write(
+        &mut self,
+        parameter: &str,
+        value: &Value,
+        io: &mut dyn DeviceIo,
+    ) -> Result<(), String> {
+        let description = self
+            .parameters()
+            .into_iter()
+            .find(|item| item.id == parameter)
+            .ok_or_else(|| format!("Unknown Arduino parameter: {parameter}"))?;
+
+        if !description.writable {
+            return Err("Parameter is read-only".to_string());
+        }
+
+        if !description.spec.accepts(value) {
+            return Err("Value does not match parameter spec".to_string());
+        }
+
+        let id = self.next_id;
+
+        let command = match (parameter, value) {
+            ("power", Value::Integer(power)) => {
+                format!("o {id} set power {power}\n")
+            }
+
+            _ => return Err("Unsupported Arduino write".to_string()),
+        };
+
+        self.next_id = if id == u16::MAX { 1 } else { id + 1 };
+
+        io.send(command.as_bytes())
+            .map_err(|error| error.to_string())?;
+
+        let mut response = String::new();
+
+        let bytes = io
+            .read_line(&mut response)
+            .map_err(|error| error.to_string())?;
+
+        if bytes == 0 {
+            return Err("Empty response".to_string());
+        }
+
+        let mut parts = response.split_whitespace();
+
+        let expected_id = format!("@{id}");
+
+        if parts.next() != Some(expected_id.as_str()) {
+            return Err("Unexpected response".to_string());
+        }
+
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("ok"), None, None) => Ok(()),
+
+            (Some("err"), Some(reason), None) => Err(format!("Arduino error: {reason}")),
+
+            _ => Err("Unexpected response".to_string()),
+        }
     }
 }
 
@@ -193,5 +264,88 @@ mod tests {
             port.get_ref().output,
             b"o 1 get t.sample\no 2 get t.sample\n"
         );
+    }
+
+    #[test]
+    fn writes_power() {
+        let fake = FakePort {
+            input: Cursor::new(b"@1 ok 20.00\n@2 ok\n".to_vec()),
+            output: Vec::new(),
+        };
+
+        let mut port = BufReader::new(fake);
+        let mut driver = Arduino::new();
+
+        assert_eq!(
+            driver.read("sample_temperature", &mut port),
+            Ok(Value::Float(20.0))
+        );
+
+        assert_eq!(
+            driver.write("power", &Value::Integer(10), &mut port),
+            Ok(())
+        );
+
+        assert_eq!(
+            port.get_ref().output,
+            b"o 1 get t.sample\no 2 set power 10\n"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_writes() {
+        let fake = FakePort {
+            input: Cursor::new(b"@1 ok\n".to_vec()),
+            output: Vec::new(),
+        };
+
+        let mut port = BufReader::new(fake);
+        let mut driver = Arduino::new();
+
+        assert!(
+            driver
+                .write("power", &Value::Integer(-1), &mut port)
+                .is_err()
+        );
+        assert!(
+            driver
+                .write("power", &Value::Integer(101), &mut port)
+                .is_err()
+        );
+        assert!(
+            driver
+                .write("power", &Value::Float(10.0), &mut port)
+                .is_err()
+        );
+
+        assert!(
+            driver
+                .write("sample_temperature", &Value::Float(20.0), &mut port)
+                .is_err()
+        );
+
+        assert!(port.get_ref().output.is_empty());
+
+        assert_eq!(
+            driver.write("power", &Value::Integer(10), &mut port),
+            Ok(())
+        );
+
+        assert_eq!(port.get_ref().output, b"o 1 set power 10\n");
+    }
+
+    #[test]
+    fn reports_arduino_write_error() {
+        let fake = FakePort {
+            input: Cursor::new(b"@1 err range\r\n".to_vec()),
+            output: Vec::new(),
+        };
+
+        let mut port = BufReader::new(fake);
+        let mut driver = Arduino::new();
+
+        let result = driver.write("power", &Value::Integer(10), &mut port);
+
+        assert_eq!(result, Err("Arduino error: range".to_string()));
     }
 }
