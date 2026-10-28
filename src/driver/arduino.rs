@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::driver::{DeviceIo, Driver};
 use crate::model::{ParameterDescription, Spec, Value};
 
@@ -22,6 +24,7 @@ impl Driver for Arduino {
                 },
                 unit: "degC".to_string(),
                 writable: false,
+                default_poll_period: Some(Duration::from_secs(1)),
             },
             ParameterDescription {
                 id: "heater_temperature".to_string(),
@@ -31,6 +34,7 @@ impl Driver for Arduino {
                 },
                 unit: "degC".to_string(),
                 writable: false,
+                default_poll_period: Some(Duration::from_secs(1)),
             },
             ParameterDescription {
                 id: "room_temperature".to_string(),
@@ -40,12 +44,14 @@ impl Driver for Arduino {
                 },
                 unit: "degC".to_string(),
                 writable: false,
+                default_poll_period: Some(Duration::from_secs(1)),
             },
             ParameterDescription {
                 id: "power".to_string(),
                 spec: Spec::Integer { min: 0, max: 100 },
                 unit: "%".to_string(),
                 writable: true,
+                default_poll_period: Some(Duration::from_secs(1)),
             },
         ]
     }

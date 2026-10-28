@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -14,18 +14,19 @@ pub struct Observation {
     pub reading: Result<Value, String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Spec {
     Float { min: f64, max: f64 },
     Integer { min: i64, max: i64 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParameterDescription {
     pub id: String,
     pub spec: Spec,
     pub unit: String,
     pub writable: bool,
+    pub default_poll_period: Option<Duration>,
 }
 
 impl Spec {

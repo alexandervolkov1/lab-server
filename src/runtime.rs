@@ -17,6 +17,14 @@ pub struct SetCommand {
     pub reply: Sender<Result<(), String>>,
 }
 
+pub enum DeviceCommand {
+    Read {
+        description: ParameterDescription,
+        reply: Sender<Observation>,
+    },
+    Set(SetCommand),
+}
+
 struct ScheduledPoll {
     task: PollTask,
     next_at: Instant,
@@ -41,9 +49,42 @@ fn earliest_index(schedule: &[ScheduledPoll]) -> usize {
         .expect("Polling schedule must not be empty")
 }
 
-fn execute_set<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command: SetCommand) {
-    let result = driver.write(&command.parameter, &command.value, port);
-    let _ = command.reply.send(result);
+fn execute_command<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command: DeviceCommand) {
+    match command {
+        DeviceCommand::Read { description, reply } => {
+            let observation = read_observation(driver, port, &description.id, &description);
+
+            let _ = reply.send(observation);
+        }
+
+        DeviceCommand::Set(command) => {
+            let result = driver.write(&command.parameter, &command.value, port);
+
+            let _ = command.reply.send(result);
+        }
+    }
+}
+
+fn read_observation<D: Driver, P: DeviceIo>(
+    driver: &mut D,
+    port: &mut P,
+    source: &str,
+    description: &ParameterDescription,
+) -> Observation {
+    let reading = driver.read(&description.id, port).and_then(|value| {
+        if description.spec.accepts(&value) {
+            Ok(value)
+        } else {
+            Err("Value out of range".to_string())
+        }
+    });
+
+    Observation {
+        source: source.to_string(),
+        unit: description.unit.clone(),
+        completed_at: SystemTime::now(),
+        reading,
+    }
 }
 
 pub fn run_polling<D: Driver, P: DeviceIo>(
@@ -51,7 +92,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
     mut port: P,
     tasks: Vec<PollTask>,
     tx: Sender<Observation>,
-    commands: Receiver<SetCommand>,
+    commands: Receiver<DeviceCommand>,
 ) {
     assert!(!tasks.is_empty(), "At least one polling task is required");
 
@@ -79,7 +120,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
         if now < deadline {
             match commands.recv_timeout(deadline - now) {
                 Ok(command) => {
-                    execute_set(&mut driver, &mut port, command);
+                    execute_command(&mut driver, &mut port, command);
                     continue;
                 }
 
@@ -92,27 +133,13 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
         }
 
         if let Ok(command) = commands.try_recv() {
-            execute_set(&mut driver, &mut port, command);
+            execute_command(&mut driver, &mut port, command);
         }
 
         let task = &schedule[index].task;
 
-        let reading = driver
-            .read(&task.description.id, &mut port)
-            .and_then(|value| {
-                if task.description.spec.accepts(&value) {
-                    Ok(value)
-                } else {
-                    Err("Value out of range".to_string())
-                }
-            });
+        let observation = read_observation(&mut driver, &mut port, &task.source, &task.description);
 
-        let observation = Observation {
-            source: task.source.clone(),
-            unit: task.description.unit.clone(),
-            completed_at: SystemTime::now(),
-            reading,
-        };
         let period = task.period;
 
         if tx.send(observation).is_err() {
@@ -140,8 +167,8 @@ mod tests {
                 },
                 unit: "test".to_string(),
                 writable: false,
+                default_poll_period: Some(Duration::from_millis(period_ms)),
             },
-
             source: id.to_string(),
             period: Duration::from_millis(period_ms),
         }
@@ -175,7 +202,7 @@ mod tests {
 
     fn spawn_overloaded_worker(
         driver: SlowDriver,
-        commands: Receiver<SetCommand>,
+        commands: Receiver<DeviceCommand>,
     ) -> (Receiver<Observation>, thread::JoinHandle<()>) {
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -271,11 +298,11 @@ mod tests {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
 
         command_tx
-            .send(SetCommand {
+            .send(DeviceCommand::Set(SetCommand {
                 parameter: "power".to_string(),
                 value: Value::Integer(10),
                 reply: reply_tx,
-            })
+            }))
             .unwrap();
 
         let result = reply_rx.recv_timeout(Duration::from_secs(1));
@@ -288,16 +315,16 @@ mod tests {
 
     #[test]
     fn polling_continues_with_queued_writes() {
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<DeviceCommand>();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
 
         for _ in 0..100 {
             command_tx
-                .send(SetCommand {
+                .send(DeviceCommand::Set(SetCommand {
                     parameter: "power".to_string(),
                     value: Value::Integer(10),
                     reply: reply_tx.clone(),
-                })
+                }))
                 .unwrap();
         }
 
@@ -317,5 +344,39 @@ mod tests {
 
         assert_eq!(reply.unwrap(), Ok(()));
         assert!(observation.is_ok());
+    }
+
+    #[test]
+    fn reads_on_demand_during_overloaded_polling() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+
+        let (observations, worker) = spawn_overloaded_worker(
+            SlowDriver {
+                read_delay: Duration::from_millis(20),
+                write_delay: Duration::ZERO,
+            },
+            command_rx,
+        );
+
+        observations.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        command_tx
+            .send(DeviceCommand::Read {
+                description: test_task("on_demand", 10).description,
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let result = reply_rx.recv_timeout(Duration::from_secs(1));
+
+        drop(observations);
+        worker.join().unwrap();
+
+        let observation = result.unwrap();
+
+        assert_eq!(observation.source, "on_demand");
+        assert_eq!(observation.reading, Ok(Value::Float(1.0)));
     }
 }

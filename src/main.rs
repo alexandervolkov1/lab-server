@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
@@ -8,7 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use serde_json::json;
 
 use crate::driver::{Driver, arduino::Arduino};
-use crate::model::{Observation, Value};
+use crate::model::{Observation, ParameterDescription, Value};
 
 mod driver;
 mod model;
@@ -27,30 +27,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let parameters = driver.parameters();
 
-    let known_keys: Arc<HashSet<String>> = Arc::new(
+    let catalog: Arc<HashMap<String, ParameterDescription>> = Arc::new(
         parameters
             .iter()
-            .map(|parameter| parameter.id.clone())
+            .map(|parameter| (parameter.id.clone(), parameter.clone()))
             .collect(),
     );
 
     let tasks: Vec<runtime::PollTask> = parameters
         .into_iter()
-        .map(|description| {
+        .filter_map(|description| {
+            let period = description.default_poll_period?;
             let source = description.id.clone();
 
             println!("Signal: {} [{}]", source, description.unit);
 
-            runtime::PollTask {
+            Some(runtime::PollTask {
                 description,
                 source,
-                period: Duration::from_secs(1),
-            }
+                period,
+            })
         })
         .collect();
 
     let (tx, rx) = mpsc::channel::<Observation>();
-    let (command_tx, command_rx) = mpsc::channel::<runtime::SetCommand>();
+    let (command_tx, command_rx) = mpsc::channel::<runtime::DeviceCommand>();
 
     let latest = Arc::new(Mutex::new(HashMap::<String, Observation>::new()));
 
@@ -63,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_latest = Arc::clone(&latest);
     let tcp_subscribers = Arc::clone(&subscribers);
     let tcp_commands = command_tx.clone();
-    let tcp_known_keys = Arc::clone(&known_keys);
+    let tcp_catalog = Arc::clone(&catalog);
 
     let _tcp_worker = thread::spawn(move || {
         for connection in listener.incoming() {
@@ -72,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let client_latest = Arc::clone(&tcp_latest);
                     let client_subscribers = Arc::clone(&tcp_subscribers);
                     let client_commands = tcp_commands.clone();
-                    let client_known_keys = Arc::clone(&tcp_known_keys);
+                    let client_catalog = Arc::clone(&tcp_catalog);
 
                     thread::spawn(move || {
                         if let Err(error) = handle_client(
@@ -80,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &client_latest,
                             &client_subscribers,
                             &client_commands,
-                            &client_known_keys,
+                            &client_catalog,
                         ) {
                             eprintln!("TCP client error: {error}");
                         }
@@ -197,8 +198,8 @@ fn handle_client(
     mut stream: TcpStream,
     latest: &Mutex<HashMap<String, Observation>>,
     subscribers: &Mutex<Vec<mpsc::Sender<Observation>>>,
-    commands: &mpsc::Sender<runtime::SetCommand>,
-    known_keys: &HashSet<String>,
+    commands: &mpsc::Sender<runtime::DeviceCommand>,
+    catalog: &HashMap<String, ParameterDescription>,
 ) -> std::io::Result<()> {
     const MAX_REQUEST_BYTES: u64 = 4096;
 
@@ -261,7 +262,7 @@ fn handle_client(
             | TcpRequest::Set { id, key, .. } => (*id, key.as_str()),
         };
 
-        if !known_keys.contains(key) {
+        if !catalog.contains_key(key) {
             writeln!(
                 stream,
                 "{}",
@@ -277,7 +278,11 @@ fn handle_client(
 
         match command {
             TcpRequest::Get { id, key } => {
-                let response = {
+                let description = catalog
+                    .get(&key)
+                    .expect("Known parameter must have a description");
+
+                let response = if description.default_poll_period.is_some() {
                     let guard = latest
                         .lock()
                         .map_err(|_| io::Error::other("observation lock poisoned"))?;
@@ -292,6 +297,40 @@ fn handle_client(
                         })
                         .to_string(),
                     }
+                } else {
+                    let (reply_tx, reply_rx) = mpsc::channel::<Observation>();
+
+                    let command = runtime::DeviceCommand::Read {
+                        description: description.clone(),
+                        reply: reply_tx,
+                    };
+
+                    if commands.send(command).is_err() {
+                        json!({
+                            "id": id,
+                            "status": "error",
+                            "error": "runtime_unavailable"
+                        })
+                        .to_string()
+                    } else {
+                        match reply_rx.recv_timeout(Duration::from_secs(10)) {
+                            Ok(observation) => observation_json(Some(id), &observation)?,
+
+                            Err(mpsc::RecvTimeoutError::Timeout) => json!({
+                                "id": id,
+                                "status": "error",
+                                "error": "runtime_timeout"
+                            })
+                            .to_string(),
+
+                            Err(mpsc::RecvTimeoutError::Disconnected) => json!({
+                                "id": id,
+                                "status": "error",
+                                "error": "runtime_unavailable"
+                            })
+                            .to_string(),
+                        }
+                    }
                 };
 
                 writeln!(stream, "{response}")?;
@@ -300,11 +339,11 @@ fn handle_client(
             TcpRequest::Set { id, key, value } => {
                 let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
 
-                let command = runtime::SetCommand {
+                let command = runtime::DeviceCommand::Set(runtime::SetCommand {
                     parameter: key,
                     value,
                     reply: reply_tx,
-                };
+                });
 
                 if commands.send(command).is_err() {
                     writeln!(
