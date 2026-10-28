@@ -41,6 +41,11 @@ fn earliest_index(schedule: &[ScheduledPoll]) -> usize {
         .expect("Polling schedule must not be empty")
 }
 
+fn execute_set<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command: SetCommand) {
+    let result = driver.write(&command.parameter, &command.value, port);
+    let _ = command.reply.send(result);
+}
+
 pub fn run_polling<D: Driver, P: DeviceIo>(
     mut driver: D,
     mut port: P,
@@ -74,10 +79,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
         if now < deadline {
             match commands.recv_timeout(deadline - now) {
                 Ok(command) => {
-                    let result = driver.write(&command.parameter, &command.value, &mut port);
-
-                    let _ = command.reply.send(result);
-
+                    execute_set(&mut driver, &mut port, command);
                     continue;
                 }
 
@@ -87,6 +89,10 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
                     thread::sleep(deadline - now);
                 }
             }
+        }
+
+        if let Ok(command) = commands.try_recv() {
+            execute_set(&mut driver, &mut port, command);
         }
 
         let task = &schedule[index].task;
@@ -119,6 +125,8 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufReader, Cursor};
+
     use super::*;
     use crate::model::Spec;
 
@@ -137,6 +145,51 @@ mod tests {
             source: id.to_string(),
             period: Duration::from_millis(period_ms),
         }
+    }
+
+    struct SlowDriver {
+        read_delay: Duration,
+        write_delay: Duration,
+    }
+
+    impl Driver for SlowDriver {
+        fn parameters(&self) -> Vec<ParameterDescription> {
+            Vec::new()
+        }
+
+        fn read(&mut self, _parameter: &str, _io: &mut dyn DeviceIo) -> Result<Value, String> {
+            thread::sleep(self.read_delay);
+            Ok(Value::Float(1.0))
+        }
+
+        fn write(
+            &mut self,
+            _parameter: &str,
+            _value: &Value,
+            _io: &mut dyn DeviceIo,
+        ) -> Result<(), String> {
+            thread::sleep(self.write_delay);
+            Ok(())
+        }
+    }
+
+    fn spawn_overloaded_worker(
+        driver: SlowDriver,
+        commands: Receiver<SetCommand>,
+    ) -> (Receiver<Observation>, thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            let port = BufReader::new(Cursor::new(Vec::<u8>::new()));
+
+            let tasks = (0..4)
+                .map(|index| test_task(&format!("signal_{index}"), 10))
+                .collect();
+
+            run_polling(driver, port, tasks, tx, commands);
+        });
+
+        (rx, worker)
     }
 
     #[test]
@@ -199,5 +252,70 @@ mod tests {
 
             schedule[index].next_at = next_deadline(previous, period, previous);
         }
+    }
+
+    #[test]
+    fn processes_set_during_overloaded_polling() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+
+        let (observations, worker) = spawn_overloaded_worker(
+            SlowDriver {
+                read_delay: Duration::from_millis(20),
+                write_delay: Duration::ZERO,
+            },
+            command_rx,
+        );
+
+        observations.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        command_tx
+            .send(SetCommand {
+                parameter: "power".to_string(),
+                value: Value::Integer(10),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let result = reply_rx.recv_timeout(Duration::from_secs(1));
+
+        drop(observations);
+        worker.join().unwrap();
+
+        assert_eq!(result.unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn polling_continues_with_queued_writes() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        for _ in 0..100 {
+            command_tx
+                .send(SetCommand {
+                    parameter: "power".to_string(),
+                    value: Value::Integer(10),
+                    reply: reply_tx.clone(),
+                })
+                .unwrap();
+        }
+
+        let (observations, worker) = spawn_overloaded_worker(
+            SlowDriver {
+                read_delay: Duration::from_millis(20),
+                write_delay: Duration::from_millis(20),
+            },
+            command_rx,
+        );
+
+        let reply = reply_rx.recv_timeout(Duration::from_secs(1));
+        let observation = observations.recv_timeout(Duration::from_secs(1));
+
+        drop(observations);
+        worker.join().unwrap();
+
+        assert_eq!(reply.unwrap(), Ok(()));
+        assert!(observation.is_ok());
     }
 }
