@@ -94,7 +94,13 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
     tx: Sender<Observation>,
     commands: Receiver<DeviceCommand>,
 ) {
-    assert!(!tasks.is_empty(), "At least one polling task is required");
+    if tasks.is_empty() {
+        for command in commands {
+            execute_command(&mut driver, &mut port, command);
+        }
+
+        return;
+    }
 
     assert!(
         tasks.iter().all(|task| !task.period.is_zero()),
@@ -378,5 +384,67 @@ mod tests {
 
         assert_eq!(observation.source, "on_demand");
         assert_eq!(observation.reading, Ok(Value::Float(1.0)));
+    }
+
+    #[test]
+    fn handles_commands_without_polling_tasks() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+
+        let (observation_tx, observation_rx) = std::sync::mpsc::channel::<Observation>();
+
+        let worker = thread::spawn(move || {
+            let port = BufReader::new(Cursor::new(Vec::<u8>::new()));
+
+            run_polling(
+                SlowDriver {
+                    read_delay: Duration::ZERO,
+                    write_delay: Duration::ZERO,
+                },
+                port,
+                Vec::new(),
+                observation_tx,
+                command_rx,
+            );
+        });
+
+        let mut description = test_task("on_demand", 100).description;
+        description.default_poll_period = None;
+
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+
+        command_tx
+            .send(DeviceCommand::Read {
+                description,
+                reply: read_tx,
+            })
+            .unwrap();
+
+        let observation = read_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(observation.source, "on_demand");
+        assert_eq!(observation.reading, Ok(Value::Float(1.0)));
+
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+
+        command_tx
+            .send(DeviceCommand::Set(SetCommand {
+                parameter: "power".to_string(),
+                value: Value::Integer(10),
+                reply: write_tx,
+            }))
+            .unwrap();
+
+        assert_eq!(
+            write_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(())
+        );
+
+        drop(command_tx);
+        worker.join().unwrap();
+
+        assert!(matches!(
+            observation_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 }

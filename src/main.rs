@@ -388,6 +388,25 @@ fn handle_client(
             }
 
             TcpRequest::Subscribe { id, key } => {
+                let description = catalog
+                    .get(&key)
+                    .expect("Known parameter must have a description");
+
+                if description.default_poll_period.is_none() {
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({
+                            "id": id,
+                            "status": "error",
+                            "error": "not_subscribable",
+                            "key": key
+                        })
+                    )?;
+
+                    continue;
+                }
+
                 let (tx, rx) = mpsc::channel::<Observation>();
 
                 subscribers
@@ -512,5 +531,56 @@ mod tests {
             parse_tcp_request(r#"{"id":1,"op":"unknown","key":"power"}"#),
             Err("unsupported_op")
         );
+    }
+
+    #[test]
+    fn rejects_subscription_without_polling() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+
+            let latest = Mutex::new(HashMap::new());
+            let subscribers = Mutex::new(Vec::new());
+
+            let (command_tx, _command_rx) = mpsc::channel::<runtime::DeviceCommand>();
+
+            let description = ParameterDescription {
+                id: "configuration".to_string(),
+                spec: crate::model::Spec::Integer { min: 0, max: 100 },
+                unit: "".to_string(),
+                writable: false,
+                default_poll_period: None,
+            };
+
+            let catalog = HashMap::from([(description.id.clone(), description)]);
+
+            handle_client(stream, &latest, &subscribers, &command_tx, &catalog).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        client
+            .write_all(b"{\"id\":5,\"op\":\"subscribe\",\"key\":\"configuration\"}\n")
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut response = String::new();
+
+        reader.read_line(&mut response).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["id"], 5);
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "not_subscribable");
+
+        drop(reader);
+        server.join().unwrap();
     }
 }
