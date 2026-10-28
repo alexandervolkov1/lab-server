@@ -200,6 +200,8 @@ fn handle_client(
     commands: &mpsc::Sender<runtime::SetCommand>,
     known_keys: &HashSet<String>,
 ) -> std::io::Result<()> {
+    const MAX_REQUEST_BYTES: u64 = 4096;
+
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -207,7 +209,10 @@ fn handle_client(
     loop {
         let mut request = String::new();
 
-        let bytes = reader.by_ref().take(64).read_line(&mut request)?;
+        let bytes = reader
+            .by_ref()
+            .take(MAX_REQUEST_BYTES)
+            .read_line(&mut request)?;
 
         if bytes == 0 {
             return Ok(());

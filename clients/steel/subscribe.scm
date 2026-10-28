@@ -4,9 +4,21 @@
 (define (show-measurement event)
   (display (hash-> event key))
   (display ": ")
-  (display (hash-> event value))
-  (display " ")
-  (display (hash-> event unit))
+
+  (cond
+    ((equal? (hash-> event status) "ok")
+      (display (hash-> event value))
+      (display " ")
+      (display (hash-> event unit)))
+
+    ((equal? (hash-> event status) "error")
+      (display "ERROR: ")
+      (display (hash-> event error)))
+
+    (else
+      (display "Unexpected status: ")
+      (display (hash-> event status))))
+
   (display " at ")
   (display (hash-> event completed_at_unix_ms))
   (newline))

@@ -18,7 +18,7 @@
         (reader (caddr client)))
     (display (value->jsexpr-string request) writer)
     (display "\n" writer)
-
+    (flush-output-port writer)
     (string->jsexpr (read-line reader))))
 
 (define (lab-get client id key)
