@@ -1,6 +1,6 @@
 (require-builtin steel/hash)
-(require "collections.scm")
-(require "lab-client.scm")
+(require "../../lib/collections.scm")
+(require "../../lib/lab-client.scm")
 
 (define (show-response response)
   (let ((status (hash-> response status)))

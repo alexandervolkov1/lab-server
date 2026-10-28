@@ -1,7 +1,7 @@
 (require-builtin steel/time)
 (require-builtin steel/hash)
-(require "collections.scm")
-(require "lab-client.scm")
+(require "../../lib/collections.scm")
+(require "../../lib/lab-client.scm")
 
 (define (show-response power response)
   (display "Set power to ")

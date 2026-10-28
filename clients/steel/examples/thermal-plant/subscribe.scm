@@ -1,5 +1,5 @@
-(require "collections.scm")
-(require "lab-client.scm")
+(require "../../lib/collections.scm")
+(require "../../lib/lab-client.scm")
 
 (define (show-measurement event)
   (display (hash-> event key))
