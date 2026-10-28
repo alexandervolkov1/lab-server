@@ -1,15 +1,6 @@
-(require-builtin steel/tcp)
-(require-builtin steel/time)
-(require-builtin steel/json)
 (require-builtin steel/hash)
 (require "collections.scm")
-
-(define (get-latest writer reader id)
-  (display "{\"id\":" writer)
-  (display id writer)
-  (display ",\"op\":\"get\",\"key\":\"sample_temperature\"}\n" writer)
-  (flush-output-port writer)
-  (string->jsexpr (read-line reader)))
+(require "lab-client.scm")
 
 (define (show-response response)
   (let ((status (hash-> response status)))
@@ -32,16 +23,18 @@
         (display status)
         (newline)))))
 
-(define (poll writer reader id remaining)
-  (if (= remaining 0)
-    #f
-    (begin
-      (show-response (get-latest writer reader id))
-      (time/sleep-ms 1000)
-      (poll writer reader (+ id 1) (- remaining 1)))))
+(let ((client (lab-connect "127.0.0.1:7240")))
 
-(let* ((connection (tcp-connect "127.0.0.1:7240"))
-       (writer (tcp-stream-writer connection))
-       (reader (tcp-stream-buffered-reader connection)))
-  (poll writer reader 1 5)
-  (tcp-shutdown! connection))
+  (show-response
+    (lab-get client 1 "sample_temperature"))
+
+  (show-response
+    (lab-get client 2 "heater_temperature"))
+
+  (show-response
+    (lab-get client 3 "room_temperature"))
+
+  (show-response
+    (lab-get client 4 "power"))
+
+  (lab-close client))

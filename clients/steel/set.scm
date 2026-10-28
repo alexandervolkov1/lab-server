@@ -1,17 +1,7 @@
-(require-builtin steel/tcp)
-(require-builtin steel/json)
 (require-builtin steel/time)
 (require-builtin steel/hash)
 (require "collections.scm")
-
-(define (set-power writer reader id power)
-  (display "{\"id\":" writer)
-  (display id writer)
-  (display ",\"op\":\"set\",\"key\":\"power\",\"value\":" writer)
-  (display power writer)
-  (display "}\n" writer)
-  (flush-output-port writer)
-  (string->jsexpr (read-line reader)))
+(require "lab-client.scm")
 
 (define (show-response power response)
   (display "Set power to ")
@@ -27,16 +17,17 @@
 
   (newline))
 
-(let* ((connection (tcp-connect "127.0.0.1:7240"))
-       (writer (tcp-stream-writer connection))
-       (reader (tcp-stream-buffered-reader connection)))
+(let ((client (lab-connect "127.0.0.1:7240")))
 
-  (show-response 0 (set-power writer reader 1 0))
+  (show-response 0
+    (lab-set client 1 "power" 0))
 
-  (show-response 10 (set-power writer reader 2 10))
+  (show-response 10
+    (lab-set client 2 "power" 10))
 
   (time/sleep-ms 10000)
 
-  (show-response 0 (set-power writer reader 3 0))
+  (show-response 0
+    (lab-set client 3 "power" 0))
 
-  (tcp-shutdown! connection))
+  (lab-close client))

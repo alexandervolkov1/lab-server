@@ -24,6 +24,24 @@ impl Driver for Arduino {
                 writable: false,
             },
             ParameterDescription {
+                id: "heater_temperature".to_string(),
+                spec: Spec::Float {
+                    min: -250.0,
+                    max: 1500.0,
+                },
+                unit: "degC".to_string(),
+                writable: false,
+            },
+            ParameterDescription {
+                id: "room_temperature".to_string(),
+                spec: Spec::Float {
+                    min: -250.0,
+                    max: 1500.0,
+                },
+                unit: "degC".to_string(),
+                writable: false,
+            },
+            ParameterDescription {
                 id: "power".to_string(),
                 spec: Spec::Integer { min: 0, max: 100 },
                 unit: "%".to_string(),
@@ -33,15 +51,25 @@ impl Driver for Arduino {
     }
 
     fn read(&mut self, parameter: &str, io: &mut dyn DeviceIo) -> Result<Value, String> {
-        if parameter != "sample_temperature" {
-            return Err(format!("Unknown Arduino parameter: {parameter}"));
-        }
+        let device_key = match parameter {
+            "sample_temperature" => "t.sample",
+            "heater_temperature" => "t.heater",
+            "room_temperature" => "t.room",
+            "power" => "power",
+            _ => return Err(format!("Unknown Arduino parameter: {parameter}")),
+        };
+
+        let description = self
+            .parameters()
+            .into_iter()
+            .find(|item| item.id == parameter)
+            .expect("Known Arduino parameter must have a description");
 
         let id = self.next_id;
 
         self.next_id = if id == u16::MAX { 1 } else { id + 1 };
 
-        let command = format!("o {id} get t.sample\n");
+        let command = format!("o {id} get {device_key}\n");
 
         io.send(command.as_bytes())
             .map_err(|error| error.to_string())?;
@@ -56,9 +84,7 @@ impl Driver for Arduino {
             return Err("Empty response".to_string());
         }
 
-        let temperature = parse_sample_temp(&response, id).map_err(|error| error.to_string())?;
-
-        Ok(Value::Float(temperature))
+        parse_numeric_reply(&response, id, &description.spec).map_err(|error| error.to_string())
     }
 
     fn write(
@@ -124,7 +150,7 @@ impl Driver for Arduino {
     }
 }
 
-fn parse_sample_temp(line: &str, request_id: u16) -> Result<f64, &'static str> {
+fn parse_numeric_reply(line: &str, request_id: u16, spec: &Spec) -> Result<Value, &'static str> {
     let mut parts = line.split_whitespace();
 
     let expected_id = format!("@{request_id}");
@@ -137,18 +163,28 @@ fn parse_sample_temp(line: &str, request_id: u16) -> Result<f64, &'static str> {
         return Err("Arduino request failed");
     }
 
-    let raw_value = parts.next().ok_or("Missing temperature")?;
+    let raw_value = parts.next().ok_or("Missing value")?;
 
     if parts.next().is_some() {
         return Err("Too many fields");
     }
 
-    let value = raw_value
-        .parse::<f64>()
-        .map_err(|_| "Invalid temperature")?;
+    let value = match spec {
+        Spec::Float { .. } => {
+            let number = raw_value.parse::<f64>().map_err(|_| "Invalid float")?;
 
-    if !value.is_finite() {
-        return Err("Non-finite temperature");
+            Value::Float(number)
+        }
+
+        Spec::Integer { .. } => {
+            let number = raw_value.parse::<i64>().map_err(|_| "Invalid integer")?;
+
+            Value::Integer(number)
+        }
+    };
+
+    if !spec.accepts(&value) {
+        return Err("Value out of range");
     }
 
     Ok(value)
@@ -230,14 +266,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_temperature() {
-        assert_eq!(parse_sample_temp("@7 ok 23.75", 7), Ok(23.75));
+    fn parses_numeric_reply() {
+        let temperature = Spec::Float {
+            min: -250.0,
+            max: 1500.0,
+        };
 
-        assert!(parse_sample_temp("@8 ok 23.75", 7).is_err());
-        assert!(parse_sample_temp("@7 ok abc", 7).is_err());
-        assert!(parse_sample_temp("@7 err key", 7).is_err());
-        assert!(parse_sample_temp("ERR", 7).is_err());
-        assert!(parse_sample_temp("@7 ok 23.75 extra", 7).is_err());
+        let power = Spec::Integer { min: 0, max: 100 };
+
+        assert_eq!(
+            parse_numeric_reply("@7 ok 23.75", 7, &temperature),
+            Ok(Value::Float(23.75))
+        );
+
+        assert_eq!(
+            parse_numeric_reply("@8 ok 10", 8, &power),
+            Ok(Value::Integer(10))
+        );
+
+        assert!(parse_numeric_reply("@8 ok 10.5", 8, &power).is_err());
+        assert!(parse_numeric_reply("@8 ok 101", 8, &power).is_err());
+        assert!(parse_numeric_reply("@8 ok -1", 8, &power).is_err());
+
+        assert!(parse_numeric_reply("@8 ok 23.75", 7, &temperature).is_err());
+        assert!(parse_numeric_reply("@7 ok abc", 7, &temperature).is_err());
+        assert!(parse_numeric_reply("@7 err key", 7, &temperature).is_err());
+        assert!(parse_numeric_reply("ERR", 7, &temperature).is_err());
+        assert!(parse_numeric_reply("@7 ok 23.75 extra", 7, &temperature).is_err());
     }
 
     #[test]
@@ -347,5 +402,33 @@ mod tests {
         let result = driver.write("power", &Value::Integer(10), &mut port);
 
         assert_eq!(result, Err("Arduino error: range".to_string()));
+    }
+
+    #[test]
+    fn reads_remaining_numeric_parameters() {
+        let fake = FakePort {
+            input: Cursor::new(b"@1 ok 31.5\n@2 ok 21.25\n@3 ok 10\n".to_vec()),
+            output: Vec::new(),
+        };
+
+        let mut port = BufReader::new(fake);
+        let mut driver = Arduino::new();
+
+        assert_eq!(
+            driver.read("heater_temperature", &mut port),
+            Ok(Value::Float(31.5))
+        );
+
+        assert_eq!(
+            driver.read("room_temperature", &mut port),
+            Ok(Value::Float(21.25))
+        );
+
+        assert_eq!(driver.read("power", &mut port), Ok(Value::Integer(10)));
+
+        assert_eq!(
+            port.get_ref().output,
+            b"o 1 get t.heater\no 2 get t.room\no 3 get power\n"
+        );
     }
 }

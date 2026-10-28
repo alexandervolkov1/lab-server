@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
@@ -24,20 +25,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let driver = Arduino::new();
 
-    let description = driver
-        .parameters()
+    let parameters = driver.parameters();
+
+    let known_keys: Arc<HashSet<String>> = Arc::new(
+        parameters
+            .iter()
+            .map(|parameter| parameter.id.clone())
+            .collect(),
+    );
+
+    let tasks: Vec<runtime::PollTask> = parameters
         .into_iter()
-        .find(|signal| signal.id == "sample_temperature")
-        .expect("Arduino signal not found");
+        .map(|description| {
+            let source = description.id.clone();
 
-    let signal_id = description.id.clone();
+            println!("Signal: {} [{}]", source, description.unit);
 
-    println!("Signal: {} [{}]", signal_id, description.unit);
+            runtime::PollTask {
+                description,
+                source,
+                period: Duration::from_secs(1),
+            }
+        })
+        .collect();
 
     let (tx, rx) = mpsc::channel::<Observation>();
     let (command_tx, command_rx) = mpsc::channel::<runtime::SetCommand>();
 
-    let latest = Arc::new(Mutex::new(None::<Observation>));
+    let latest = Arc::new(Mutex::new(HashMap::<String, Observation>::new()));
 
     let subscribers = Arc::new(Mutex::new(Vec::<mpsc::Sender<Observation>>::new()));
 
@@ -48,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_latest = Arc::clone(&latest);
     let tcp_subscribers = Arc::clone(&subscribers);
     let tcp_commands = command_tx.clone();
+    let tcp_known_keys = Arc::clone(&known_keys);
 
     let _tcp_worker = thread::spawn(move || {
         for connection in listener.incoming() {
@@ -56,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let client_latest = Arc::clone(&tcp_latest);
                     let client_subscribers = Arc::clone(&tcp_subscribers);
                     let client_commands = tcp_commands.clone();
+                    let client_known_keys = Arc::clone(&tcp_known_keys);
 
                     thread::spawn(move || {
                         if let Err(error) = handle_client(
@@ -63,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &client_latest,
                             &client_subscribers,
                             &client_commands,
+                            &client_known_keys,
                         ) {
                             eprintln!("TCP client error: {error}");
                         }
@@ -76,12 +94,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let tasks = vec![runtime::PollTask {
-        description,
-        source: signal_id,
-        period: Duration::from_secs(1),
-    }];
-
     let worker = thread::spawn(move || {
         runtime::run_polling(driver, reader, tasks, tx, command_rx);
     });
@@ -90,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let mut guard = latest.lock().expect("Observation lock poisoned");
 
-            *guard = Some(observation.clone());
+            guard.insert(observation.source.clone(), observation.clone());
         }
 
         let mut clients = subscribers.lock().expect("Subscribers lock poisoned");
@@ -183,9 +195,10 @@ fn parse_tcp_request(line: &str) -> Result<TcpRequest, &'static str> {
 
 fn handle_client(
     mut stream: TcpStream,
-    latest: &Mutex<Option<Observation>>,
+    latest: &Mutex<HashMap<String, Observation>>,
     subscribers: &Mutex<Vec<mpsc::Sender<Observation>>>,
     commands: &mpsc::Sender<runtime::SetCommand>,
+    known_keys: &HashSet<String>,
 ) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
@@ -243,7 +256,7 @@ fn handle_client(
             | TcpRequest::Set { id, key, .. } => (*id, key.as_str()),
         };
 
-        if key != "sample_temperature" && !matches!(&command, TcpRequest::Set { .. }) {
+        if !known_keys.contains(key) {
             writeln!(
                 stream,
                 "{}",
@@ -264,7 +277,7 @@ fn handle_client(
                         .lock()
                         .map_err(|_| io::Error::other("observation lock poisoned"))?;
 
-                    match guard.as_ref() {
+                    match guard.get(&key) {
                         Some(observation) => observation_json(Some(id), observation)?,
 
                         None => json!({
