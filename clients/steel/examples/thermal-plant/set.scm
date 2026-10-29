@@ -10,24 +10,24 @@
   (display (hash-> response status))
 
   (if (equal? (hash-> response status) "error")
-    (begin
-      (display " - ")
-      (display (hash-> response error)))
-    #f)
+      (begin
+        (display " - ")
+        (display (hash-> response error)))
+      #f)
 
   (newline))
 
 (let ((client (lab-connect "127.0.0.1:7240")))
 
   (show-response 0
-    (lab-set client 1 "power" 0))
+                 (lab-set client 1 "power" 0))
 
   (show-response 10
-    (lab-set client 2 "power" 10))
+                 (lab-set client 2 "power" 10))
 
   (time/sleep-ms 10000)
 
   (show-response 0
-    (lab-set client 3 "power" 0))
+                 (lab-set client 3 "power" 0))
 
   (lab-close client))

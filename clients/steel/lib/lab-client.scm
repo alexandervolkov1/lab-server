@@ -23,26 +23,26 @@
 
 (define (lab-get client id key)
   (lab-request
-    client
-    (hash "id" id
-          "op" "get"
-          "key" key)))
+   client
+   (hash "id" id
+         "op" "get"
+         "key" key)))
 
 (define (lab-set client id key value)
   (lab-request
-    client
-    (hash "id" id
-          "op" "set"
-          "key" key
-          "value" value)))
+   client
+   (hash "id" id
+         "op" "set"
+         "key" key
+         "value" value)))
 
 (define (lab-subscribe client id key)
   (lab-request
-    client
-    (hash "id" id
-          "op" "subscribe"
-          "key" key)))
+   client
+   (hash "id" id
+         "op" "subscribe"
+         "key" key)))
 
 (define (lab-receive client)
   (string->jsexpr
-    (read-line (caddr client))))
+   (read-line (caddr client))))

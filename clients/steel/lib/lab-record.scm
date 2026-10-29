@@ -8,14 +8,14 @@
 
 (define (write-measurement port key response)
   (write-csv-row
-    port
-    (list
-      (hash-ref-or response 'completed_at_unix_ms "")
-      key
-      (hash-ref-or response 'status "")
-      (hash-ref-or response 'value "")
-      (hash-ref-or response 'unit "")
-      (hash-ref-or response 'error "")))
+   port
+   (list
+    (hash-ref-or response 'completed_at_unix_ms "")
+    key
+    (hash-ref-or response 'status "")
+    (hash-ref-or response 'value "")
+    (hash-ref-or response 'unit "")
+    (hash-ref-or response 'error "")))
 
   (flush-output-port port))
 
@@ -29,22 +29,22 @@
         (write-measurement port key response)
 
         (record-once
-          client
-          port
-          (cdr keys)
-          (+ request-id 1)))))
+         client
+         port
+         (cdr keys)
+         (+ request-id 1)))))
 
 (define (lab-record-samples client keys cycles pause-ms filename)
   (let ((port (open-output-file filename)))
 
     (write-csv-row
-      port
-      '("completed_at_unix_ms"
-        "key"
-        "status"
-        "value"
-        "unit"
-        "error"))
+     port
+     '("completed_at_unix_ms"
+       "key"
+       "status"
+       "value"
+       "unit"
+       "error"))
 
     (flush-output-port port)
 
@@ -53,7 +53,7 @@
 
       (if (> remaining 0)
           (let ((next-id
-                  (record-once client port keys request-id)))
+                 (record-once client port keys request-id)))
 
             (if (> remaining 1)
                 (time/sleep-ms pause-ms)

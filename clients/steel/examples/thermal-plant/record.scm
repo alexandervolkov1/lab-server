@@ -5,9 +5,9 @@
 
 (define output-file
   (string-append
-    "clients/steel/output/thermal-plant-"
-    (number->string (current-milliseconds))
-    ".csv"))
+   "clients/steel/output/thermal-plant-"
+   (number->string (current-milliseconds))
+   ".csv"))
 
 (define parameters
   '("sample_temperature"
@@ -18,11 +18,11 @@
 (let ((client (lab-connect "127.0.0.1:7240")))
 
   (lab-record-samples
-    client
-    parameters
-    10
-    1000
-    output-file)
+   client
+   parameters
+   10
+   1000
+   output-file)
 
   (lab-close client))
 

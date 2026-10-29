@@ -7,17 +7,17 @@
 
   (cond
     ((equal? (hash-> event status) "ok")
-      (display (hash-> event value))
-      (display " ")
-      (display (hash-> event unit)))
+     (display (hash-> event value))
+     (display " ")
+     (display (hash-> event unit)))
 
     ((equal? (hash-> event status) "error")
-      (display "ERROR: ")
-      (display (hash-> event error)))
+     (display "ERROR: ")
+     (display (hash-> event error)))
 
     (else
-      (display "Unexpected status: ")
-      (display (hash-> event status))))
+     (display "Unexpected status: ")
+     (display (hash-> event status))))
 
   (display " at ")
   (display (hash-> event completed_at_unix_ms))
@@ -33,7 +33,7 @@
 (let ((client (lab-connect "127.0.0.1:7240")))
 
   (let ((response
-          (lab-subscribe client 1 "sample_temperature")))
+         (lab-subscribe client 1 "sample_temperature")))
 
     (display "Subscription: ")
     (display (hash-> response status))

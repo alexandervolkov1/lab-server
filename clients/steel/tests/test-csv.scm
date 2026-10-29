@@ -16,32 +16,32 @@
     (get-output-string port)))
 
 (assert-equal
-  "\"temperature\""
-  (field->string "temperature"))
+ "\"temperature\""
+ (field->string "temperature"))
 
 (assert-equal
-  "20.5"
-  (field->string 20.5))
+ "20.5"
+ (field->string 20.5))
 
 (assert-equal
-  "\"heater, sample\""
-  (field->string "heater, sample"))
+ "\"heater, sample\""
+ (field->string "heater, sample"))
 
 (assert-equal
-  "\"He said \"\"Hello\"\"\""
-  (field->string "He said \"Hello\""))
+ "\"He said \"\"Hello\"\"\""
+ (field->string "He said \"Hello\""))
 
 (assert-equal
-  "\"\""
-  (field->string ""))
+ "\"\""
+ (field->string ""))
 
 (assert-equal
-  "\"line 1\nline 2\""
-  (field->string "line 1\nline 2"))
+ "\"line 1\nline 2\""
+ (field->string "line 1\nline 2"))
 
 (assert-equal
-  "\"temperature\",20.5,\"degC\"\n"
-  (row->string '("temperature" 20.5 "degC")))
+ "\"temperature\",20.5,\"degC\"\n"
+ (row->string '("temperature" 20.5 "degC")))
 
 (display "CSV tests passed")
 (newline)

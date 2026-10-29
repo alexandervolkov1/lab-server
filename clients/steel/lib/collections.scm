@@ -18,6 +18,6 @@
 (define-syntax hash->
   (syntax-rules ()
     ((_ data)
-      data)
+     data)
     ((_ data key rest ...)
      (hash-> (hash-ref data 'key) rest ...))))

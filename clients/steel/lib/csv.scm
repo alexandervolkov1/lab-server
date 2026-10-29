@@ -6,11 +6,11 @@
         (display "\"" port)
 
         (for-each
-          (lambda (character)
-            (if (char=? character #\")
-                (display "\"\"" port)
-                (display character port)))
-          (string->list value))
+         (lambda (character)
+           (if (char=? character #\")
+               (display "\"\"" port)
+               (display character port)))
+         (string->list value))
 
         (display "\"" port))
 
