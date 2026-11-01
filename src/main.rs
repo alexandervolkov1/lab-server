@@ -12,6 +12,8 @@ use crate::model::{Observation, ParameterDescription, Value};
 
 mod driver;
 mod model;
+#[cfg(test)]
+mod protocol;
 mod runtime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
