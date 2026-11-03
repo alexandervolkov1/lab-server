@@ -98,6 +98,8 @@ pub enum RequestError {
     InvalidId,
     UnsupportedOp,
     InvalidKey,
+    InvalidValue,
+    InvalidKeys,
 }
 
 pub fn parse_request_header(
@@ -132,6 +134,146 @@ pub fn parse_parameter_key(
         .filter(|key| !key.is_empty())
         .map(|key| key.to_owned())
         .ok_or(RequestError::InvalidKey)
+}
+
+pub fn parse_set_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<crate::model::Value, RequestError> {
+    let number = object
+        .get("value")
+        .and_then(serde_json::Value::as_number)
+        .ok_or(RequestError::InvalidValue)?;
+
+    let raw = number.as_str();
+
+    if raw.bytes().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        raw.parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(crate::model::Value::Float)
+            .ok_or(RequestError::InvalidValue)
+    } else {
+        raw.parse::<i64>()
+            .map(crate::model::Value::Integer)
+            .map_err(|_| RequestError::InvalidValue)
+    }
+}
+
+pub fn parse_subscription_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    op: &RequestOp,
+) -> Result<Vec<String>, RequestError> {
+    if !matches!(op, &RequestOp::Subscribe | &RequestOp::Unsubscribe) {
+        return Err(RequestError::InvalidKeys);
+    }
+
+    let mut keys = match (object.get("key"), object.get("keys")) {
+        (None, Some(value)) => {
+            let items = value.as_array().ok_or(RequestError::InvalidKeys)?;
+            let mut keys = Vec::with_capacity(items.len());
+
+            for value in items {
+                let key = value
+                    .as_str()
+                    .filter(|key| !key.is_empty())
+                    .ok_or(RequestError::InvalidKeys)?;
+
+                keys.push(key.to_owned());
+            }
+
+            keys
+        }
+
+        (Some(value), None) if matches!(op, &RequestOp::Subscribe) => {
+            let key = value
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .ok_or(RequestError::InvalidKeys)?;
+
+            vec![key.to_owned()]
+        }
+
+        _ => return Err(RequestError::InvalidKeys),
+    };
+
+    keys.sort_unstable();
+    keys.dedup();
+
+    Ok(keys)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TcpRequest {
+    Hello {
+        id: u64,
+    },
+    Describe {
+        id: u64,
+    },
+    Ping {
+        id: u64,
+    },
+    Get {
+        id: u64,
+        key: String,
+    },
+    Set {
+        id: u64,
+        key: String,
+        value: crate::model::Value,
+    },
+    Subscribe {
+        id: u64,
+        keys: Vec<String>,
+    },
+    Unsubscribe {
+        id: u64,
+        keys: Vec<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseError {
+    Json(JsonError),
+    Request(RequestError),
+}
+
+pub fn parse_tcp_request(frame: &str) -> Result<TcpRequest, ParseError> {
+    let object = parse_json_object(frame).map_err(ParseError::Json)?;
+
+    let RequestHeader { id, op } = parse_request_header(&object).map_err(ParseError::Request)?;
+
+    match op {
+        RequestOp::Hello => Ok(TcpRequest::Hello { id }),
+        RequestOp::Describe => Ok(TcpRequest::Describe { id }),
+        RequestOp::Ping => Ok(TcpRequest::Ping { id }),
+
+        RequestOp::Get => {
+            let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
+            Ok(TcpRequest::Get { id, key })
+        }
+
+        RequestOp::Set => {
+            let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
+            let value = parse_set_value(&object).map_err(ParseError::Request)?;
+
+            Ok(TcpRequest::Set { id, key, value })
+        }
+
+        RequestOp::Subscribe => {
+            let keys = parse_subscription_keys(&object, &RequestOp::Subscribe)
+                .map_err(ParseError::Request)?;
+
+            Ok(TcpRequest::Subscribe { id, keys })
+        }
+
+        RequestOp::Unsubscribe => {
+            let keys = parse_subscription_keys(&object, &RequestOp::Unsubscribe)
+                .map_err(ParseError::Request)?;
+
+            Ok(TcpRequest::Unsubscribe { id, keys })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +530,261 @@ mod tests {
             let object = parse_json_object(frame).unwrap();
 
             assert_eq!(parse_parameter_key(&object), Err(RequestError::InvalidKey));
+        }
+    }
+
+    #[test]
+    fn parses_integer_and_float_literals() {
+        use crate::model::Value;
+
+        let cases = [
+            (r#"{"value":20}"#, Value::Integer(20)),
+            (r#"{"value":-20}"#, Value::Integer(-20)),
+            (r#"{"value":-0}"#, Value::Integer(0)),
+            (r#"{"value":9223372036854775807}"#, Value::Integer(i64::MAX)),
+            (
+                r#"{"value":-9223372036854775808}"#,
+                Value::Integer(i64::MIN),
+            ),
+            (r#"{"value":20.0}"#, Value::Float(20.0)),
+            (r#"{"value":2e1}"#, Value::Float(20.0)),
+            (r#"{"value":-0.0}"#, Value::Float(-0.0)),
+        ];
+
+        for (frame, expected) in cases {
+            let object = parse_json_object(frame).unwrap();
+
+            assert_eq!(parse_set_value(&object), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_integers_outside_i64() {
+        let cases = [
+            r#"{"value":9223372036854775808}"#,
+            r#"{"value":-9223372036854775809}"#,
+            r#"{"value":18446744073709551616}"#,
+            r#"{"value":-18446744073709551617}"#,
+        ];
+
+        for frame in cases {
+            let object = parse_json_object(frame).unwrap();
+
+            assert_eq!(parse_set_value(&object), Err(RequestError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_non_numeric_values() {
+        let cases = [
+            r#"{"id":1}"#,
+            r#"{"value":null}"#,
+            r#"{"value":true}"#,
+            r#"{"value":"20"}"#,
+            r#"{"value":[]}"#,
+            r#"{"value":{}}"#,
+        ];
+
+        for frame in cases {
+            let object = parse_json_object(frame).unwrap();
+
+            assert_eq!(parse_set_value(&object), Err(RequestError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float_conversion() {
+        for frame in [r#"{"value":1e400}"#, r#"{"value":-1e400}"#] {
+            let object = parse_json_object(frame).unwrap();
+
+            assert_eq!(parse_set_value(&object), Err(RequestError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn canonicalizes_subscription_keys() {
+        let object = parse_json_object(
+            r#"{"id":1,"op":"subscribe","keys":["z.future","sample_temperature","a","z.future"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_subscription_keys(&object, &RequestOp::Subscribe),
+            Ok(vec![
+                "a".to_owned(),
+                "sample_temperature".to_owned(),
+                "z.future".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn accepts_empty_key_arrays() {
+        let object = parse_json_object(r#"{"keys":[]}"#).unwrap();
+
+        for op in [RequestOp::Subscribe, RequestOp::Unsubscribe] {
+            assert_eq!(
+                parse_subscription_keys(&object, &op),
+                Ok(Vec::<String>::new())
+            );
+        }
+    }
+
+    #[test]
+    fn supports_legacy_single_key_only_for_subscribe() {
+        let object =
+            parse_json_object(r#"{"id":2,"op":"subscribe","key":"sample_temperature"}"#).unwrap();
+
+        assert_eq!(
+            parse_subscription_keys(&object, &RequestOp::Subscribe),
+            Ok(vec!["sample_temperature".to_owned()])
+        );
+
+        assert_eq!(
+            parse_subscription_keys(&object, &RequestOp::Unsubscribe),
+            Err(RequestError::InvalidKeys)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_key_arrays() {
+        let cases = [
+            r#"{}"#,
+            r#"{"keys":"sample_temperature"}"#,
+            r#"{"keys":["sample_temperature",42]}"#,
+            r#"{"keys":[""]}"#,
+            r#"{"keys":[null]}"#,
+            r#"{"key":"sample_temperature","keys":["sample_temperature"]}"#,
+        ];
+
+        for frame in cases {
+            let object = parse_json_object(frame).unwrap();
+
+            assert_eq!(
+                parse_subscription_keys(&object, &RequestOp::Subscribe),
+                Err(RequestError::InvalidKeys)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_keys_for_unrelated_operation() {
+        let object = parse_json_object(r#"{"keys":["power"]}"#).unwrap();
+
+        assert_eq!(
+            parse_subscription_keys(&object, &RequestOp::Get),
+            Err(RequestError::InvalidKeys)
+        );
+    }
+
+    #[test]
+    fn parses_header_only_requests() {
+        assert_eq!(
+            parse_tcp_request(r#"{"id":1,"op":"hello"}"#),
+            Ok(TcpRequest::Hello { id: 1 })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":2,"op":"describe"}"#),
+            Ok(TcpRequest::Describe { id: 2 })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":3,"op":"ping"}"#),
+            Ok(TcpRequest::Ping { id: 3 })
+        );
+    }
+
+    #[test]
+    fn parses_get_and_set_requests() {
+        assert_eq!(
+            parse_tcp_request(r#"{"id":4,"op":"get","key":"sample_temperature"}"#),
+            Ok(TcpRequest::Get {
+                id: 4,
+                key: "sample_temperature".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":5,"op":"set","key":"power","value":20}"#),
+            Ok(TcpRequest::Set {
+                id: 5,
+                key: "power".to_owned(),
+                value: crate::model::Value::Integer(20),
+            })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":6,"op":"set","key":"power","value":20.0}"#),
+            Ok(TcpRequest::Set {
+                id: 6,
+                key: "power".to_owned(),
+                value: crate::model::Value::Float(20.0),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_subscription_requests() {
+        assert_eq!(
+            parse_tcp_request(
+                r#"{"id":7,"op":"subscribe","keys":["sample_temperature","heater_temperature","sample_temperature"]}"#
+            ),
+            Ok(TcpRequest::Subscribe {
+                id: 7,
+                keys: vec![
+                    "heater_temperature".to_owned(),
+                    "sample_temperature".to_owned(),
+                ],
+            })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":8,"op":"unsubscribe","keys":["heater_temperature"]}"#),
+            Ok(TcpRequest::Unsubscribe {
+                id: 8,
+                keys: vec!["heater_temperature".to_owned()],
+            })
+        );
+
+        assert_eq!(
+            parse_tcp_request(r#"{"id":9,"op":"subscribe","key":"power"}"#),
+            Ok(TcpRequest::Subscribe {
+                id: 9,
+                keys: vec!["power".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn propagates_request_parse_errors() {
+        let cases = [
+            ("not-json", ParseError::Json(JsonError::InvalidJson)),
+            ("[]", ParseError::Json(JsonError::ExpectedObject)),
+            (
+                r#"{"op":"hello"}"#,
+                ParseError::Request(RequestError::InvalidId),
+            ),
+            (
+                r#"{"id":1,"op":"unknown"}"#,
+                ParseError::Request(RequestError::UnsupportedOp),
+            ),
+            (
+                r#"{"id":1,"op":"get"}"#,
+                ParseError::Request(RequestError::InvalidKey),
+            ),
+            (
+                r#"{"id":1,"op":"set","key":"power"}"#,
+                ParseError::Request(RequestError::InvalidValue),
+            ),
+            (
+                r#"{"id":1,"op":"unsubscribe","key":"power"}"#,
+                ParseError::Request(RequestError::InvalidKeys),
+            ),
+        ];
+
+        for (frame, expected) in cases {
+            assert_eq!(parse_tcp_request(frame), Err(expected));
         }
     }
 }
