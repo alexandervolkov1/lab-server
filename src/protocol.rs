@@ -67,7 +67,7 @@ impl FrameDecoder {
         Ok(frames)
     }
 
-    pub fn finish(self) -> Result<(), FrameError> {
+    pub fn finish(&self) -> Result<(), FrameError> {
         if self.pending.is_empty() {
             Ok(())
         } else {

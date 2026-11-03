@@ -278,10 +278,77 @@ pub enum Incoming {
     FramingError(FrameError),
 }
 
+const MAX_SUBSCRIPTIONS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionChange {
+    Subscribe,
+    Unsubscribe,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubscriptionError {
+    UnknownKey(String),
+    NotSubscribable(String),
+    Full,
+}
+
+#[derive(Default)]
+pub struct SubscriptionSet {
+    keys: std::collections::BTreeSet<String>,
+}
+
+impl SubscriptionSet {
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.keys.iter().cloned().collect()
+    }
+
+    pub fn apply(
+        &mut self,
+        change: SubscriptionChange,
+        keys: &[String],
+        catalog: &HashMap<String, ParameterDescription>,
+    ) -> Result<Vec<String>, SubscriptionError> {
+        let mut next = self.keys.clone();
+
+        for key in keys {
+            let Some(description) = catalog.get(key) else {
+                return Err(SubscriptionError::UnknownKey(key.clone()));
+            };
+
+            if description.default_poll_period.is_none() {
+                return Err(SubscriptionError::NotSubscribable(key.clone()));
+            }
+
+            match change {
+                SubscriptionChange::Subscribe => {
+                    next.insert(key.clone());
+                }
+
+                SubscriptionChange::Unsubscribe => {
+                    next.remove(key);
+                }
+            }
+        }
+
+        if next.len() > MAX_SUBSCRIPTIONS {
+            return Err(SubscriptionError::Full);
+        }
+
+        self.keys = next;
+        Ok(self.keys())
+    }
+}
+
 pub struct ClientSession {
     decoder: FrameDecoder,
     pub pending: PendingRequests,
     pub outbound: OutboundBuffer,
+    pub subscriptions: SubscriptionSet,
     terminal: bool,
 }
 
@@ -291,6 +358,7 @@ impl ClientSession {
             decoder: FrameDecoder::default(),
             pending: PendingRequests::new(max_pending),
             outbound: OutboundBuffer::new(max_output_bytes),
+            subscriptions: SubscriptionSet::default(),
             terminal: false,
         }
     }
@@ -443,6 +511,217 @@ impl ClientSession {
         }
     }
 
+    pub fn dispatch_describe(
+        &mut self,
+        id: u64,
+        catalog: &HashMap<String, ParameterDescription>,
+    ) -> io::Result<()> {
+        if self.pending.contains_id(id) {
+            return self.queue_error(id, "duplicate_id");
+        }
+
+        let mut descriptions: Vec<_> = catalog.values().collect();
+        descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+        let parameters: Vec<_> = descriptions
+            .into_iter()
+            .map(|description| {
+                let (kind, min, max) = match &description.spec {
+                    crate::model::Spec::Float { min, max } => ("float", json!(min), json!(max)),
+                    crate::model::Spec::Integer { min, max } => ("integer", json!(min), json!(max)),
+                };
+
+                json!({
+                    "key": &description.id,
+                    "type": kind,
+                    "min": min,
+                    "max": max,
+                    "unit": &description.unit,
+                    "writable": description.writable,
+                    "poll_period_ns": description
+                        .default_poll_period
+                        .map(|period| period.as_nanos())
+                })
+            })
+            .collect();
+
+        self.queue_response(
+            &json!({
+                "id": id,
+                "status": "ok",
+                "parameters": parameters
+            })
+            .to_string(),
+        )
+    }
+
+    pub fn dispatch_subscription(
+        &mut self,
+        id: u64,
+        change: SubscriptionChange,
+        keys: Vec<String>,
+        catalog: &HashMap<String, ParameterDescription>,
+    ) -> io::Result<()> {
+        if self.pending.contains_id(id) {
+            return self.queue_error(id, "duplicate_id");
+        }
+
+        let response = match self.subscriptions.apply(change, &keys, catalog) {
+            Ok(keys) => json!({
+                "id": id,
+                "status": "ok",
+                "keys": keys
+            }),
+
+            Err(SubscriptionError::UnknownKey(key)) => json!({
+                "id": id,
+                "status": "error",
+                "error": "unknown_key",
+                "key": key
+            }),
+
+            Err(SubscriptionError::NotSubscribable(key)) => json!({
+                "id": id,
+                "status": "error",
+                "error": "not_subscribable",
+                "key": key
+            }),
+
+            Err(SubscriptionError::Full) => json!({
+                "id": id,
+                "status": "error",
+                "error": "too_many_subscriptions"
+            }),
+        };
+
+        self.queue_response(&response.to_string())
+    }
+
+    pub fn dispatch_incoming(
+        &mut self,
+        incoming: Incoming,
+        commands: &Sender<crate::runtime::DeviceCommand>,
+        catalog: &HashMap<String, ParameterDescription>,
+        latest: &Mutex<HashMap<String, Observation>>,
+        now: Instant,
+    ) -> io::Result<Option<Incoming>> {
+        match incoming {
+            Incoming::Request(TcpRequest::Subscribe { id, keys }) => {
+                self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)?;
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Unsubscribe { id, keys }) => {
+                self.dispatch_subscription(id, SubscriptionChange::Unsubscribe, keys, catalog)?;
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Describe { id }) => {
+                self.dispatch_describe(id, catalog)?;
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Hello { id }) => {
+                if self.pending.contains_id(id) {
+                    self.queue_error(id, "duplicate_id")?;
+                } else {
+                    self.queue_response(
+                        &json!({
+                            "id": id,
+                            "status": "ok",
+                            "protocol": "lab-server",
+                            "version": 1
+                        })
+                        .to_string(),
+                    )?;
+                }
+
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Ping { id }) => {
+                if self.pending.contains_id(id) {
+                    self.queue_error(id, "duplicate_id")?;
+                } else {
+                    self.queue_response(
+                        &json!({
+                            "id": id,
+                            "status": "ok"
+                        })
+                        .to_string(),
+                    )?;
+                }
+
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Get { id, key }) => {
+                self.dispatch_get(id, key, commands, catalog, latest, now)?;
+                Ok(None)
+            }
+
+            Incoming::Request(TcpRequest::Set { id, key, value }) => {
+                self.dispatch_set(id, key, value, commands, catalog, now)?;
+                Ok(None)
+            }
+
+            Incoming::InvalidRequest { frame, error } => {
+                use crate::protocol::{JsonError, RequestError};
+
+                let code = match error {
+                    ParseError::Json(JsonError::InvalidJson) => "invalid_json",
+                    ParseError::Json(JsonError::ExpectedObject) => "expected_object",
+                    ParseError::Json(JsonError::DuplicateKey) => "duplicate_key",
+
+                    ParseError::Request(RequestError::InvalidId) => "invalid_id",
+                    ParseError::Request(RequestError::UnsupportedOp) => "unsupported_op",
+                    ParseError::Request(RequestError::InvalidKey) => "invalid_key",
+                    ParseError::Request(RequestError::InvalidValue) => "invalid_value",
+                    ParseError::Request(RequestError::InvalidKeys) => "invalid_keys",
+                };
+
+                let mut response = json!({
+                    "status": "error",
+                    "error": code
+                });
+
+                if let Ok(object) = crate::protocol::parse_json_object(&frame) {
+                    if let Some(id) = object
+                        .get("id")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|id| *id > 0)
+                    {
+                        response["id"] = json!(id);
+                    }
+                }
+
+                self.queue_response(&response.to_string())?;
+                Ok(None)
+            }
+
+            Incoming::FramingError(error) => {
+                self.terminal = true;
+
+                let code = match error {
+                    FrameError::EmptyFrame => "empty_frame",
+                    FrameError::FrameTooLong => "frame_too_long",
+                    FrameError::InvalidUtf8 => "invalid_utf8",
+                    FrameError::IncompleteFrame => "incomplete_frame",
+                };
+
+                self.queue_response(
+                    &json!({
+                        "status": "error",
+                        "error": code
+                    })
+                    .to_string(),
+                )?;
+
+                Ok(None)
+            }
+        }
+    }
+
     pub fn collect_ready(&mut self, now: Instant) -> io::Result<()> {
         for finished in self.pending.poll(now) {
             let response = completion_json(finished)?;
@@ -494,6 +773,12 @@ impl TcpConnection {
                 match self.stream.read(&mut bytes) {
                     Ok(0) => {
                         self.read_closed = true;
+
+                        if let Err(error) = self.session.decoder.finish() {
+                            self.session.terminal = true;
+                            incoming.push(Incoming::FramingError(error));
+                        }
+
                         break;
                     }
 
@@ -878,6 +1163,23 @@ mod tests {
         }
     }
 
+    fn collect_until_read_closed(connection: &mut TcpConnection) -> Vec<Incoming> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut incoming = Vec::new();
+
+        loop {
+            let step = connection.pump().unwrap();
+            incoming.extend(step.incoming);
+
+            if step.read_closed {
+                return incoming;
+            }
+
+            assert!(Instant::now() < deadline, "TCP EOF test timed out");
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn tcp_reads_request_and_writes_response() {
         let (mut connection, mut client) = loopback_pair();
@@ -926,17 +1228,47 @@ mod tests {
     fn tcp_detects_incomplete_frame_after_half_close() {
         let (mut connection, mut client) = loopback_pair();
 
-        client.write_all(b"{\"id\":8").unwrap();
+        client
+            .write_all(b"{\"id\":7,\"op\":\"ping\"}\n{\"id\":8")
+            .unwrap();
+
         client.shutdown(Shutdown::Write).unwrap();
 
-        let step = wait_for_step(&mut connection, |step| step.read_closed);
+        let incoming = collect_until_read_closed(&mut connection);
 
-        assert!(step.incoming.is_empty());
+        assert_eq!(
+            incoming,
+            vec![
+                Incoming::Request(TcpRequest::Ping { id: 7 }),
+                Incoming::FramingError(FrameError::IncompleteFrame),
+            ]
+        );
+
+        assert!(connection.session.is_terminal());
 
         assert_eq!(
             connection.session.finish(),
             Err(FrameError::IncompleteFrame)
         );
+    }
+
+    #[test]
+    fn tcp_clean_half_close_is_not_a_framing_error() {
+        let (mut connection, mut client) = loopback_pair();
+
+        client.write_all(b"{\"id\":9,\"op\":\"ping\"}\n").unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let incoming = collect_until_read_closed(&mut connection);
+
+        assert_eq!(
+            incoming,
+            vec![Incoming::Request(TcpRequest::Ping { id: 9 })]
+        );
+
+        assert!(!connection.session.is_terminal());
+        assert_eq!(connection.session.finish(), Ok(()));
     }
 
     #[test]
@@ -1488,5 +1820,626 @@ mod tests {
         assert_eq!(responses[1]["error"], "duplicate_id");
 
         assert_eq!(session.pending.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_incoming_routes_ping_get_and_set() {
+        let mut session = ClientSession::new(4, 1024);
+
+        let mut catalog = get_catalog();
+        catalog.extend(power_catalog());
+
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let input = concat!(
+            "{\"id\":1,\"op\":\"ping\"}\n",
+            "{\"id\":2,\"op\":\"get\",\"key\":\"sample_temperature\"}\n",
+            "{\"id\":3,\"op\":\"set\",\"key\":\"power\",\"value\":25}\n"
+        );
+
+        let incoming = session.receive(input.as_bytes());
+
+        assert_eq!(incoming.len(), 3);
+
+        for event in incoming {
+            let remaining = session
+                .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now())
+                .unwrap();
+
+            assert!(remaining.is_none());
+        }
+
+        assert_eq!(session.pending.len(), 1);
+
+        match command_rx.try_recv().unwrap() {
+            crate::runtime::DeviceCommand::Set(command) => {
+                assert_eq!(command.parameter, "power");
+                assert_eq!(command.value, Value::Integer(25));
+            }
+            _ => panic!("expected Set command"),
+        }
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(responses[0], serde_json::json!({"id": 1, "status": "ok"}));
+
+        assert_eq!(
+            responses[1],
+            serde_json::json!({
+                "id": 2,
+                "status": "no_data",
+                "key": "sample_temperature"
+            })
+        );
+    }
+
+    #[test]
+    fn dispatch_incoming_handles_subscribe_and_invalid_request() {
+        let mut session = ClientSession::new(2, 512);
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        let input = concat!(
+            "{\"id\":4,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n",
+            "{\"id\":5,\"op\":\"unknown\"}\n"
+        );
+
+        let incoming = session.receive(input.as_bytes());
+
+        assert_eq!(incoming.len(), 2);
+
+        let remaining: Vec<Incoming> = incoming
+            .into_iter()
+            .filter_map(|event| {
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now())
+                    .unwrap()
+            })
+            .collect();
+
+        assert!(remaining.is_empty());
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(responses[0]["id"], 4);
+        assert_eq!(responses[0]["status"], "ok");
+        assert_eq!(
+            responses[0]["keys"],
+            serde_json::json!(["sample_temperature"])
+        );
+
+        assert_eq!(responses[1]["id"], 5);
+        assert_eq!(responses[1]["status"], "error");
+        assert_eq!(responses[1]["error"], "unsupported_op");
+
+        assert_eq!(session.subscriptions.keys(), vec!["sample_temperature"]);
+
+        assert!(session.pending.is_empty());
+    }
+
+    #[test]
+    fn hello_responds_immediately_and_rejects_pending_id() {
+        let mut session = ClientSession::new(2, 512);
+        let now = Instant::now();
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
+
+        session
+            .pending
+            .add_read(7, now + Duration::from_secs(10), || Some(pending_rx))
+            .unwrap();
+
+        let input = concat!(
+            "{\"id\":1,\"op\":\"hello\"}\n",
+            "{\"id\":7,\"op\":\"hello\"}\n"
+        );
+
+        for event in session.receive(input.as_bytes()) {
+            let remaining = session
+                .dispatch_incoming(event, &command_tx, &catalog, &latest, now)
+                .unwrap();
+
+            assert!(remaining.is_none());
+        }
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(
+            responses[0],
+            serde_json::json!({
+                "id": 1,
+                "status": "ok",
+                "protocol": "lab-server",
+                "version": 1
+            })
+        );
+
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["status"], "error");
+        assert_eq!(responses[1]["error"], "duplicate_id");
+
+        assert_eq!(session.pending.len(), 1);
+        assert!(session.outbound.is_empty());
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn describe_serializes_catalog_without_device_commands() {
+        let mut session = ClientSession::new(1, 2048);
+        let now = Instant::now();
+
+        let mut catalog = get_catalog();
+        catalog.extend(power_catalog());
+
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
+
+        session
+            .pending
+            .add_read(7, now + Duration::from_secs(10), || Some(pending_rx))
+            .unwrap();
+
+        let input = concat!(
+            "{\"id\":42,\"op\":\"describe\"}\n",
+            "{\"id\":7,\"op\":\"describe\"}\n"
+        );
+
+        for event in session.receive(input.as_bytes()) {
+            assert!(
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, now,)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 42);
+        assert_eq!(responses[0]["status"], "ok");
+
+        let parameters = responses[0]["parameters"].as_array().unwrap();
+
+        assert_eq!(parameters.len(), 3);
+
+        let keys: Vec<_> = parameters
+            .iter()
+            .map(|parameter| parameter["key"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(keys, vec!["configuration", "power", "sample_temperature"]);
+
+        assert_eq!(parameters[0]["type"], "integer");
+        assert_eq!(parameters[0]["min"], 0);
+        assert_eq!(parameters[0]["max"], 100);
+        assert!(parameters[0]["poll_period_ns"].is_null());
+
+        assert_eq!(parameters[1]["unit"], "%");
+        assert_eq!(parameters[1]["writable"], true);
+
+        assert_eq!(parameters[2]["type"], "float");
+        assert_eq!(parameters[2]["unit"], "degC");
+        assert_eq!(parameters[2]["min"], -100.0);
+        assert_eq!(parameters[2]["max"], 500.0);
+        assert_eq!(parameters[2]["poll_period_ns"].as_u64(), Some(100_000_000));
+
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["error"], "duplicate_id");
+
+        assert_eq!(session.pending.len(), 1);
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscriptions_are_atomic_and_idempotent() {
+        let mut catalog = get_catalog();
+
+        let mut heater = catalog["sample_temperature"].clone();
+        heater.id = "heater_temperature".to_owned();
+        catalog.insert(heater.id.clone(), heater);
+
+        let mut subscriptions = SubscriptionSet::default();
+
+        let result = subscriptions
+            .apply(
+                SubscriptionChange::Subscribe,
+                &[
+                    "sample_temperature".to_owned(),
+                    "heater_temperature".to_owned(),
+                ],
+                &catalog,
+            )
+            .unwrap();
+
+        assert_eq!(result, vec!["heater_temperature", "sample_temperature"]);
+
+        assert_eq!(
+            subscriptions
+                .apply(
+                    SubscriptionChange::Subscribe,
+                    &["sample_temperature".to_owned()],
+                    &catalog,
+                )
+                .unwrap(),
+            result
+        );
+
+        assert_eq!(
+            subscriptions.apply(
+                SubscriptionChange::Subscribe,
+                &["configuration".to_owned()],
+                &catalog,
+            ),
+            Err(SubscriptionError::NotSubscribable(
+                "configuration".to_owned()
+            ))
+        );
+
+        assert_eq!(
+            subscriptions.apply(
+                SubscriptionChange::Unsubscribe,
+                &["sample_temperature".to_owned(), "unknown".to_owned(),],
+                &catalog,
+            ),
+            Err(SubscriptionError::UnknownKey("unknown".to_owned()))
+        );
+
+        assert_eq!(subscriptions.keys(), result);
+
+        assert_eq!(
+            subscriptions
+                .apply(
+                    SubscriptionChange::Unsubscribe,
+                    &["sample_temperature".to_owned()],
+                    &catalog,
+                )
+                .unwrap(),
+            vec!["heater_temperature"]
+        );
+
+        assert_eq!(
+            subscriptions
+                .apply(
+                    SubscriptionChange::Unsubscribe,
+                    &["sample_temperature".to_owned()],
+                    &catalog,
+                )
+                .unwrap(),
+            vec!["heater_temperature"]
+        );
+
+        assert_eq!(
+            subscriptions
+                .apply(SubscriptionChange::Unsubscribe, &[], &catalog)
+                .unwrap(),
+            vec!["heater_temperature"]
+        );
+    }
+
+    #[test]
+    fn subscriptions_enforce_limit_and_are_per_session() {
+        let seed = get_catalog();
+        let template = seed["sample_temperature"].clone();
+
+        let mut catalog = HashMap::new();
+        let mut keys = Vec::new();
+
+        for index in 0..65 {
+            let mut description = template.clone();
+            description.id = format!("signal_{index:02}");
+
+            keys.push(description.id.clone());
+            catalog.insert(description.id.clone(), description);
+        }
+
+        let mut first = ClientSession::new(1, 1024);
+        let second = ClientSession::new(1, 1024);
+
+        assert_eq!(
+            first
+                .subscriptions
+                .apply(SubscriptionChange::Subscribe, &keys, &catalog,),
+            Err(SubscriptionError::Full)
+        );
+
+        assert!(first.subscriptions.keys().is_empty());
+
+        let result = first
+            .subscriptions
+            .apply(SubscriptionChange::Subscribe, &keys[..64], &catalog)
+            .unwrap();
+
+        assert_eq!(result.len(), 64);
+
+        assert_eq!(
+            first
+                .subscriptions
+                .apply(
+                    SubscriptionChange::Subscribe,
+                    &["signal_00".to_owned()],
+                    &catalog,
+                )
+                .unwrap()
+                .len(),
+            64
+        );
+
+        assert!(first.subscriptions.contains("signal_00"));
+        assert!(second.subscriptions.keys().is_empty());
+    }
+
+    #[test]
+    fn dispatches_subscription_requests_and_responses() {
+        let mut session = ClientSession::new(2, 4096);
+        let mut catalog = get_catalog();
+
+        let mut heater = catalog["sample_temperature"].clone();
+        heater.id = "heater_temperature".to_owned();
+        catalog.insert(heater.id.clone(), heater);
+
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let input = concat!(
+            "{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\",\"configuration\"]}\n",
+            "{\"id\":2,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\",\"heater_temperature\"]}\n",
+            "{\"id\":3,\"op\":\"subscribe\",\"keys\":[\"missing\"]}\n",
+            "{\"id\":4,\"op\":\"unsubscribe\",\"keys\":[]}\n",
+            "{\"id\":5,\"op\":\"unsubscribe\",\"keys\":[\"sample_temperature\"]}\n"
+        );
+
+        for event in session.receive(input.as_bytes()) {
+            assert!(
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now(),)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 5);
+
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["error"], "not_subscribable");
+        assert_eq!(responses[0]["key"], "configuration");
+
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["status"], "ok");
+        assert_eq!(
+            responses[1]["keys"],
+            serde_json::json!(["heater_temperature", "sample_temperature"])
+        );
+
+        assert_eq!(responses[2]["id"], 3);
+        assert_eq!(responses[2]["error"], "unknown_key");
+        assert_eq!(responses[2]["key"], "missing");
+
+        assert_eq!(responses[3]["id"], 4);
+        assert_eq!(responses[3]["keys"], responses[1]["keys"]);
+
+        assert_eq!(responses[4]["id"], 5);
+        assert_eq!(
+            responses[4]["keys"],
+            serde_json::json!(["heater_temperature"])
+        );
+
+        assert_eq!(session.subscriptions.keys(), vec!["heater_temperature"]);
+
+        assert!(session.pending.is_empty());
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_requests_return_codes_without_ambiguous_ids() {
+        let mut session = ClientSession::new(2, 4096);
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let input = concat!(
+            "{\"id\":10,\"op\":\"unknown\"}\n",
+            "{\"id\":11,\"op\":\"get\"}\n",
+            "{\"id\":12,\"op\":\"get\",\"key\":\"a\",\"key\":\"b\"}\n",
+            "not-json\n",
+            "[]\n",
+            "{\"op\":\"ping\"}\n",
+            "{\"id\":13,\"op\":\"ping\"}\n"
+        );
+
+        let incoming = session.receive(input.as_bytes());
+        assert_eq!(incoming.len(), 7);
+
+        for event in incoming {
+            assert!(
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now(),)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 7);
+
+        assert_eq!(responses[0]["id"], 10);
+        assert_eq!(responses[0]["error"], "unsupported_op");
+
+        assert_eq!(responses[1]["id"], 11);
+        assert_eq!(responses[1]["error"], "invalid_key");
+
+        assert_eq!(responses[2]["error"], "duplicate_key");
+        assert!(responses[2].get("id").is_none());
+
+        assert_eq!(responses[3]["error"], "invalid_json");
+        assert!(responses[3].get("id").is_none());
+
+        assert_eq!(responses[4]["error"], "expected_object");
+        assert!(responses[4].get("id").is_none());
+
+        assert_eq!(responses[5]["error"], "invalid_id");
+        assert!(responses[5].get("id").is_none());
+
+        assert_eq!(responses[6]["id"], 13);
+        assert_eq!(responses[6]["status"], "ok");
+
+        assert!(!session.is_terminal());
+        assert!(session.pending.is_empty());
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn framing_error_preserves_valid_reply_before_terminal_error() {
+        let mut session = ClientSession::new(2, 512);
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let incoming = session.receive(b"{\"id\":1,\"op\":\"ping\"}\n\n");
+
+        assert_eq!(
+            incoming,
+            vec![
+                Incoming::Request(TcpRequest::Ping { id: 1 }),
+                Incoming::FramingError(FrameError::EmptyFrame),
+            ]
+        );
+
+        for event in incoming {
+            assert!(
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now(),)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert!(session.is_terminal());
+        assert!(session.receive(b"{\"id\":2,\"op\":\"ping\"}\n").is_empty());
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(responses[0], serde_json::json!({"id": 1, "status": "ok"}));
+
+        assert_eq!(
+            responses[1],
+            serde_json::json!({
+                "status": "error",
+                "error": "empty_frame"
+            })
+        );
+
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn framing_errors_are_reported_without_request_id() {
+        let cases = [
+            (b"\xff\n".to_vec(), FrameError::InvalidUtf8, "invalid_utf8"),
+            (
+                vec![b'x'; crate::protocol::MAX_FRAME_BYTES + 1],
+                FrameError::FrameTooLong,
+                "frame_too_long",
+            ),
+        ];
+
+        for (bytes, expected_error, expected_code) in cases {
+            let mut session = ClientSession::new(1, 256);
+            let catalog = HashMap::new();
+            let latest = Mutex::new(HashMap::new());
+            let (command_tx, _command_rx) = mpsc::channel();
+
+            let incoming = session.receive(&bytes);
+
+            assert_eq!(incoming, vec![Incoming::FramingError(expected_error)]);
+
+            for event in incoming {
+                assert!(
+                    session
+                        .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now(),)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+
+            assert!(session.is_terminal());
+
+            let mut output = Vec::new();
+            session.outbound.flush_to(&mut output).unwrap();
+
+            let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+            assert_eq!(response["status"], "error");
+            assert_eq!(response["error"], expected_code);
+            assert!(response.get("id").is_none());
+        }
     }
 }
