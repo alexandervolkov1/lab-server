@@ -10,8 +10,12 @@ use serde_json::json;
 use crate::driver::{Driver, arduino::Arduino};
 use crate::model::{Observation, ParameterDescription, Value};
 
+#[cfg(test)]
+mod connection;
 mod driver;
 mod model;
+#[cfg(test)]
+mod pending;
 #[cfg(test)]
 mod protocol;
 mod runtime;
@@ -196,6 +200,40 @@ fn parse_tcp_request(line: &str) -> Result<TcpRequest, &'static str> {
     }
 }
 
+fn queue_read(
+    commands: &mpsc::Sender<runtime::DeviceCommand>,
+    description: ParameterDescription,
+) -> Option<mpsc::Receiver<Observation>> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+
+    let command = runtime::DeviceCommand::Read {
+        description,
+        reply: reply_tx,
+    };
+
+    commands.send(command).ok()?;
+
+    Some(reply_rx)
+}
+
+fn queue_set(
+    commands: &mpsc::Sender<runtime::DeviceCommand>,
+    key: String,
+    value: Value,
+) -> Option<mpsc::Receiver<Result<(), String>>> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+
+    let command = runtime::DeviceCommand::Set(runtime::SetCommand {
+        parameter: key,
+        value,
+        reply: reply_tx,
+    });
+
+    commands.send(command).ok()?;
+
+    Some(reply_rx)
+}
+
 fn handle_client(
     mut stream: TcpStream,
     latest: &Mutex<HashMap<String, Observation>>,
@@ -300,22 +338,8 @@ fn handle_client(
                         .to_string(),
                     }
                 } else {
-                    let (reply_tx, reply_rx) = mpsc::channel::<Observation>();
-
-                    let command = runtime::DeviceCommand::Read {
-                        description: description.clone(),
-                        reply: reply_tx,
-                    };
-
-                    if commands.send(command).is_err() {
-                        json!({
-                            "id": id,
-                            "status": "error",
-                            "error": "runtime_unavailable"
-                        })
-                        .to_string()
-                    } else {
-                        match reply_rx.recv_timeout(Duration::from_secs(10)) {
+                    match queue_read(commands, description.clone()) {
+                        Some(reply_rx) => match reply_rx.recv_timeout(Duration::from_secs(10)) {
                             Ok(observation) => observation_json(Some(id), &observation)?,
 
                             Err(mpsc::RecvTimeoutError::Timeout) => json!({
@@ -331,7 +355,14 @@ fn handle_client(
                                 "error": "runtime_unavailable"
                             })
                             .to_string(),
-                        }
+                        },
+
+                        None => json!({
+                            "id": id,
+                            "status": "error",
+                            "error": "runtime_unavailable"
+                        })
+                        .to_string(),
                     }
                 };
 
@@ -339,15 +370,7 @@ fn handle_client(
             }
 
             TcpRequest::Set { id, key, value } => {
-                let (reply_tx, reply_rx) = mpsc::channel::<Result<(), String>>();
-
-                let command = runtime::DeviceCommand::Set(runtime::SetCommand {
-                    parameter: key,
-                    value,
-                    reply: reply_tx,
-                });
-
-                if commands.send(command).is_err() {
+                let Some(reply_rx) = queue_set(commands, key, value) else {
                     writeln!(
                         stream,
                         "{}",
@@ -359,7 +382,7 @@ fn handle_client(
                     )?;
 
                     continue;
-                }
+                };
 
                 let response = match reply_rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(Ok(())) => json!({
@@ -444,6 +467,91 @@ fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queues_read_without_waiting_for_device() {
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let description = ParameterDescription {
+            id: "configuration".to_owned(),
+            spec: crate::model::Spec::Integer { min: 0, max: 100 },
+            unit: "".to_owned(),
+            writable: false,
+            default_poll_period: None,
+        };
+
+        let reply_rx = queue_read(&command_tx, description.clone()).unwrap();
+
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let command = command_rx.try_recv().unwrap();
+
+        match command {
+            runtime::DeviceCommand::Read {
+                description: queued,
+                reply,
+            } => {
+                assert_eq!(queued.id, description.id);
+                assert_eq!(queued.default_poll_period, description.default_poll_period);
+
+                reply
+                    .send(Observation {
+                        source: queued.id,
+                        unit: queued.unit,
+                        completed_at: UNIX_EPOCH + Duration::from_millis(10),
+                        reading: Ok(Value::Integer(30)),
+                    })
+                    .unwrap();
+            }
+
+            _ => panic!("expected Read command"),
+        }
+
+        let observation = reply_rx.try_recv().unwrap();
+
+        assert_eq!(observation.source, "configuration");
+        assert_eq!(observation.reading, Ok(Value::Integer(30)));
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        drop(closed_rx);
+
+        assert!(queue_read(&closed_tx, description).is_none());
+    }
+
+    #[test]
+    fn queues_set_without_waiting_for_device() {
+        let (command_tx, command_rx) = mpsc::channel();
+
+        let reply_rx = queue_set(&command_tx, "power".to_owned(), Value::Integer(25)).unwrap();
+
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let command = command_rx.try_recv().unwrap();
+
+        match command {
+            runtime::DeviceCommand::Set(command) => {
+                assert_eq!(command.parameter, "power");
+                assert_eq!(command.value, Value::Integer(25));
+
+                command.reply.send(Ok(())).unwrap();
+            }
+
+            _ => panic!("expected Set command"),
+        }
+
+        assert_eq!(reply_rx.try_recv(), Ok(Ok(())));
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        drop(closed_rx);
+
+        assert!(queue_set(&closed_tx, "power".to_owned(), Value::Integer(25)).is_none());
+    }
 
     #[test]
     fn serializes_observation_as_json() {

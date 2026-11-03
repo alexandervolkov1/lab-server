@@ -8,13 +8,19 @@ pub enum FrameError {
     IncompleteFrame,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct FrameDecodeFailure {
+    pub frames: Vec<String>,
+    pub error: FrameError,
+}
+
 #[derive(Default)]
 pub struct FrameDecoder {
     pending: Vec<u8>,
 }
 
 impl FrameDecoder {
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, FrameError> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, FrameDecodeFailure> {
         let mut frames = Vec::new();
 
         for chunk in bytes.split_inclusive(|&byte| byte == b'\n') {
@@ -27,19 +33,31 @@ impl FrameDecoder {
             };
 
             if data.len() > MAX_FRAME_BYTES - self.pending.len() {
-                return Err(FrameError::FrameTooLong);
+                return Err(FrameDecodeFailure {
+                    frames,
+                    error: FrameError::FrameTooLong,
+                });
             }
 
             self.pending.extend_from_slice(data);
 
             if has_lf {
                 if self.pending.is_empty() {
-                    return Err(FrameError::EmptyFrame);
+                    return Err(FrameDecodeFailure {
+                        frames,
+                        error: FrameError::EmptyFrame,
+                    });
                 }
 
-                let line = std::str::from_utf8(&self.pending)
-                    .map_err(|_| FrameError::InvalidUtf8)?
-                    .to_owned();
+                let line = match std::str::from_utf8(&self.pending) {
+                    Ok(line) => line.to_owned(),
+                    Err(_) => {
+                        return Err(FrameDecodeFailure {
+                            frames,
+                            error: FrameError::InvalidUtf8,
+                        });
+                    }
+                };
 
                 frames.push(line);
                 self.pending.clear();
@@ -62,17 +80,57 @@ impl FrameDecoder {
 pub enum JsonError {
     InvalidJson,
     ExpectedObject,
+    DuplicateKey,
+}
+
+struct UniqueJsonObject(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for UniqueJsonObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for UniqueObjectVisitor {
+            type Value = UniqueJsonObject;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut fields = serde_json::Map::new();
+
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if fields.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate JSON key"));
+                    }
+
+                    fields.insert(key, value);
+                }
+
+                Ok(UniqueJsonObject(fields))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueObjectVisitor)
+    }
 }
 
 pub fn parse_json_object(
     frame: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, JsonError> {
-    let value: serde_json::Value =
-        serde_json::from_str(frame).map_err(|_| JsonError::InvalidJson)?;
-
-    match value {
-        serde_json::Value::Object(fields) => Ok(fields),
-        _ => Err(JsonError::ExpectedObject),
+    match serde_json::from_str::<UniqueJsonObject>(frame) {
+        Ok(UniqueJsonObject(fields)) => Ok(fields),
+        Err(_) => match serde_json::from_str::<serde_json::Value>(frame) {
+            Ok(serde_json::Value::Object(_)) => Err(JsonError::DuplicateKey),
+            Ok(_) => Err(JsonError::ExpectedObject),
+            Err(_) => Err(JsonError::InvalidJson),
+        },
     }
 }
 
@@ -337,7 +395,9 @@ mod tests {
     fn rejects_empty_frame() {
         let mut decoder = FrameDecoder::default();
 
-        assert_eq!(decoder.push(b"\n"), Err(FrameError::EmptyFrame));
+        let failure = decoder.push(b"\n").unwrap_err();
+        assert!(failure.frames.is_empty());
+        assert_eq!(failure.error, FrameError::EmptyFrame);
     }
 
     #[test]
@@ -346,7 +406,9 @@ mod tests {
 
         assert!(decoder.push(&[0xff]).unwrap().is_empty());
 
-        assert_eq!(decoder.push(b"\n"), Err(FrameError::InvalidUtf8));
+        let failure = decoder.push(b"\n").unwrap_err();
+        assert!(failure.frames.is_empty());
+        assert_eq!(failure.error, FrameError::InvalidUtf8);
     }
 
     #[test]
@@ -367,10 +429,10 @@ mod tests {
 
         let mut decoder = FrameDecoder::default();
 
-        assert_eq!(
-            decoder.push(&vec![b'x'; MAX_FRAME_BYTES + 1]),
-            Err(FrameError::FrameTooLong)
-        );
+        let failure = decoder.push(&vec![b'x'; MAX_FRAME_BYTES + 1]).unwrap_err();
+
+        assert!(failure.frames.is_empty());
+        assert_eq!(failure.error, FrameError::FrameTooLong);
     }
 
     #[test]
@@ -379,7 +441,35 @@ mod tests {
 
         decoder.push(&vec![b'x'; MAX_FRAME_BYTES]).unwrap();
 
-        assert_eq!(decoder.push(b"x"), Err(FrameError::FrameTooLong));
+        let failure = decoder.push(b"x").unwrap_err();
+        assert!(failure.frames.is_empty());
+        assert_eq!(failure.error, FrameError::FrameTooLong);
+    }
+
+    #[test]
+    fn preserves_completed_frames_before_later_error() {
+        let cases = [
+            (b"\n".to_vec(), FrameError::EmptyFrame),
+            (vec![0xff, b'\n'], FrameError::InvalidUtf8),
+            (vec![b'x'; MAX_FRAME_BYTES + 1], FrameError::FrameTooLong),
+        ];
+
+        for (tail, expected_error) in cases {
+            let mut combined_input = b"{}\n".to_vec();
+            combined_input.extend_from_slice(&tail);
+
+            let mut combined = FrameDecoder::default();
+            let combined_failure = combined.push(&combined_input).unwrap_err();
+
+            let mut split = FrameDecoder::default();
+            let split_frames = split.push(b"{}\n").unwrap();
+            let split_failure = split.push(&tail).unwrap_err();
+
+            assert_eq!(combined_failure.frames, split_frames);
+            assert_eq!(combined_failure.error, expected_error);
+            assert!(split_failure.frames.is_empty());
+            assert_eq!(split_failure.error, expected_error);
+        }
     }
 
     #[test]
@@ -424,6 +514,23 @@ mod tests {
     fn rejects_non_object_json() {
         for frame in ["null", "false", "42", r#""hello""#, "[]"] {
             assert_eq!(parse_json_object(frame), Err(JsonError::ExpectedObject));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_request_fields() {
+        for frame in [
+            r#"{"id":1,"id":2,"op":"ping"}"#,
+            r#"{"id":1,"i\u0064":2,"op":"ping"}"#,
+            r#"{"id":1,"op":"get","op":"set","key":"power"}"#,
+            r#"{"id":1,"op":"set","key":"power","value":1,"value":2}"#,
+            r#"{"id":1,"op":"subscribe","keys":[],"keys":["power"]}"#,
+        ] {
+            assert_eq!(parse_json_object(frame), Err(JsonError::DuplicateKey));
+            assert_eq!(
+                parse_tcp_request(frame),
+                Err(ParseError::Json(JsonError::DuplicateKey))
+            );
         }
     }
 
