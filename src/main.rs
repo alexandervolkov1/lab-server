@@ -12,6 +12,7 @@ use crate::driver::{Driver, arduino::Arduino};
 use crate::fanout::ObservationFanout;
 use crate::model::{Observation, ParameterDescription, Value};
 
+mod client_limit;
 mod connection;
 mod driver;
 mod fanout;
@@ -56,12 +57,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let (tx, rx) = mpsc::channel::<Observation>();
-    let (command_tx, command_rx) = mpsc::channel::<runtime::DeviceCommand>();
+    let (tx, rx) = mpsc::sync_channel::<Observation>(runtime::OBSERVATION_QUEUE_CAPACITY);
+    let (command_tx, command_rx) =
+        mpsc::sync_channel::<runtime::DeviceCommand>(runtime::COMMAND_QUEUE_CAPACITY);
 
     let latest = Arc::new(Mutex::new(HashMap::<String, Observation>::new()));
 
     let fanout = Arc::new(ObservationFanout::new(128));
+    let tx = runtime::ObservationOutput::new(tx, fanout.loss_epoch());
 
     let listener = TcpListener::bind("127.0.0.1:7240")?;
 
@@ -72,16 +75,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_commands = command_tx.clone();
     let tcp_catalog = Arc::clone(&catalog);
 
+    let slots = client_limit::ClientSlots::new();
     let _tcp_worker = thread::spawn(move || {
         for connection in listener.incoming() {
             match connection {
                 Ok(stream) => {
+                    let Some(slot) = slots.try_acquire() else {
+                        drop(stream);
+                        continue;
+                    };
                     let client_latest = Arc::clone(&tcp_latest);
                     let client_fanout = Arc::clone(&tcp_fanout);
                     let client_commands = tcp_commands.clone();
                     let client_catalog = Arc::clone(&tcp_catalog);
 
-                    thread::spawn(move || {
+                    if let Err(error) = thread::Builder::new().spawn(move || {
+                        let _slot = slot;
                         let result = (|| -> io::Result<()> {
                             let mut connection = TcpConnection::new(stream, 64, 64 * 1024)?;
 
@@ -98,7 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(error) = result {
                             eprintln!("TCP client error: {error}");
                         }
-                    });
+                    }) {
+                        eprintln!("TCP worker spawn error: {error}");
+                    }
                 }
 
                 Err(error) => {
@@ -167,9 +178,9 @@ fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<St
 }
 
 fn queue_read(
-    commands: &mpsc::Sender<runtime::DeviceCommand>,
+    commands: &mpsc::SyncSender<runtime::DeviceCommand>,
     description: ParameterDescription,
-) -> Option<mpsc::Receiver<Observation>> {
+) -> Result<mpsc::Receiver<Observation>, connection::EnqueueError> {
     let (reply_tx, reply_rx) = mpsc::channel();
 
     let command = runtime::DeviceCommand::Read {
@@ -177,17 +188,20 @@ fn queue_read(
         reply: reply_tx,
     };
 
-    commands.send(command).ok()?;
+    commands.try_send(command).map_err(|error| match error {
+        mpsc::TrySendError::Full(_) => connection::EnqueueError::RuntimeBusy,
+        mpsc::TrySendError::Disconnected(_) => connection::EnqueueError::RuntimeUnavailable,
+    })?;
 
-    Some(reply_rx)
+    Ok(reply_rx)
 }
 
 fn queue_set(
-    commands: &mpsc::Sender<runtime::DeviceCommand>,
+    commands: &mpsc::SyncSender<runtime::DeviceCommand>,
     key: String,
     value: Value,
     execution: Arc<crate::pending::SetExecution>,
-) -> Option<mpsc::Receiver<Result<(), String>>> {
+) -> Result<mpsc::Receiver<Result<(), String>>, connection::EnqueueError> {
     let (reply_tx, reply_rx) = mpsc::channel();
 
     let command = runtime::DeviceCommand::Set(runtime::SetCommand {
@@ -197,9 +211,12 @@ fn queue_set(
         reply: reply_tx,
     });
 
-    commands.send(command).ok()?;
+    commands.try_send(command).map_err(|error| match error {
+        mpsc::TrySendError::Full(_) => connection::EnqueueError::RuntimeBusy,
+        mpsc::TrySendError::Disconnected(_) => connection::EnqueueError::RuntimeUnavailable,
+    })?;
 
-    Some(reply_rx)
+    Ok(reply_rx)
 }
 
 #[cfg(test)]
@@ -207,8 +224,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_queue_rejects_overflow_without_blocking() {
+        let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+        for _ in 0..128 {
+            assert!(
+                queue_set(
+                    &tx,
+                    "power".into(),
+                    Value::Integer(1),
+                    crate::pending::SetExecution::new(
+                        std::time::Instant::now() + Duration::from_secs(10)
+                    )
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            queue_set(
+                &tx,
+                "power".into(),
+                Value::Integer(1),
+                crate::pending::SetExecution::new(
+                    std::time::Instant::now() + Duration::from_secs(10)
+                )
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn queues_read_without_waiting_for_device() {
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let description = ParameterDescription {
             id: "configuration".to_owned(),
@@ -253,15 +299,15 @@ mod tests {
         assert_eq!(observation.source, "configuration");
         assert_eq!(observation.reading, Ok(Value::Integer(30)));
 
-        let (closed_tx, closed_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         drop(closed_rx);
 
-        assert!(queue_read(&closed_tx, description).is_none());
+        assert!(queue_read(&closed_tx, description).is_err());
     }
 
     #[test]
     fn queues_set_without_waiting_for_device() {
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let reply_rx = queue_set(
             &command_tx,
@@ -291,7 +337,7 @@ mod tests {
 
         assert_eq!(reply_rx.try_recv(), Ok(Ok(())));
 
-        let (closed_tx, closed_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         drop(closed_rx);
 
         assert!(
@@ -303,7 +349,7 @@ mod tests {
                     std::time::Instant::now() + Duration::from_secs(10)
                 )
             )
-            .is_none()
+            .is_err()
         );
     }
 

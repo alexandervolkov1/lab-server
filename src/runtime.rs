@@ -1,9 +1,39 @@
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::driver::{DeviceIo, Driver};
 use crate::model::{Observation, ParameterDescription, Value};
+
+pub const COMMAND_QUEUE_CAPACITY: usize = 128;
+pub const OBSERVATION_QUEUE_CAPACITY: usize = 128;
+
+pub struct ObservationOutput {
+    sender: SyncSender<Observation>,
+    loss_epoch: Arc<AtomicU64>,
+}
+
+impl ObservationOutput {
+    pub fn new(sender: SyncSender<Observation>, loss_epoch: Arc<AtomicU64>) -> Self {
+        Self { sender, loss_epoch }
+    }
+
+    fn publish(&self, observation: Observation) -> bool {
+        match self.sender.try_send(observation) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                // Never block device I/O. Existing streams must terminate explicitly.
+                self.loss_epoch.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
 
 pub struct PollTask {
     pub description: ParameterDescription,
@@ -65,7 +95,11 @@ fn execute_command<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command
                 });
                 return;
             }
-            let result = driver.write(&command.parameter, &command.value, port);
+            // The driver returns untyped errors, including transport failures after
+            // the write. Conservatively report uncertainty for every such failure.
+            let result = driver
+                .write(&command.parameter, &command.value, port)
+                .map_err(|_| "outcome_unknown".to_owned());
             command.execution.complete(|| {
                 let _ = command.reply.send(result);
             });
@@ -99,7 +133,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
     mut driver: D,
     mut port: P,
     tasks: Vec<PollTask>,
-    tx: Sender<Observation>,
+    tx: ObservationOutput,
     commands: Receiver<DeviceCommand>,
 ) {
     if tasks.is_empty() {
@@ -156,7 +190,7 @@ pub fn run_polling<D: Driver, P: DeviceIo>(
 
         let period = task.period;
 
-        if tx.send(observation).is_err() {
+        if !tx.publish(observation) {
             break;
         }
 
@@ -171,8 +205,30 @@ mod tests {
     use super::*;
     use crate::model::Spec;
 
+    #[test]
+    fn upstream_overflow_is_nonblocking_and_signals_loss() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let output = ObservationOutput::new(tx, epoch.clone());
+        let observation = Observation {
+            source: "test".into(),
+            unit: "".into(),
+            completed_at: SystemTime::now(),
+            reading: Ok(Value::Integer(1)),
+        };
+        assert!(output.publish(observation.clone()));
+        assert!(output.publish(observation.clone()));
+        assert_eq!(epoch.load(std::sync::atomic::Ordering::SeqCst), 1);
+        rx.try_recv().unwrap();
+        assert!(output.publish(observation.clone()));
+        assert_eq!(epoch.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(rx);
+        assert!(!output.publish(observation));
+    }
+
     struct CallbackDriver<F: FnMut()> {
         writes: usize,
+        result: Result<(), String>,
         on_write: F,
     }
 
@@ -186,8 +242,33 @@ mod tests {
         fn write(&mut self, _: &str, _: &Value, _: &mut dyn DeviceIo) -> Result<(), String> {
             self.writes += 1;
             (self.on_write)();
-            Ok(())
+            self.result.clone()
         }
+    }
+
+    #[test]
+    fn driver_failure_after_start_reports_unknown_outcome() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let command = DeviceCommand::Set(SetCommand {
+            execution: crate::pending::SetExecution::new(
+                Instant::now() + Duration::from_secs(3600),
+            ),
+            parameter: "power".into(),
+            value: Value::Integer(20),
+            reply: tx,
+        });
+        let mut driver = CallbackDriver {
+            writes: 0,
+            result: Err("reply lost".into()),
+            on_write: || {},
+        };
+        execute_command(
+            &mut driver,
+            &mut BufReader::new(Cursor::new(Vec::<u8>::new())),
+            command,
+        );
+        assert_eq!(rx.try_recv().unwrap(), Err("outcome_unknown".into()));
+        assert_eq!(driver.writes, 1);
     }
 
     fn set_timeout_case(expired_in_queue: bool, delayed_reply: bool) {
@@ -200,7 +281,7 @@ mod tests {
             now
         };
         let mut session = ClientSession::new(1, 1024);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let description = ParameterDescription {
             id: "power".into(),
             spec: Spec::Integer { min: 0, max: 100 },
@@ -221,6 +302,7 @@ mod tests {
         let command = rx.try_recv().unwrap();
         let mut driver = CallbackDriver {
             writes: 0,
+            result: Ok(()),
             on_write: || {
                 if delayed_reply {
                     session
@@ -319,7 +401,8 @@ mod tests {
         driver: SlowDriver,
         commands: Receiver<DeviceCommand>,
     ) -> (Receiver<Observation>, thread::JoinHandle<()>) {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(OBSERVATION_QUEUE_CAPACITY);
+        let tx = ObservationOutput::new(tx, Arc::new(AtomicU64::new(0)));
 
         let worker = thread::spawn(move || {
             let port = BufReader::new(Cursor::new(Vec::<u8>::new()));
@@ -398,7 +481,8 @@ mod tests {
 
     #[test]
     fn processes_set_during_overloaded_polling() {
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let (observations, worker) = spawn_overloaded_worker(
             SlowDriver {
@@ -433,7 +517,8 @@ mod tests {
 
     #[test]
     fn polling_continues_with_queued_writes() {
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel::<DeviceCommand>(COMMAND_QUEUE_CAPACITY);
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
 
         for _ in 0..100 {
@@ -469,7 +554,8 @@ mod tests {
 
     #[test]
     fn reads_on_demand_during_overloaded_polling() {
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let (observations, worker) = spawn_overloaded_worker(
             SlowDriver {
@@ -503,9 +589,11 @@ mod tests {
 
     #[test]
     fn handles_commands_without_polling_tasks() {
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel::<DeviceCommand>(COMMAND_QUEUE_CAPACITY);
 
-        let (observation_tx, observation_rx) = std::sync::mpsc::channel::<Observation>();
+        let (observation_tx, observation_rx) =
+            std::sync::mpsc::sync_channel::<Observation>(OBSERVATION_QUEUE_CAPACITY);
 
         let worker = thread::spawn(move || {
             let port = BufReader::new(Cursor::new(Vec::<u8>::new()));
@@ -517,7 +605,7 @@ mod tests {
                 },
                 port,
                 Vec::new(),
-                observation_tx,
+                ObservationOutput::new(observation_tx, Arc::new(AtomicU64::new(0))),
                 command_rx,
             );
         });

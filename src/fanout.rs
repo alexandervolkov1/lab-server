@@ -14,10 +14,23 @@ pub struct ObservationReceiver {
     receiver: Receiver<PublishedObservation>,
     pub clock: Arc<AtomicU64>,
     _lifetime: Arc<()>,
+    loss_epoch: Arc<AtomicU64>,
+    registered_epoch: u64,
 }
 
 impl ObservationReceiver {
+    pub fn closed_error(&self) -> &'static str {
+        if self.loss_epoch.load(Ordering::SeqCst) != self.registered_epoch {
+            "observation_data_lost"
+        } else {
+            "observation_stream_closed"
+        }
+    }
+
     pub fn try_recv(&self) -> Result<PublishedObservation, mpsc::TryRecvError> {
+        if self.loss_epoch.load(Ordering::SeqCst) != self.registered_epoch {
+            return Err(mpsc::TryRecvError::Disconnected);
+        }
         self.receiver.try_recv()
     }
 }
@@ -26,6 +39,7 @@ pub struct ObservationFanout {
     queue_capacity: usize,
     subscribers: Mutex<Vec<(Weak<()>, SyncSender<PublishedObservation>)>>,
     clock: Arc<AtomicU64>,
+    loss_epoch: Arc<AtomicU64>,
 }
 
 impl ObservationFanout {
@@ -35,8 +49,13 @@ impl ObservationFanout {
         Self {
             queue_capacity,
             clock: Arc::new(AtomicU64::new(0)),
+            loss_epoch: Arc::new(AtomicU64::new(0)),
             subscribers: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn loss_epoch(&self) -> Arc<AtomicU64> {
+        self.loss_epoch.clone()
     }
 
     pub fn register(&self) -> io::Result<ObservationReceiver> {
@@ -52,6 +71,8 @@ impl ObservationFanout {
             receiver,
             clock: self.clock.clone(),
             _lifetime: lifetime,
+            loss_epoch: self.loss_epoch.clone(),
+            registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
         })
     }
 
@@ -88,6 +109,39 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use crate::model::Value;
+
+    #[test]
+    fn upstream_loss_closes_existing_streams_and_allows_reconnect() {
+        let fanout = ObservationFanout::new(2);
+        let first = fanout.register().unwrap();
+        let second = fanout.register().unwrap();
+        fanout.publish(&observation(20.0)).unwrap();
+        fanout.loss_epoch().fetch_add(1, Ordering::SeqCst);
+        assert!(matches!(
+            first.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            second.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(first.closed_error(), "observation_data_lost");
+        let reconnected = fanout.register().unwrap();
+        fanout.publish(&observation(21.0)).unwrap();
+        assert_eq!(
+            reconnected.try_recv().unwrap().observation.reading,
+            Ok(Value::Float(21.0))
+        );
+    }
+
+    #[test]
+    fn disconnected_registrations_do_not_accumulate_without_publications() {
+        let fanout = ObservationFanout::new(1);
+        for _ in 0..1000 {
+            drop(fanout.register().unwrap());
+        }
+        assert_eq!(fanout.subscribers.lock().unwrap().len(), 1);
+    }
 
     fn observation(value: f64) -> Observation {
         Observation {

@@ -121,6 +121,55 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn timeout_and_start_have_one_winner() {
+        for _ in 0..100 {
+            let deadline = Instant::now() + Duration::from_secs(3600);
+            let execution = SetExecution::new(deadline);
+            let (tx, rx) = mpsc::channel();
+            let pending = Pending::new(1, deadline, rx).with_execution(execution.clone());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let worker_barrier = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                let started = execution.try_start();
+                if started {
+                    execution.complete(|| {
+                        let _ = tx.send(());
+                    });
+                }
+                started
+            });
+            barrier.wait();
+            let completion = pending.poll(deadline);
+            let started = worker.join().unwrap();
+            match completion {
+                Poll::Finished(Completion::Timeout { .. } | Completion::Disconnected { .. }) => {
+                    assert!(!started)
+                }
+                Poll::Finished(Completion::OutcomeUnknown { .. } | Completion::Received { .. }) => {
+                    assert!(started)
+                }
+                Poll::Waiting(_) => panic!("deadline must finish the request"),
+            }
+        }
+    }
+
+    #[test]
+    fn started_set_with_disconnected_reply_has_unknown_outcome() {
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let execution = SetExecution::new(deadline);
+        let (tx, rx) = mpsc::channel::<()>();
+        assert!(execution.try_start());
+        drop(tx);
+        assert!(matches!(
+            Pending::new(1, deadline, rx)
+                .with_execution(execution)
+                .poll(Instant::now()),
+            Poll::Finished(Completion::OutcomeUnknown { id: 1 })
+        ));
+    }
+
+    #[test]
     fn waits_then_receives_result() {
         let (sender, receiver) = mpsc::channel();
         let now = Instant::now();

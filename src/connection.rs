@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -16,6 +16,7 @@ pub enum EnqueueError {
     DuplicateId,
     Full,
     RuntimeUnavailable,
+    RuntimeBusy,
 }
 
 pub enum FinishedRequest {
@@ -131,11 +132,11 @@ impl PendingRequests {
         &mut self,
         id: u64,
         deadline: Instant,
-        enqueue: impl FnOnce() -> Option<Receiver<Observation>>,
+        enqueue: impl FnOnce() -> Result<Receiver<Observation>, EnqueueError>,
     ) -> Result<(), EnqueueError> {
         self.ensure_available(id)?;
 
-        let receiver = enqueue().ok_or(EnqueueError::RuntimeUnavailable)?;
+        let receiver = enqueue()?;
 
         self.entries.push_back(Entry::Read {
             id,
@@ -151,12 +152,12 @@ impl PendingRequests {
         deadline: Instant,
         enqueue: impl FnOnce(
             std::sync::Arc<crate::pending::SetExecution>,
-        ) -> Option<Receiver<Result<(), String>>>,
+        ) -> Result<Receiver<Result<(), String>>, EnqueueError>,
     ) -> Result<(), EnqueueError> {
         self.ensure_available(id)?;
 
         let execution = crate::pending::SetExecution::new(deadline);
-        let receiver = enqueue(execution.clone()).ok_or(EnqueueError::RuntimeUnavailable)?;
+        let receiver = enqueue(execution.clone())?;
 
         self.entries.push_back(Entry::Set {
             id,
@@ -456,7 +457,7 @@ impl ClientSession {
         id: u64,
         key: String,
         value: Value,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         now: Instant,
     ) -> io::Result<()> {
@@ -484,6 +485,7 @@ impl ClientSession {
                     EnqueueError::DuplicateId => "duplicate_id",
                     EnqueueError::Full => "too_many_pending",
                     EnqueueError::RuntimeUnavailable => "runtime_unavailable",
+                    EnqueueError::RuntimeBusy => "runtime_busy",
                 };
 
                 self.queue_error(id, code)
@@ -495,7 +497,7 @@ impl ClientSession {
         &mut self,
         id: u64,
         key: String,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
@@ -545,6 +547,7 @@ impl ClientSession {
                     EnqueueError::DuplicateId => "duplicate_id",
                     EnqueueError::Full => "too_many_pending",
                     EnqueueError::RuntimeUnavailable => "runtime_unavailable",
+                    EnqueueError::RuntimeBusy => "runtime_busy",
                 };
 
                 self.queue_error(id, code)
@@ -648,7 +651,7 @@ impl ClientSession {
     pub fn dispatch_incoming(
         &mut self,
         incoming: Incoming,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
@@ -751,14 +754,13 @@ impl ClientSession {
                     "error": code
                 });
 
-                if let Ok(object) = crate::protocol::parse_json_object(&frame) {
-                    if let Some(id) = object
+                if let Ok(object) = crate::protocol::parse_json_object(&frame)
+                    && let Some(id) = object
                         .get("id")
                         .and_then(serde_json::Value::as_u64)
                         .filter(|id| *id > 0)
-                    {
-                        response["id"] = json!(id);
-                    }
+                {
+                    response["id"] = json!(id);
                 }
 
                 self.queue_response(&response.to_string())?;
@@ -901,7 +903,7 @@ impl TcpConnection {
 
     pub fn drive_once(
         &mut self,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
     ) -> io::Result<bool> {
@@ -940,7 +942,7 @@ impl TcpConnection {
 
     pub fn drive_once_with_observations(
         &mut self,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         observations: &crate::fanout::ObservationReceiver,
@@ -957,11 +959,11 @@ impl TcpConnection {
         for _ in 0..MAX_OBSERVATIONS_PER_TURN {
             match observations.try_recv() {
                 Ok(published) => {
-                    if !self
+                    if self
                         .session
                         .activated_after
                         .get(&published.observation.source)
-                        .is_some_and(|boundary| published.sequence > *boundary)
+                        .is_none_or(|boundary| published.sequence <= *boundary)
                     {
                         continue;
                     }
@@ -981,13 +983,13 @@ impl TcpConnection {
 
                     let response = json!({
                         "status": "error",
-                        "error": "observation_stream_closed"
+                        "error": observations.closed_error()
                     });
 
-                    if let Err(error) = self.session.queue_response(&response.to_string()) {
-                        if !is_output_error(&error) {
-                            return Err(error);
-                        }
+                    if let Err(error) = self.session.queue_response(&response.to_string())
+                        && !is_output_error(&error)
+                    {
+                        return Err(error);
                     }
 
                     break;
@@ -1002,7 +1004,7 @@ impl TcpConnection {
 
     pub fn run(
         &mut self,
-        commands: &Sender<crate::runtime::DeviceCommand>,
+        commands: &SyncSender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         observations: &crate::fanout::ObservationReceiver,
@@ -1041,7 +1043,7 @@ mod tests {
             r#"{"id":9,"op":"ping"}"#,
         ] {
             let mut session = ClientSession::new(2, 2048);
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
             let catalog = power_catalog();
             let latest = Mutex::new(HashMap::new());
             for frame in [
@@ -1085,7 +1087,7 @@ mod tests {
 
     #[test]
     fn request_ids_are_independent_between_clients() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         for _ in 0..2 {
             let mut session = ClientSession::new(1, 128);
             session
@@ -1125,8 +1127,8 @@ mod tests {
         let (read_tx, read_rx) = mpsc::channel();
         let (set_tx, set_rx) = mpsc::channel();
 
-        assert_eq!(pending.add_read(1, deadline, || Some(read_rx)), Ok(()));
-        assert_eq!(pending.add_set(2, deadline, |_| Some(set_rx)), Ok(()));
+        assert_eq!(pending.add_read(1, deadline, || Ok(read_rx)), Ok(()));
+        assert_eq!(pending.add_set(2, deadline, |_| Ok(set_rx)), Ok(()));
 
         assert_eq!(pending.len(), 2);
         assert!(pending.poll(now).is_empty());
@@ -1170,14 +1172,14 @@ mod tests {
         let mut pending = PendingRequests::new(1);
         let (_read_tx, read_rx) = mpsc::channel();
 
-        assert_eq!(pending.add_read(7, deadline, || Some(read_rx)), Ok(()));
+        assert_eq!(pending.add_read(7, deadline, || Ok(read_rx)), Ok(()));
 
         let called = Cell::new(false);
 
         assert_eq!(
             pending.add_set(7, deadline, |_| {
                 called.set(true);
-                None
+                Err(EnqueueError::RuntimeUnavailable)
             }),
             Err(EnqueueError::DuplicateId)
         );
@@ -1187,7 +1189,7 @@ mod tests {
         assert_eq!(
             pending.add_set(8, deadline, |_| {
                 called.set(true);
-                None
+                Err(EnqueueError::RuntimeUnavailable)
             }),
             Err(EnqueueError::Full)
         );
@@ -1204,7 +1206,7 @@ mod tests {
         let mut pending = PendingRequests::new(1);
 
         assert_eq!(
-            pending.add_set(1, deadline, |_| None),
+            pending.add_set(1, deadline, |_| Err(EnqueueError::RuntimeUnavailable)),
             Err(EnqueueError::RuntimeUnavailable)
         );
 
@@ -1212,7 +1214,7 @@ mod tests {
 
         let (_sender, receiver) = mpsc::channel();
 
-        assert_eq!(pending.add_set(1, deadline, |_| Some(receiver)), Ok(()));
+        assert_eq!(pending.add_set(1, deadline, |_| Ok(receiver)), Ok(()));
         assert_eq!(pending.len(), 1);
     }
 
@@ -1227,10 +1229,10 @@ mod tests {
         let (_set_tx, set_rx) = mpsc::channel();
 
         pending
-            .add_read(1, now + Duration::from_secs(10), || Some(read_rx))
+            .add_read(1, now + Duration::from_secs(10), || Ok(read_rx))
             .unwrap();
 
-        pending.add_set(2, now, |_| Some(set_rx)).unwrap();
+        pending.add_set(2, now, |_| Ok(set_rx)).unwrap();
 
         let finished = pending.poll(now);
 
@@ -1563,7 +1565,7 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(51, now + Duration::from_secs(10), |_| Some(reply_rx))
+            .add_set(51, now + Duration::from_secs(10), |_| Ok(reply_rx))
             .unwrap();
 
         client.shutdown(Shutdown::Write).unwrap();
@@ -1639,7 +1641,7 @@ mod tests {
         let (mut connection, mut client) = loopback_pair();
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         client
             .write_all(b"{\"id\":23,\"op\":\"ping\"}\n{\"id\":24")
@@ -1715,12 +1717,12 @@ mod tests {
 
         session
             .pending
-            .add_read(7, deadline, || Some(read_rx))
+            .add_read(7, deadline, || Ok(read_rx))
             .unwrap();
 
         session
             .pending
-            .add_set(8, deadline, |_| Some(set_rx))
+            .add_set(8, deadline, |_| Ok(set_rx))
             .unwrap();
 
         session.collect_ready(now).unwrap();
@@ -1765,10 +1767,10 @@ mod tests {
 
         session
             .pending
-            .add_read(1, now + Duration::from_secs(10), || Some(read_rx))
+            .add_read(1, now + Duration::from_secs(10), || Ok(read_rx))
             .unwrap();
 
-        session.pending.add_set(2, now, |_| Some(set_rx)).unwrap();
+        session.pending.add_set(2, now, |_| Ok(set_rx)).unwrap();
 
         session.collect_ready(now).unwrap();
 
@@ -1800,7 +1802,7 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(13, now + Duration::from_secs(10), |_| Some(reply_rx))
+            .add_set(13, now + Duration::from_secs(10), |_| Ok(reply_rx))
             .unwrap();
 
         reply_tx.send(Ok(())).unwrap();
@@ -1842,7 +1844,7 @@ mod tests {
 
         session
             .pending
-            .add_set(1, now + Duration::from_secs(10), |_| Some(reply_rx))
+            .add_set(1, now + Duration::from_secs(10), |_| Ok(reply_rx))
             .unwrap();
 
         reply_tx.send(Ok(())).unwrap();
@@ -1858,7 +1860,7 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let now = Instant::now();
         let deadline = now + Duration::from_secs(10);
@@ -1869,13 +1871,13 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(1, deadline, |_| Some(first_rx))
+            .add_set(1, deadline, |_| Ok(first_rx))
             .unwrap();
 
         connection
             .session
             .pending
-            .add_set(2, deadline, |_| Some(second_rx))
+            .add_set(2, deadline, |_| Ok(second_rx))
             .unwrap();
 
         first_tx.send(Ok(())).unwrap();
@@ -1920,7 +1922,7 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         client.write_all(b"{\"id\":81,\"op\":\"ping\"}\n").unwrap();
 
@@ -2012,7 +2014,7 @@ mod tests {
             let description = catalog.get_mut("power").unwrap();
             description.writable = writable;
             description.spec = spec;
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
             let mut session = ClientSession::new(1, 1024);
             session
                 .dispatch_set(1, "power".into(), value, &tx, &catalog, Instant::now())
@@ -2043,7 +2045,7 @@ mod tests {
         let catalog = power_catalog();
 
         let mut session = ClientSession::new(1, 512);
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         session
             .dispatch_set(
@@ -2130,7 +2132,7 @@ mod tests {
         let (mut connection, mut client) = loopback_pair();
         let catalog = power_catalog();
 
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         client
             .write_all(b"{\"id\":10,\"op\":\"set\",\"key\":\"power\",\"value\":25}\n")
@@ -2232,7 +2234,7 @@ mod tests {
         let mut session = ClientSession::new(1, 512);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let now = Instant::now();
 
@@ -2294,7 +2296,7 @@ mod tests {
         let mut session = ClientSession::new(1, 512);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let now = Instant::now();
 
@@ -2351,7 +2353,7 @@ mod tests {
         let mut session = ClientSession::new(1, 512);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let now = Instant::now();
 
@@ -2418,7 +2420,7 @@ mod tests {
         catalog.extend(power_catalog());
 
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let input = concat!(
             "{\"id\":1,\"op\":\"ping\"}\n",
@@ -2476,7 +2478,7 @@ mod tests {
         let mut session = ClientSession::new(2, 512);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let input = concat!(
             "{\"id\":4,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n",
@@ -2532,13 +2534,13 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
 
         session
             .pending
-            .add_read(7, now + Duration::from_secs(10), || Some(pending_rx))
+            .add_read(7, now + Duration::from_secs(10), || Ok(pending_rx))
             .unwrap();
 
         let input = concat!(
@@ -2593,13 +2595,13 @@ mod tests {
         catalog.extend(power_catalog());
 
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
 
         session
             .pending
-            .add_read(7, now + Duration::from_secs(10), || Some(pending_rx))
+            .add_read(7, now + Duration::from_secs(10), || Ok(pending_rx))
             .unwrap();
 
         let input = concat!(
@@ -2809,7 +2811,7 @@ mod tests {
         catalog.insert(heater.id.clone(), heater);
 
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let input = concat!(
             "{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\",\"configuration\"]}\n",
@@ -2874,7 +2876,7 @@ mod tests {
         let mut session = ClientSession::new(2, 4096);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let input = concat!(
             "{\"id\":10,\"op\":\"unknown\"}\n",
@@ -2940,7 +2942,7 @@ mod tests {
         let mut session = ClientSession::new(2, 512);
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let incoming = session.receive(b"{\"id\":1,\"op\":\"ping\"}\n\n");
 
@@ -2997,7 +2999,7 @@ mod tests {
 
         session
             .pending
-            .add_set(7, now + Duration::from_secs(10), |_| Some(reply_rx))
+            .add_set(7, now + Duration::from_secs(10), |_| Ok(reply_rx))
             .unwrap();
 
         let incoming = session.receive(b"\n");
@@ -3009,7 +3011,7 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         for event in incoming {
             assert!(
@@ -3058,7 +3060,8 @@ mod tests {
             let mut session = ClientSession::new(1, 256);
             let catalog = HashMap::new();
             let latest = Mutex::new(HashMap::new());
-            let (command_tx, _command_rx) = mpsc::channel();
+            let (command_tx, _command_rx) =
+                mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
             let incoming = session.receive(&bytes);
 
@@ -3092,7 +3095,7 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -3100,7 +3103,7 @@ mod tests {
             .session
             .pending
             .add_set(61, Instant::now() + Duration::from_secs(10), |_| {
-                Some(reply_rx)
+                Ok(reply_rx)
             })
             .unwrap();
 
@@ -3162,7 +3165,7 @@ mod tests {
 
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         client
             .write_all(b"{\"id\":71,\"op\":\"ping\"}\n\n")
@@ -3217,7 +3220,7 @@ mod tests {
         connection.session.outbound = OutboundBuffer::new(4096);
         let fanout = crate::fanout::ObservationFanout::new(8);
         let observations = fanout.register().unwrap();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
         fanout.publish(&observation()).unwrap();
@@ -3253,13 +3256,171 @@ mod tests {
     }
 
     #[test]
+    fn tcp_disconnect_releases_slot_for_reconnection() {
+        let slots = crate::client_limit::ClientSlots::new();
+        let held: Vec<_> = (1..crate::client_limit::MAX_CLIENTS)
+            .map(|_| slots.try_acquire().unwrap())
+            .collect();
+        for _ in 0..2 {
+            let slot = slots.try_acquire().unwrap();
+            assert!(slots.try_acquire().is_none());
+            let (mut connection, client) = loopback_pair();
+            let worker = std::thread::spawn(move || {
+                let _slot = slot;
+                let (tx, _rx) = mpsc::sync_channel(1);
+                let fanout = crate::fanout::ObservationFanout::new(1);
+                let observations = fanout.register().unwrap();
+                connection
+                    .run(
+                        &tx,
+                        &HashMap::new(),
+                        &Mutex::new(HashMap::new()),
+                        &observations,
+                    )
+                    .unwrap();
+            });
+            client.shutdown(Shutdown::Both).unwrap();
+            worker.join().unwrap();
+        }
+        drop(held);
+    }
+
+    #[test]
+    fn tcp_reports_upstream_data_loss() {
+        let (mut connection, mut client) = loopback_pair();
+        let fanout = crate::fanout::ObservationFanout::new(2);
+        let observations = fanout.register().unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        fanout
+            .loss_epoch()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connection
+                .drive_once_with_observations(
+                    &tx,
+                    &get_catalog(),
+                    &Mutex::new(HashMap::new()),
+                    &observations
+                )
+                .unwrap()
+        );
+        drop(connection);
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["error"],
+            "observation_data_lost"
+        );
+    }
+
+    #[test]
+    fn runtime_queue_overflow_releases_pending_capacity() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let catalog = power_catalog();
+        let mut session = ClientSession::new(4, 1024);
+        let now = Instant::now();
+        session
+            .dispatch_set(1, "power".into(), Value::Integer(1), &tx, &catalog, now)
+            .unwrap();
+        session
+            .dispatch_set(2, "power".into(), Value::Integer(2), &tx, &catalog, now)
+            .unwrap();
+        session
+            .dispatch_get(
+                3,
+                "power".into(),
+                &tx,
+                &catalog,
+                &Mutex::new(HashMap::new()),
+                now,
+            )
+            .unwrap();
+        assert_eq!(session.pending.len(), 1);
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+        let messages: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["error"], "runtime_busy");
+        assert_eq!(messages[1]["error"], "runtime_busy");
+    }
+
+    #[test]
+    fn subscription_boundaries_are_per_key_and_per_client() {
+        let fanout = crate::fanout::ObservationFanout::new(16);
+        let catalog = get_catalog();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let latest = Mutex::new(HashMap::new());
+        let (mut first, mut first_client) = loopback_pair();
+        let (mut second, mut second_client) = loopback_pair();
+        first.session.outbound = OutboundBuffer::new(4096);
+        second.session.outbound = OutboundBuffer::new(4096);
+        let first_rx = fanout.register().unwrap();
+        let second_rx = fanout.register().unwrap();
+        for session in [&mut first.session, &mut second.session] {
+            session.observation_clock = Some(first_rx.clock.clone());
+        }
+        let keys = vec!["sample_temperature".into()];
+        first
+            .session
+            .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
+            .unwrap();
+        fanout.publish(&observation()).unwrap();
+        second
+            .session
+            .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
+            .unwrap();
+        // Idempotent subscribe must preserve the first client's queued event.
+        first
+            .session
+            .dispatch_subscription(2, SubscriptionChange::Subscribe, keys.clone(), &catalog)
+            .unwrap();
+        first
+            .drive_once_with_observations(&tx, &catalog, &latest, &first_rx)
+            .unwrap();
+        second
+            .drive_once_with_observations(&tx, &catalog, &latest, &second_rx)
+            .unwrap();
+        first
+            .session
+            .dispatch_subscription(3, SubscriptionChange::Unsubscribe, keys.clone(), &catalog)
+            .unwrap();
+        fanout.publish(&observation()).unwrap();
+        first
+            .session
+            .dispatch_subscription(4, SubscriptionChange::Subscribe, keys, &catalog)
+            .unwrap();
+        first
+            .drive_once_with_observations(&tx, &catalog, &latest, &first_rx)
+            .unwrap();
+        second
+            .drive_once_with_observations(&tx, &catalog, &latest, &second_rx)
+            .unwrap();
+        drop(first);
+        drop(second);
+        for client in [&mut first_client, &mut second_client] {
+            let mut text = String::new();
+            client.read_to_string(&mut text).unwrap();
+            let events = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|message| message.get("event").is_some())
+                .count();
+            assert_eq!(events, 1);
+        }
+    }
+
+    #[test]
     fn tcp_streams_only_subscribed_observations() {
         let (mut connection, mut client) = loopback_pair();
 
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
 
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let source_tx = crate::fanout::ObservationFanout::new(8);
         let source_rx = source_tx.register().unwrap();
 
@@ -3334,7 +3495,7 @@ mod tests {
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
 
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let observation_tx = crate::fanout::ObservationFanout::new(8);
         let observation_rx = observation_tx.register().unwrap();
 
@@ -3533,7 +3694,7 @@ mod tests {
 
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
         let fanout = crate::fanout::ObservationFanout::new(1);
         let observations = fanout.register().unwrap();
@@ -3615,7 +3776,7 @@ mod tests {
     fn tcp_run_combines_commands_and_observation_stream() {
         let (mut connection, mut client) = loopback_pair();
 
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let observation_tx = crate::fanout::ObservationFanout::new(2);
         let observation_rx = observation_tx.register().unwrap();
 

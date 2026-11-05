@@ -1,3 +1,40 @@
+//! TCP contract (NDJSON on 127.0.0.1:7240, protocol version 1).
+//!
+//! Request IDs are positive u64 values, strictly increasing within a connection.
+//! A valid ID is consumed even when the operation or its contents are rejected.
+//! Repeated or smaller IDs produce `duplicate_id` WITHOUT an `id` field; the
+//! original pending request remains eligible for its single response. Invalid
+//! JSON, duplicate JSON fields and invalid IDs do not consume an ID. Clients
+//! must reconnect before exhausting u64; independent connections have independent IDs.
+//!
+//! Set is validated against the catalog before queueing. Its ten-second deadline
+//! includes queue time. Starting driver.write and cancelling a queued Set are
+//! mutually exclusive: `runtime_timeout` means it did not start. Once started,
+//! a timeout, lost reply channel, or untyped driver failure produces
+//! `outcome_unknown`; clients must not assume the write failed or blindly retry.
+//! An available definitive reply wins over timeout; late replies never produce
+//! another response. Driver validation remains a second line of defense.
+//!
+//! Subscription activation is linearized against the fanout publication counter,
+//! independently for each newly subscribed key. Publications at or before that
+//! boundary are excluded. The subscribe ACK precedes all events for new keys;
+//! retained keys keep their boundary on an idempotent subscribe. Accepted events
+//! preserve publication order. Unsubscribe ACK follows already queued events and
+//! prevents further events for removed keys. A cached get is independent of this
+//! stream and may return an earlier measurement.
+//!
+//! At most 32 clients have workers; excess connections are closed. Device commands
+//! and upstream observations each have capacity 128. Command admission never
+//! waits: a full queue returns `runtime_busy`, a closed queue `runtime_unavailable`.
+//! Upstream observation overflow continues device polling but invalidates every
+//! existing stream with terminal `observation_data_lost` (without request ID).
+//! Reconnection creates a new stream. Per-client fanout overflow terminates that
+//! client with `observation_stream_closed`. These errors mean delivery is incomplete.
+//! An exhausted output buffer or transport failure may only permit connection
+//! closure; EOF is never proof of complete measurement delivery or Set failure.
+//! There is no replay across reconnects. The per-client pending, subscription and
+//! output limits remain 64, 64 and 64 KiB respectively.
+
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
