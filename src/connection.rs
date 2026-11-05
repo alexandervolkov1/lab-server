@@ -456,8 +456,14 @@ impl ClientSession {
         catalog: &HashMap<String, ParameterDescription>,
         now: Instant,
     ) -> io::Result<()> {
-        if !catalog.contains_key(&key) {
+        let Some(description) = catalog.get(&key) else {
             return self.queue_error(id, "unknown_key");
+        };
+        if !description.writable {
+            return self.queue_error(id, "Parameter is read-only");
+        }
+        if !description.spec.accepts(&value) {
+            return self.queue_error(id, "Value does not match parameter spec");
         }
 
         let result = self
@@ -1937,6 +1943,78 @@ mod tests {
         };
 
         HashMap::from([(description.id.clone(), description)])
+    }
+
+    #[test]
+    fn validates_set_spec_before_queueing() {
+        for (writable, spec, value, expected) in [
+            (
+                false,
+                crate::model::Spec::Integer { min: 0, max: 100 },
+                Value::Integer(20),
+                Some("Parameter is read-only"),
+            ),
+            (
+                true,
+                crate::model::Spec::Integer { min: 0, max: 100 },
+                Value::Float(20.0),
+                Some("Value does not match parameter spec"),
+            ),
+            (
+                true,
+                crate::model::Spec::Integer { min: 0, max: 100 },
+                Value::Integer(101),
+                Some("Value does not match parameter spec"),
+            ),
+            (
+                true,
+                crate::model::Spec::Float {
+                    min: 0.0,
+                    max: 100.0,
+                },
+                Value::Float(f64::NAN),
+                Some("Value does not match parameter spec"),
+            ),
+            (
+                true,
+                crate::model::Spec::Integer { min: 100, max: 0 },
+                Value::Integer(20),
+                Some("Value does not match parameter spec"),
+            ),
+            (
+                true,
+                crate::model::Spec::Integer { min: 0, max: 100 },
+                Value::Integer(20),
+                None,
+            ),
+        ] {
+            let mut catalog = power_catalog();
+            let description = catalog.get_mut("power").unwrap();
+            description.writable = writable;
+            description.spec = spec;
+            let (tx, rx) = mpsc::channel();
+            let mut session = ClientSession::new(1, 1024);
+            session
+                .dispatch_set(1, "power".into(), value, &tx, &catalog, Instant::now())
+                .unwrap();
+            if let Some(expected) = expected {
+                assert!(rx.try_recv().is_err(), "invalid Set reached device queue");
+                assert!(session.pending.is_empty());
+                let mut bytes = Vec::new();
+                session.outbound.flush_to(&mut bytes).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
+                    expected
+                );
+            } else {
+                assert!(matches!(
+                    rx.try_recv(),
+                    Ok(crate::runtime::DeviceCommand::Set(_))
+                ));
+                assert!(rx.try_recv().is_err());
+                assert_eq!(session.pending.len(), 1);
+            }
+        }
     }
 
     #[test]
