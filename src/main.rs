@@ -186,10 +186,12 @@ fn queue_set(
     commands: &mpsc::Sender<runtime::DeviceCommand>,
     key: String,
     value: Value,
+    execution: Arc<crate::pending::SetExecution>,
 ) -> Option<mpsc::Receiver<Result<(), String>>> {
     let (reply_tx, reply_rx) = mpsc::channel();
 
     let command = runtime::DeviceCommand::Set(runtime::SetCommand {
+        execution,
         parameter: key,
         value,
         reply: reply_tx,
@@ -261,7 +263,13 @@ mod tests {
     fn queues_set_without_waiting_for_device() {
         let (command_tx, command_rx) = mpsc::channel();
 
-        let reply_rx = queue_set(&command_tx, "power".to_owned(), Value::Integer(25)).unwrap();
+        let reply_rx = queue_set(
+            &command_tx,
+            "power".to_owned(),
+            Value::Integer(25),
+            crate::pending::SetExecution::new(std::time::Instant::now() + Duration::from_secs(10)),
+        )
+        .unwrap();
 
         assert!(matches!(
             reply_rx.try_recv(),
@@ -286,7 +294,17 @@ mod tests {
         let (closed_tx, closed_rx) = mpsc::channel();
         drop(closed_rx);
 
-        assert!(queue_set(&closed_tx, "power".to_owned(), Value::Integer(25)).is_none());
+        assert!(
+            queue_set(
+                &closed_tx,
+                "power".to_owned(),
+                Value::Integer(25),
+                crate::pending::SetExecution::new(
+                    std::time::Instant::now() + Duration::from_secs(10)
+                )
+            )
+            .is_none()
+        );
     }
 
     #[test]

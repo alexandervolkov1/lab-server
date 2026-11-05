@@ -12,6 +12,7 @@ pub struct PollTask {
 }
 
 pub struct SetCommand {
+    pub execution: std::sync::Arc<crate::pending::SetExecution>,
     pub parameter: String,
     pub value: Value,
     pub reply: Sender<Result<(), String>>,
@@ -58,9 +59,16 @@ fn execute_command<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command
         }
 
         DeviceCommand::Set(command) => {
+            if !command.execution.try_start() {
+                command.execution.complete(|| {
+                    let _ = command.reply.send(Err("runtime_timeout".into()));
+                });
+                return;
+            }
             let result = driver.write(&command.parameter, &command.value, port);
-
-            let _ = command.reply.send(result);
+            command.execution.complete(|| {
+                let _ = command.reply.send(result);
+            });
         }
     }
 }
@@ -162,6 +170,107 @@ mod tests {
 
     use super::*;
     use crate::model::Spec;
+
+    struct CallbackDriver<F: FnMut()> {
+        writes: usize,
+        on_write: F,
+    }
+
+    impl<F: FnMut()> Driver for CallbackDriver<F> {
+        fn parameters(&self) -> Vec<ParameterDescription> {
+            Vec::new()
+        }
+        fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, String> {
+            unreachable!()
+        }
+        fn write(&mut self, _: &str, _: &Value, _: &mut dyn DeviceIo) -> Result<(), String> {
+            self.writes += 1;
+            (self.on_write)();
+            Ok(())
+        }
+    }
+
+    fn set_timeout_case(expired_in_queue: bool, delayed_reply: bool) {
+        use crate::connection::ClientSession;
+        use std::collections::HashMap;
+        let now = Instant::now();
+        let requested_at = if expired_in_queue {
+            now - Duration::from_secs(11)
+        } else {
+            now
+        };
+        let mut session = ClientSession::new(1, 1024);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let description = ParameterDescription {
+            id: "power".into(),
+            spec: Spec::Integer { min: 0, max: 100 },
+            unit: "%".into(),
+            writable: true,
+            default_poll_period: None,
+        };
+        session
+            .dispatch_set(
+                1,
+                "power".into(),
+                Value::Integer(20),
+                &tx,
+                &HashMap::from([("power".into(), description)]),
+                requested_at,
+            )
+            .unwrap();
+        let command = rx.try_recv().unwrap();
+        let mut driver = CallbackDriver {
+            writes: 0,
+            on_write: || {
+                if delayed_reply {
+                    session
+                        .collect_ready(now + Duration::from_secs(10))
+                        .unwrap();
+                }
+            },
+        };
+        execute_command(
+            &mut driver,
+            &mut BufReader::new(Cursor::new(Vec::<u8>::new())),
+            command,
+        );
+        assert_eq!(driver.writes, usize::from(!expired_in_queue));
+        session
+            .collect_ready(now + Duration::from_secs(11))
+            .unwrap();
+        session
+            .collect_ready(now + Duration::from_secs(12))
+            .unwrap();
+        let mut bytes = Vec::new();
+        session.outbound.flush_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "late replies must not produce a second response"
+        );
+        let response: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        if expired_in_queue {
+            assert_eq!(response["error"], "runtime_timeout");
+        } else if delayed_reply {
+            assert_eq!(response["error"], "outcome_unknown");
+        } else {
+            assert_eq!(response["status"], "ok");
+        }
+    }
+
+    #[test]
+    fn expired_queued_set_never_reaches_driver() {
+        set_timeout_case(true, false);
+    }
+    #[test]
+    fn started_set_timeout_is_unknown_and_has_no_second_reply() {
+        set_timeout_case(false, true);
+    }
+    #[test]
+    fn timely_set_reply_is_delivered_once() {
+        set_timeout_case(false, false);
+    }
 
     fn test_task(id: &str, period_ms: u64) -> PollTask {
         PollTask {
@@ -305,6 +414,9 @@ mod tests {
 
         command_tx
             .send(DeviceCommand::Set(SetCommand {
+                execution: crate::pending::SetExecution::new(
+                    Instant::now() + Duration::from_secs(10),
+                ),
                 parameter: "power".to_string(),
                 value: Value::Integer(10),
                 reply: reply_tx,
@@ -327,6 +439,9 @@ mod tests {
         for _ in 0..100 {
             command_tx
                 .send(DeviceCommand::Set(SetCommand {
+                    execution: crate::pending::SetExecution::new(
+                        Instant::now() + Duration::from_secs(10),
+                    ),
                     parameter: "power".to_string(),
                     value: Value::Integer(10),
                     reply: reply_tx.clone(),
@@ -428,6 +543,9 @@ mod tests {
 
         command_tx
             .send(DeviceCommand::Set(SetCommand {
+                execution: crate::pending::SetExecution::new(
+                    Instant::now() + Duration::from_secs(10),
+                ),
                 parameter: "power".to_string(),
                 value: Value::Integer(10),
                 reply: write_tx,

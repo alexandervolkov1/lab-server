@@ -1,16 +1,56 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+#[derive(Clone, Copy)]
+enum ExecutionState {
+    Queued,
+    Started,
+    Cancelled,
+}
+
+pub struct SetExecution {
+    deadline: Instant,
+    state: Mutex<ExecutionState>,
+}
+
+impl SetExecution {
+    pub fn new(deadline: Instant) -> Arc<Self> {
+        Arc::new(Self {
+            deadline,
+            state: Mutex::new(ExecutionState::Queued),
+        })
+    }
+
+    pub fn try_start(&self) -> bool {
+        let mut state = self.state.lock().expect("execution lock poisoned");
+        // Read the clock inside the lock: a waiter must not use a stale timestamp.
+        if matches!(*state, ExecutionState::Queued) && Instant::now() < self.deadline {
+            *state = ExecutionState::Started;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn complete(&self, send: impl FnOnce()) {
+        let _state = self.state.lock().expect("execution lock poisoned");
+        send();
+    }
+}
 
 pub struct Pending<T> {
     id: u64,
     deadline: Instant,
     reply: Receiver<T>,
+    execution: Option<Arc<SetExecution>>,
 }
 
 pub enum Completion<T> {
     Received { id: u64, value: T },
     Timeout { id: u64 },
     Disconnected { id: u64 },
+    OutcomeUnknown { id: u64 },
 }
 
 pub enum Poll<T> {
@@ -24,19 +64,49 @@ impl<T> Pending<T> {
             id,
             deadline,
             reply,
+            execution: None,
         }
     }
 
+    pub fn with_execution(mut self, execution: Arc<SetExecution>) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
     pub fn poll(self, now: Instant) -> Poll<T> {
+        let execution = self.execution.clone();
+        let mut state = execution
+            .as_ref()
+            .map(|execution| execution.state.lock().expect("execution lock poisoned"));
         match self.reply.try_recv() {
             Ok(value) => Poll::Finished(Completion::Received { id: self.id, value }),
 
             Err(TryRecvError::Disconnected) => {
-                Poll::Finished(Completion::Disconnected { id: self.id })
+                if state
+                    .as_deref()
+                    .is_some_and(|s| matches!(s, ExecutionState::Started))
+                {
+                    Poll::Finished(Completion::OutcomeUnknown { id: self.id })
+                } else {
+                    if let Some(state) = state.as_deref_mut() {
+                        *state = ExecutionState::Cancelled;
+                    }
+                    Poll::Finished(Completion::Disconnected { id: self.id })
+                }
             }
 
             Err(TryRecvError::Empty) if now >= self.deadline => {
-                Poll::Finished(Completion::Timeout { id: self.id })
+                if state
+                    .as_deref()
+                    .is_some_and(|s| matches!(s, ExecutionState::Started))
+                {
+                    Poll::Finished(Completion::OutcomeUnknown { id: self.id })
+                } else {
+                    if let Some(state) = state.as_deref_mut() {
+                        *state = ExecutionState::Cancelled;
+                    }
+                    Poll::Finished(Completion::Timeout { id: self.id })
+                }
             }
 
             Err(TryRecvError::Empty) => Poll::Waiting(self),

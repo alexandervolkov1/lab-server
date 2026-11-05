@@ -46,6 +46,12 @@ fn completion_json(completion: FinishedRequest) -> io::Result<String> {
             Ok(response.to_string())
         }
 
+        FinishedRequest::Read(Completion::OutcomeUnknown { id })
+        | FinishedRequest::Set(Completion::OutcomeUnknown { id }) => Ok(json!({
+            "id": id, "status": "error", "error": "outcome_unknown"
+        })
+        .to_string()),
+
         FinishedRequest::Read(Completion::Timeout { id })
         | FinishedRequest::Set(Completion::Timeout { id }) => Ok(json!({
             "id": id,
@@ -143,15 +149,18 @@ impl PendingRequests {
         &mut self,
         id: u64,
         deadline: Instant,
-        enqueue: impl FnOnce() -> Option<Receiver<Result<(), String>>>,
+        enqueue: impl FnOnce(
+            std::sync::Arc<crate::pending::SetExecution>,
+        ) -> Option<Receiver<Result<(), String>>>,
     ) -> Result<(), EnqueueError> {
         self.ensure_available(id)?;
 
-        let receiver = enqueue().ok_or(EnqueueError::RuntimeUnavailable)?;
+        let execution = crate::pending::SetExecution::new(deadline);
+        let receiver = enqueue(execution.clone()).ok_or(EnqueueError::RuntimeUnavailable)?;
 
         self.entries.push_back(Entry::Set {
             id,
-            pending: Pending::new(id, deadline, receiver),
+            pending: Pending::new(id, deadline, receiver).with_execution(execution),
         });
 
         Ok(())
@@ -366,6 +375,7 @@ pub struct ClientSession {
     pub outbound: OutboundBuffer,
     pub subscriptions: SubscriptionSet,
     terminal: bool,
+    last_request_id: u64,
 }
 
 impl ClientSession {
@@ -376,6 +386,7 @@ impl ClientSession {
             outbound: OutboundBuffer::new(max_output_bytes),
             subscriptions: SubscriptionSet::default(),
             terminal: false,
+            last_request_id: 0,
         }
     }
 
@@ -423,11 +434,15 @@ impl ClientSession {
     }
 
     fn queue_error(&mut self, id: u64, error: &str) -> io::Result<()> {
-        let response = json!({
+        let mut response = json!({
             "id": id,
             "status": "error",
             "error": error
         });
+
+        if error == "duplicate_id" {
+            response.as_object_mut().expect("error object").remove("id");
+        }
 
         self.queue_response(&response.to_string())
     }
@@ -445,9 +460,11 @@ impl ClientSession {
             return self.queue_error(id, "unknown_key");
         }
 
-        let result = self.pending.add_set(id, now + Duration::from_secs(10), || {
-            crate::queue_set(commands, key, value)
-        });
+        let result = self
+            .pending
+            .add_set(id, now + Duration::from_secs(10), |execution| {
+                crate::queue_set(commands, key, value, execution)
+            });
 
         match result {
             Ok(()) => Ok(()),
@@ -619,6 +636,32 @@ impl ClientSession {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<Option<Incoming>> {
+        let id = match &incoming {
+            Incoming::Request(
+                TcpRequest::Hello { id }
+                | TcpRequest::Describe { id }
+                | TcpRequest::Ping { id }
+                | TcpRequest::Get { id, .. }
+                | TcpRequest::Set { id, .. }
+                | TcpRequest::Subscribe { id, .. }
+                | TcpRequest::Unsubscribe { id, .. },
+            ) => Some(*id),
+            Incoming::InvalidRequest { frame, .. } => crate::protocol::parse_json_object(frame)
+                .ok()
+                .and_then(|object| object.get("id").and_then(serde_json::Value::as_u64))
+                .filter(|id| *id > 0),
+            Incoming::FramingError(_) => None,
+        };
+        if let Some(id) = id {
+            if id <= self.last_request_id || self.pending.contains_id(id) {
+                self.queue_response(
+                    &json!({"status":"error", "error":"duplicate_id"}).to_string(),
+                )?;
+                return Ok(None);
+            }
+            self.last_request_id = id;
+        }
+
         match incoming {
             Incoming::Request(TcpRequest::Subscribe { id, keys }) => {
                 self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)?;
@@ -636,35 +679,27 @@ impl ClientSession {
             }
 
             Incoming::Request(TcpRequest::Hello { id }) => {
-                if self.pending.contains_id(id) {
-                    self.queue_error(id, "duplicate_id")?;
-                } else {
-                    self.queue_response(
-                        &json!({
-                            "id": id,
-                            "status": "ok",
-                            "protocol": "lab-server",
-                            "version": 1
-                        })
-                        .to_string(),
-                    )?;
-                }
+                self.queue_response(
+                    &json!({
+                        "id": id,
+                        "status": "ok",
+                        "protocol": "lab-server",
+                        "version": 1
+                    })
+                    .to_string(),
+                )?;
 
                 Ok(None)
             }
 
             Incoming::Request(TcpRequest::Ping { id }) => {
-                if self.pending.contains_id(id) {
-                    self.queue_error(id, "duplicate_id")?;
-                } else {
-                    self.queue_response(
-                        &json!({
-                            "id": id,
-                            "status": "ok"
-                        })
-                        .to_string(),
-                    )?;
-                }
+                self.queue_response(
+                    &json!({
+                        "id": id,
+                        "status": "ok"
+                    })
+                    .to_string(),
+                )?;
 
                 Ok(None)
             }
@@ -967,6 +1002,84 @@ mod tests {
 
     use crate::model::Value;
 
+    #[test]
+    fn ids_are_monotonic_across_operations_and_invalid_requests() {
+        let now = Instant::now();
+        for duplicate in [
+            r#"{"id":10,"op":"set","key":"unknown","value":1}"#,
+            r#"{"id":10,"op":"ping"}"#,
+            r#"{"id":10,"op":"get","key":"unknown"}"#,
+            r#"{"id":10,"op":"subscribe","keys":[]}"#,
+            r#"{"id":10,"op":"unsubscribe","keys":[]}"#,
+            r#"{"id":10,"op":"set"}"#,
+            r#"{"id":9,"op":"ping"}"#,
+        ] {
+            let mut session = ClientSession::new(2, 2048);
+            let (tx, rx) = mpsc::channel();
+            let catalog = power_catalog();
+            let latest = Mutex::new(HashMap::new());
+            for frame in [
+                r#"{"id":10,"op":"set","key":"power","value":20}"#,
+                duplicate,
+            ] {
+                for event in session.receive(format!("{frame}\n").as_bytes()) {
+                    session
+                        .dispatch_incoming(event, &tx, &catalog, &latest, now)
+                        .unwrap();
+                }
+            }
+            let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+                panic!()
+            };
+            command.reply.send(Ok(())).unwrap();
+            session.collect_ready(now).unwrap();
+            for event in session.receive(b"{\"id\":10,\"op\":\"ping\"}\n") {
+                session
+                    .dispatch_incoming(event, &tx, &catalog, &latest, now)
+                    .unwrap();
+            }
+            let mut bytes = Vec::new();
+            session.outbound.flush_to(&mut bytes).unwrap();
+            let responses: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                responses.iter().filter(|r| r.get("id").is_some()).count(),
+                1,
+                "{duplicate}"
+            );
+            assert_eq!(responses[0]["error"], "duplicate_id");
+            assert_eq!(responses[1]["id"], 10);
+            assert_eq!(responses[2]["error"], "duplicate_id");
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn request_ids_are_independent_between_clients() {
+        let (tx, _rx) = mpsc::channel();
+        for _ in 0..2 {
+            let mut session = ClientSession::new(1, 128);
+            session
+                .dispatch_incoming(
+                    Incoming::Request(TcpRequest::Ping { id: 1 }),
+                    &tx,
+                    &HashMap::new(),
+                    &Mutex::new(HashMap::new()),
+                    Instant::now(),
+                )
+                .unwrap();
+            let mut bytes = Vec::new();
+            session.outbound.flush_to(&mut bytes).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["status"],
+                "ok"
+            );
+        }
+    }
+
     fn observation() -> Observation {
         Observation {
             source: "sample_temperature".to_owned(),
@@ -987,7 +1100,7 @@ mod tests {
         let (set_tx, set_rx) = mpsc::channel();
 
         assert_eq!(pending.add_read(1, deadline, || Some(read_rx)), Ok(()));
-        assert_eq!(pending.add_set(2, deadline, || Some(set_rx)), Ok(()));
+        assert_eq!(pending.add_set(2, deadline, |_| Some(set_rx)), Ok(()));
 
         assert_eq!(pending.len(), 2);
         assert!(pending.poll(now).is_empty());
@@ -1036,7 +1149,7 @@ mod tests {
         let called = Cell::new(false);
 
         assert_eq!(
-            pending.add_set(7, deadline, || {
+            pending.add_set(7, deadline, |_| {
                 called.set(true);
                 None
             }),
@@ -1046,7 +1159,7 @@ mod tests {
         assert!(!called.get());
 
         assert_eq!(
-            pending.add_set(8, deadline, || {
+            pending.add_set(8, deadline, |_| {
                 called.set(true);
                 None
             }),
@@ -1065,7 +1178,7 @@ mod tests {
         let mut pending = PendingRequests::new(1);
 
         assert_eq!(
-            pending.add_set(1, deadline, || None),
+            pending.add_set(1, deadline, |_| None),
             Err(EnqueueError::RuntimeUnavailable)
         );
 
@@ -1073,7 +1186,7 @@ mod tests {
 
         let (_sender, receiver) = mpsc::channel();
 
-        assert_eq!(pending.add_set(1, deadline, || Some(receiver)), Ok(()));
+        assert_eq!(pending.add_set(1, deadline, |_| Some(receiver)), Ok(()));
         assert_eq!(pending.len(), 1);
     }
 
@@ -1091,7 +1204,7 @@ mod tests {
             .add_read(1, now + Duration::from_secs(10), || Some(read_rx))
             .unwrap();
 
-        pending.add_set(2, now, || Some(set_rx)).unwrap();
+        pending.add_set(2, now, |_| Some(set_rx)).unwrap();
 
         let finished = pending.poll(now);
 
@@ -1424,7 +1537,7 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(51, now + Duration::from_secs(10), || Some(reply_rx))
+            .add_set(51, now + Duration::from_secs(10), |_| Some(reply_rx))
             .unwrap();
 
         client.shutdown(Shutdown::Write).unwrap();
@@ -1581,7 +1694,7 @@ mod tests {
 
         session
             .pending
-            .add_set(8, deadline, || Some(set_rx))
+            .add_set(8, deadline, |_| Some(set_rx))
             .unwrap();
 
         session.collect_ready(now).unwrap();
@@ -1629,7 +1742,7 @@ mod tests {
             .add_read(1, now + Duration::from_secs(10), || Some(read_rx))
             .unwrap();
 
-        session.pending.add_set(2, now, || Some(set_rx)).unwrap();
+        session.pending.add_set(2, now, |_| Some(set_rx)).unwrap();
 
         session.collect_ready(now).unwrap();
 
@@ -1661,7 +1774,7 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(13, now + Duration::from_secs(10), || Some(reply_rx))
+            .add_set(13, now + Duration::from_secs(10), |_| Some(reply_rx))
             .unwrap();
 
         reply_tx.send(Ok(())).unwrap();
@@ -1703,7 +1816,7 @@ mod tests {
 
         session
             .pending
-            .add_set(1, now + Duration::from_secs(10), || Some(reply_rx))
+            .add_set(1, now + Duration::from_secs(10), |_| Some(reply_rx))
             .unwrap();
 
         reply_tx.send(Ok(())).unwrap();
@@ -1730,13 +1843,13 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(1, deadline, || Some(first_rx))
+            .add_set(1, deadline, |_| Some(first_rx))
             .unwrap();
 
         connection
             .session
             .pending
-            .add_set(2, deadline, || Some(second_rx))
+            .add_set(2, deadline, |_| Some(second_rx))
             .unwrap();
 
         first_tx.send(Ok(())).unwrap();
@@ -2193,7 +2306,7 @@ mod tests {
         assert_eq!(responses[0]["id"], 8);
         assert_eq!(responses[0]["status"], "no_data");
 
-        assert_eq!(responses[1]["id"], 7);
+        assert!(responses[1].get("id").is_none());
         assert_eq!(responses[1]["error"], "duplicate_id");
 
         assert_eq!(session.pending.len(), 1);
@@ -2364,7 +2477,7 @@ mod tests {
             })
         );
 
-        assert_eq!(responses[1]["id"], 7);
+        assert!(responses[1].get("id").is_none());
         assert_eq!(responses[1]["status"], "error");
         assert_eq!(responses[1]["error"], "duplicate_id");
 
@@ -2443,7 +2556,7 @@ mod tests {
         assert_eq!(parameters[2]["max"], 500.0);
         assert_eq!(parameters[2]["poll_period_ns"].as_u64(), Some(100_000_000));
 
-        assert_eq!(responses[1]["id"], 7);
+        assert!(responses[1].get("id").is_none());
         assert_eq!(responses[1]["error"], "duplicate_id");
 
         assert_eq!(session.pending.len(), 1);
@@ -2786,7 +2899,7 @@ mod tests {
 
         session
             .pending
-            .add_set(7, now + Duration::from_secs(10), || Some(reply_rx))
+            .add_set(7, now + Duration::from_secs(10), |_| Some(reply_rx))
             .unwrap();
 
         let incoming = session.receive(b"\n");
@@ -2888,7 +3001,7 @@ mod tests {
         connection
             .session
             .pending
-            .add_set(61, Instant::now() + Duration::from_secs(10), || {
+            .add_set(61, Instant::now() + Duration::from_secs(10), |_| {
                 Some(reply_rx)
             })
             .unwrap();
