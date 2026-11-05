@@ -96,6 +96,7 @@ impl PendingRequests {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -194,6 +195,20 @@ pub enum OutputError {
     Full,
 }
 
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to queue TCP response: {self:?}")
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+fn is_output_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<OutputError>())
+}
+
 pub struct OutboundBuffer {
     max_bytes: usize,
     bytes: VecDeque<u8>,
@@ -207,6 +222,7 @@ impl OutboundBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -400,9 +416,7 @@ impl ClientSession {
         if let Err(error) = self.outbound.enqueue_line(response) {
             self.terminal = true;
 
-            return Err(io::Error::other(format!(
-                "failed to queue TCP response: {error:?}"
-            )));
+            return Err(io::Error::other(error));
         }
 
         Ok(())
@@ -723,6 +737,10 @@ impl ClientSession {
     }
 
     pub fn collect_ready(&mut self, now: Instant) -> io::Result<()> {
+        if self.terminal {
+            return Ok(());
+        }
+
         for finished in self.pending.poll(now) {
             let response = completion_json(finished)?;
 
@@ -732,6 +750,16 @@ impl ClientSession {
         Ok(())
     }
 
+    pub fn enqueue_observation(&mut self, observation: &Observation) -> io::Result<()> {
+        if self.terminal || !self.subscriptions.contains(&observation.source) {
+            return Ok(());
+        }
+
+        let event = crate::observation_json(None, observation)?;
+        self.queue_response(&event)
+    }
+
+    #[cfg(test)]
     pub fn finish(self) -> Result<(), FrameError> {
         self.decoder.finish()
     }
@@ -803,13 +831,128 @@ impl TcpConnection {
             }
         }
 
-        self.session.collect_ready(Instant::now())?;
+        if let Err(error) = self.session.collect_ready(Instant::now()) {
+            if is_output_error(&error) {
+                incoming.clear();
+            } else {
+                return Err(error);
+            }
+        }
+
         self.session.outbound.flush_to(&mut self.stream)?;
 
         Ok(IoStep {
             incoming,
             read_closed: self.read_closed,
         })
+    }
+
+    pub fn drive_once(
+        &mut self,
+        commands: &Sender<crate::runtime::DeviceCommand>,
+        catalog: &HashMap<String, ParameterDescription>,
+        latest: &Mutex<HashMap<String, Observation>>,
+    ) -> io::Result<bool> {
+        let step = self.pump()?;
+        let now = Instant::now();
+
+        for incoming in step.incoming {
+            match self
+                .session
+                .dispatch_incoming(incoming, commands, catalog, latest, now)
+            {
+                Ok(None) => {}
+
+                Ok(Some(_)) => {
+                    return Err(io::Error::other("unhandled TCP event"));
+                }
+
+                Err(error) if is_output_error(&error) => {
+                    break;
+                }
+
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.session.outbound.flush_to(&mut self.stream)?;
+
+        let input_finished = step.read_closed || self.session.is_terminal();
+
+        let pending_finished = self.session.is_terminal() || self.session.pending.is_empty();
+
+        let output_finished = self.session.outbound.is_empty();
+
+        Ok(input_finished && pending_finished && output_finished)
+    }
+
+    pub fn drive_once_with_observations(
+        &mut self,
+        commands: &Sender<crate::runtime::DeviceCommand>,
+        catalog: &HashMap<String, ParameterDescription>,
+        latest: &Mutex<HashMap<String, Observation>>,
+        observations: &Receiver<Observation>,
+    ) -> io::Result<bool> {
+        let finished = self.drive_once(commands, catalog, latest)?;
+
+        if finished || self.read_closed || self.session.is_terminal() {
+            return Ok(finished);
+        }
+
+        const MAX_OBSERVATIONS_PER_TURN: usize = 32;
+
+        for _ in 0..MAX_OBSERVATIONS_PER_TURN {
+            match observations.try_recv() {
+                Ok(observation) => {
+                    if let Err(error) = self.session.enqueue_observation(&observation) {
+                        if is_output_error(&error) {
+                            break;
+                        }
+
+                        return Err(error);
+                    }
+                }
+
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.session.terminal = true;
+
+                    let response = json!({
+                        "status": "error",
+                        "error": "observation_stream_closed"
+                    });
+
+                    if let Err(error) = self.session.queue_response(&response.to_string()) {
+                        if !is_output_error(&error) {
+                            return Err(error);
+                        }
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        self.session.outbound.flush_to(&mut self.stream)?;
+
+        Ok(self.session.is_terminal() && self.session.outbound.is_empty())
+    }
+
+    pub fn run(
+        &mut self,
+        commands: &Sender<crate::runtime::DeviceCommand>,
+        catalog: &HashMap<String, ParameterDescription>,
+        latest: &Mutex<HashMap<String, Observation>>,
+        observations: &Receiver<Observation>,
+    ) -> io::Result<()> {
+        loop {
+            if self.drive_once_with_observations(commands, catalog, latest, observations)? {
+                return Ok(());
+            }
+
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -1272,15 +1415,77 @@ mod tests {
     }
 
     #[test]
+    fn tcp_clean_eof_preserves_pending_response() {
+        let (mut connection, mut client) = loopback_pair();
+        let now = Instant::now();
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        connection
+            .session
+            .pending
+            .add_set(51, now + Duration::from_secs(10), || Some(reply_rx))
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        assert!(collect_until_read_closed(&mut connection).is_empty());
+        assert!(!connection.session.is_terminal());
+        assert_eq!(connection.session.pending.len(), 1);
+
+        reply_tx.send(Ok(())).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            connection.pump().unwrap();
+
+            if connection.session.pending.is_empty() && connection.session.outbound.is_empty() {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP response timed out");
+            std::thread::yield_now();
+        }
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"id": 51, "status": "ok"})
+        );
+    }
+
+    #[test]
     fn tcp_preserves_request_before_terminal_framing_error() {
         let (mut connection, mut client) = loopback_pair();
 
         client.write_all(b"{\"id\":1,\"op\":\"ping\"}\n\n").unwrap();
 
-        let step = wait_for_step(&mut connection, |step| !step.incoming.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut incoming = Vec::new();
+
+        loop {
+            let step = connection.pump().unwrap();
+            incoming.extend(step.incoming);
+
+            if connection.session.is_terminal() {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP framing test timed out");
+            std::thread::yield_now();
+        }
 
         assert_eq!(
-            step.incoming,
+            incoming,
             vec![
                 Incoming::Request(TcpRequest::Ping { id: 1 }),
                 Incoming::FramingError(FrameError::EmptyFrame),
@@ -1288,6 +1493,76 @@ mod tests {
         );
 
         assert!(connection.session.is_terminal());
+    }
+
+    #[test]
+    fn tcp_flushes_terminal_error_before_close() {
+        let (mut connection, mut client) = loopback_pair();
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        client
+            .write_all(b"{\"id\":23,\"op\":\"ping\"}\n{\"id\":24")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let incoming = collect_until_read_closed(&mut connection);
+
+        assert_eq!(
+            incoming,
+            vec![
+                Incoming::Request(TcpRequest::Ping { id: 23 }),
+                Incoming::FramingError(FrameError::IncompleteFrame),
+            ]
+        );
+
+        for event in incoming {
+            assert!(
+                connection
+                    .session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, Instant::now(),)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        assert!(connection.session.is_terminal());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while !connection.session.outbound.is_empty() {
+            connection.pump().unwrap();
+            assert!(Instant::now() < deadline, "TCP output drain timed out");
+            std::thread::yield_now();
+        }
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        assert!(wire.ends_with('\n'));
+
+        let responses: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(
+            responses,
+            vec![
+                serde_json::json!({"id": 23, "status": "ok"}),
+                serde_json::json!({
+                    "status": "error",
+                    "error": "incomplete_frame"
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -1435,6 +1710,108 @@ mod tests {
 
         assert!(session.collect_ready(now).is_err());
         assert!(session.is_terminal());
+    }
+
+    #[test]
+    fn drive_once_drains_buffer_after_pending_output_overflow() {
+        let (mut connection, mut client) = loopback_pair();
+        connection.session.outbound = OutboundBuffer::new(25);
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+
+        connection
+            .session
+            .pending
+            .add_set(1, deadline, || Some(first_rx))
+            .unwrap();
+
+        connection
+            .session
+            .pending
+            .add_set(2, deadline, || Some(second_rx))
+            .unwrap();
+
+        first_tx.send(Ok(())).unwrap();
+        second_tx.send(Ok(())).unwrap();
+
+        let timeout = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if connection
+                .drive_once(&command_tx, &catalog, &latest)
+                .unwrap()
+            {
+                break;
+            }
+
+            assert!(Instant::now() < timeout, "TCP drain timed out");
+            std::thread::yield_now();
+        }
+
+        assert!(connection.session.is_terminal());
+        assert!(connection.session.outbound.is_empty());
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"id": 1, "status": "ok"})
+        );
+    }
+
+    #[test]
+    fn drive_once_closes_when_response_exceeds_output_capacity() {
+        let (mut connection, mut client) = loopback_pair();
+        connection.session.outbound = OutboundBuffer::new(2);
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        client.write_all(b"{\"id\":81,\"op\":\"ping\"}\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if connection
+                .drive_once(&command_tx, &catalog, &latest)
+                .unwrap()
+            {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP close timed out");
+            std::thread::yield_now();
+        }
+
+        assert!(connection.session.is_terminal());
+        assert!(connection.session.outbound.is_empty());
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        assert!(wire.is_empty());
     }
 
     fn power_catalog() -> HashMap<String, ParameterDescription> {
@@ -2401,6 +2778,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_session_does_not_append_pending_responses() {
+        let mut session = ClientSession::new(1, 256);
+        let now = Instant::now();
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        session
+            .pending
+            .add_set(7, now + Duration::from_secs(10), || Some(reply_rx))
+            .unwrap();
+
+        let incoming = session.receive(b"\n");
+
+        assert_eq!(
+            incoming,
+            vec![Incoming::FramingError(FrameError::EmptyFrame)]
+        );
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        for event in incoming {
+            assert!(
+                session
+                    .dispatch_incoming(event, &command_tx, &catalog, &latest, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        reply_tx.send(Ok(())).unwrap();
+        session.collect_ready(now).unwrap();
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(
+            responses,
+            vec![serde_json::json!({
+                "status": "error",
+                "error": "empty_frame"
+            })]
+        );
+
+        assert!(session.is_terminal());
+    }
+
+    #[test]
     fn framing_errors_are_reported_without_request_id() {
         let cases = [
             (b"\xff\n".to_vec(), FrameError::InvalidUtf8, "invalid_utf8"),
@@ -2441,5 +2873,547 @@ mod tests {
             assert_eq!(response["error"], expected_code);
             assert!(response.get("id").is_none());
         }
+    }
+
+    #[test]
+    fn drive_once_waits_for_pending_after_clean_eof() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        connection
+            .session
+            .pending
+            .add_set(61, Instant::now() + Duration::from_secs(10), || {
+                Some(reply_rx)
+            })
+            .unwrap();
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            let ready = connection
+                .drive_once(&command_tx, &catalog, &latest)
+                .unwrap();
+
+            assert!(!ready);
+
+            if connection.read_closed {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP EOF timed out");
+            std::thread::yield_now();
+        }
+
+        assert_eq!(connection.session.pending.len(), 1);
+
+        reply_tx.send(Ok(())).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if connection
+                .drive_once(&command_tx, &catalog, &latest)
+                .unwrap()
+            {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP drain timed out");
+            std::thread::yield_now();
+        }
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+            serde_json::json!({"id": 61, "status": "ok"})
+        );
+    }
+
+    #[test]
+    fn drive_once_drains_terminal_error_before_close() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let catalog = HashMap::new();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        client
+            .write_all(b"{\"id\":71,\"op\":\"ping\"}\n\n")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if connection
+                .drive_once(&command_tx, &catalog, &latest)
+                .unwrap()
+            {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP terminal drain timed out");
+            std::thread::yield_now();
+        }
+
+        assert!(connection.session.is_terminal());
+        assert!(connection.session.outbound.is_empty());
+
+        drop(connection);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+
+        let responses: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(
+            responses,
+            vec![
+                serde_json::json!({"id": 71, "status": "ok"}),
+                serde_json::json!({
+                    "status": "error",
+                    "error": "empty_frame"
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn tcp_streams_only_subscribed_observations() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+
+        let (command_tx, command_rx) = mpsc::channel();
+        let (source_tx, source_rx) = mpsc::channel();
+
+        client
+            .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while !connection
+            .session
+            .subscriptions
+            .contains("sample_temperature")
+        {
+            assert!(
+                !connection
+                    .drive_once_with_observations(&command_tx, &catalog, &latest, &source_rx,)
+                    .unwrap()
+            );
+
+            assert!(Instant::now() < deadline, "subscribe timed out");
+            std::thread::yield_now();
+        }
+
+        let mut ignored = observation();
+        ignored.source = "configuration".to_owned();
+
+        source_tx.send(ignored).unwrap();
+        source_tx.send(observation()).unwrap();
+
+        assert!(
+            !connection
+                .drive_once_with_observations(&command_tx, &catalog, &latest, &source_rx,)
+                .unwrap()
+        );
+
+        assert!(connection.session.outbound.is_empty());
+
+        drop(connection);
+
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(
+            responses[0],
+            serde_json::json!({
+                "id": 1,
+                "status": "ok",
+                "keys": ["sample_temperature"]
+            })
+        );
+
+        assert_eq!(responses[1]["event"], "measurement");
+        assert_eq!(responses[1]["key"], "sample_temperature");
+        assert_eq!(responses[1]["value"], 20.0);
+        assert!(responses[1].get("id").is_none());
+
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tcp_unsubscribe_stops_measurements_after_ack() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+
+        let (command_tx, _command_rx) = mpsc::channel();
+        let (observation_tx, observation_rx) = mpsc::channel();
+
+        client
+            .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+            .unwrap();
+
+        let mut deadline = Instant::now() + Duration::from_secs(1);
+
+        while !connection
+            .session
+            .subscriptions
+            .contains("sample_temperature")
+        {
+            assert!(
+                !connection
+                    .drive_once_with_observations(&command_tx, &catalog, &latest, &observation_rx,)
+                    .unwrap()
+            );
+
+            assert!(Instant::now() < deadline, "subscribe timed out");
+            std::thread::yield_now();
+        }
+
+        observation_tx.send(observation()).unwrap();
+
+        assert!(
+            !connection
+                .drive_once_with_observations(&command_tx, &catalog, &latest, &observation_rx,)
+                .unwrap()
+        );
+
+        assert!(connection.session.outbound.is_empty());
+
+        client
+            .write_all(b"{\"id\":2,\"op\":\"unsubscribe\",\"keys\":[\"sample_temperature\"]}\n")
+            .unwrap();
+
+        deadline = Instant::now() + Duration::from_secs(1);
+
+        while connection
+            .session
+            .subscriptions
+            .contains("sample_temperature")
+        {
+            assert!(
+                !connection
+                    .drive_once_with_observations(&command_tx, &catalog, &latest, &observation_rx,)
+                    .unwrap()
+            );
+
+            assert!(Instant::now() < deadline, "unsubscribe timed out");
+            std::thread::yield_now();
+        }
+
+        observation_tx.send(observation()).unwrap();
+
+        assert!(
+            !connection
+                .drive_once_with_observations(&command_tx, &catalog, &latest, &observation_rx,)
+                .unwrap()
+        );
+
+        assert!(connection.session.outbound.is_empty());
+        assert!(connection.session.subscriptions.keys().is_empty());
+
+        drop(connection);
+
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 3);
+
+        assert_eq!(
+            responses[0],
+            serde_json::json!({
+                "id": 1,
+                "status": "ok",
+                "keys": ["sample_temperature"]
+            })
+        );
+
+        assert_eq!(responses[1]["event"], "measurement");
+        assert_eq!(responses[1]["key"], "sample_temperature");
+        assert!(responses[1].get("id").is_none());
+
+        assert_eq!(
+            responses[2],
+            serde_json::json!({
+                "id": 2,
+                "status": "ok",
+                "keys": []
+            })
+        );
+    }
+
+    #[test]
+    fn subscription_enqueues_only_selected_measurements() {
+        let mut session = ClientSession::new(1, 2048);
+        let catalog = get_catalog();
+
+        session
+            .dispatch_subscription(
+                7,
+                SubscriptionChange::Subscribe,
+                vec!["sample_temperature".to_owned()],
+                &catalog,
+            )
+            .unwrap();
+
+        session.enqueue_observation(&observation()).unwrap();
+
+        let mut other = observation();
+        other.source = "configuration".to_owned();
+
+        session.enqueue_observation(&other).unwrap();
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(responses[0]["id"], 7);
+        assert_eq!(
+            responses[0]["keys"],
+            serde_json::json!(["sample_temperature"])
+        );
+
+        assert_eq!(responses[1]["event"], "measurement");
+        assert_eq!(responses[1]["key"], "sample_temperature");
+        assert_eq!(responses[1]["value"], 20.0);
+        assert!(responses[1].get("id").is_none());
+    }
+
+    #[test]
+    fn unsubscribe_stops_new_measurements_after_ack() {
+        let mut session = ClientSession::new(1, 2048);
+        let catalog = get_catalog();
+        let key = "sample_temperature".to_owned();
+
+        session
+            .dispatch_subscription(
+                1,
+                SubscriptionChange::Subscribe,
+                vec![key.clone()],
+                &catalog,
+            )
+            .unwrap();
+
+        session.enqueue_observation(&observation()).unwrap();
+
+        session
+            .dispatch_subscription(2, SubscriptionChange::Unsubscribe, vec![key], &catalog)
+            .unwrap();
+
+        session.enqueue_observation(&observation()).unwrap();
+
+        let mut output = Vec::new();
+        session.outbound.flush_to(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 3);
+
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["status"], "ok");
+
+        assert_eq!(responses[1]["event"], "measurement");
+        assert_eq!(responses[1]["key"], "sample_temperature");
+
+        assert_eq!(responses[2]["id"], 2);
+        assert_eq!(responses[2]["status"], "ok");
+        assert_eq!(responses[2]["keys"], serde_json::json!([]));
+
+        assert!(session.subscriptions.keys().is_empty());
+    }
+
+    #[test]
+    fn tcp_closes_after_observation_channel_overflow() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+        let (command_tx, _command_rx) = mpsc::channel();
+
+        let fanout = crate::fanout::ObservationFanout::new(1);
+        let observations = fanout.register().unwrap();
+
+        client
+            .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        while !connection
+            .session
+            .subscriptions
+            .contains("sample_temperature")
+        {
+            assert!(
+                !connection
+                    .drive_once_with_observations(&command_tx, &catalog, &latest, &observations,)
+                    .unwrap()
+            );
+
+            assert!(Instant::now() < deadline, "subscribe timed out");
+            std::thread::yield_now();
+        }
+
+        fanout.publish(&observation()).unwrap();
+
+        let mut second = observation();
+        second.reading = Ok(Value::Float(21.0));
+
+        fanout.publish(&second).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            let finished = connection
+                .drive_once_with_observations(&command_tx, &catalog, &latest, &observations)
+                .unwrap();
+
+            if finished {
+                break;
+            }
+
+            assert!(Instant::now() < deadline, "TCP close timed out");
+            std::thread::yield_now();
+        }
+
+        assert!(connection.session.is_terminal());
+        assert!(connection.session.outbound.is_empty());
+
+        drop(connection);
+
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+
+        let responses: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(responses.len(), 3);
+
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["status"], "ok");
+
+        assert_eq!(responses[1]["event"], "measurement");
+        assert_eq!(responses[1]["value"], 20.0);
+
+        assert_eq!(
+            responses[2],
+            serde_json::json!({
+                "status": "error",
+                "error": "observation_stream_closed"
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_run_combines_commands_and_observation_stream() {
+        let (mut connection, mut client) = loopback_pair();
+
+        let (command_tx, command_rx) = mpsc::channel();
+        let (observation_tx, observation_rx) = mpsc::sync_channel(2);
+
+        let worker = std::thread::spawn(move || {
+            let catalog = get_catalog();
+            let latest = Mutex::new(HashMap::new());
+
+            connection.run(&command_tx, &catalog, &latest, &observation_rx)
+        });
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+
+        client
+            .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+            .unwrap();
+
+        reader.read_line(&mut line).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["status"], "ok");
+
+        observation_tx.send(observation()).unwrap();
+
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(event["event"], "measurement");
+        assert_eq!(event["key"], "sample_temperature");
+        assert_eq!(event["value"], 20.0);
+
+        client.write_all(b"{\"id\":2,\"op\":\"ping\"}\n").unwrap();
+
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["status"], "ok");
+
+        client.shutdown(Shutdown::Write).unwrap();
+
+        worker.join().unwrap().unwrap();
+
+        assert!(command_rx.try_recv().is_err());
     }
 }
