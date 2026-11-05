@@ -376,6 +376,8 @@ pub struct ClientSession {
     pub subscriptions: SubscriptionSet,
     terminal: bool,
     last_request_id: u64,
+    observation_clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    activated_after: HashMap<String, u64>,
 }
 
 impl ClientSession {
@@ -387,6 +389,8 @@ impl ClientSession {
             subscriptions: SubscriptionSet::default(),
             terminal: false,
             last_request_id: 0,
+            observation_clock: None,
+            activated_after: HashMap::new(),
         }
     }
 
@@ -604,11 +608,18 @@ impl ClientSession {
         }
 
         let response = match self.subscriptions.apply(change, &keys, catalog) {
-            Ok(keys) => json!({
-                "id": id,
-                "status": "ok",
-                "keys": keys
-            }),
+            Ok(keys) => {
+                let boundary = self
+                    .observation_clock
+                    .as_ref()
+                    .map_or(0, |clock| clock.load(std::sync::atomic::Ordering::SeqCst));
+                self.activated_after
+                    .retain(|key, _| self.subscriptions.contains(key));
+                for key in &keys {
+                    self.activated_after.entry(key.clone()).or_insert(boundary);
+                }
+                json!({ "id": id, "status": "ok", "keys": keys })
+            }
 
             Err(SubscriptionError::UnknownKey(key)) => json!({
                 "id": id,
@@ -932,8 +943,9 @@ impl TcpConnection {
         commands: &Sender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
-        observations: &Receiver<Observation>,
+        observations: &crate::fanout::ObservationReceiver,
     ) -> io::Result<bool> {
+        self.session.observation_clock = Some(observations.clock.clone());
         let finished = self.drive_once(commands, catalog, latest)?;
 
         if finished || self.read_closed || self.session.is_terminal() {
@@ -944,8 +956,16 @@ impl TcpConnection {
 
         for _ in 0..MAX_OBSERVATIONS_PER_TURN {
             match observations.try_recv() {
-                Ok(observation) => {
-                    if let Err(error) = self.session.enqueue_observation(&observation) {
+                Ok(published) => {
+                    if !self
+                        .session
+                        .activated_after
+                        .get(&published.observation.source)
+                        .is_some_and(|boundary| published.sequence > *boundary)
+                    {
+                        continue;
+                    }
+                    if let Err(error) = self.session.enqueue_observation(&published.observation) {
                         if is_output_error(&error) {
                             break;
                         }
@@ -985,7 +1005,7 @@ impl TcpConnection {
         commands: &Sender<crate::runtime::DeviceCommand>,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
-        observations: &Receiver<Observation>,
+        observations: &crate::fanout::ObservationReceiver,
     ) -> io::Result<()> {
         loop {
             if self.drive_once_with_observations(commands, catalog, latest, observations)? {
@@ -3192,6 +3212,47 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_excludes_old_publications_and_orders_ack_first() {
+        let (mut connection, mut client) = loopback_pair();
+        connection.session.outbound = OutboundBuffer::new(4096);
+        let fanout = crate::fanout::ObservationFanout::new(8);
+        let observations = fanout.register().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+        fanout.publish(&observation()).unwrap();
+        connection.session.observation_clock = Some(observations.clock.clone());
+        connection
+            .session
+            .dispatch_subscription(
+                1,
+                SubscriptionChange::Subscribe,
+                vec!["sample_temperature".into()],
+                &catalog,
+            )
+            .unwrap();
+        for value in [21.0, 22.0] {
+            let mut observation = observation();
+            observation.reading = Ok(Value::Float(value));
+            fanout.publish(&observation).unwrap();
+        }
+        connection
+            .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+            .unwrap();
+        drop(connection);
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["id"], 1);
+        assert_eq!(messages[1]["value"], 21.0);
+        assert_eq!(messages[2]["value"], 22.0);
+    }
+
+    #[test]
     fn tcp_streams_only_subscribed_observations() {
         let (mut connection, mut client) = loopback_pair();
 
@@ -3199,7 +3260,8 @@ mod tests {
         let latest = Mutex::new(HashMap::new());
 
         let (command_tx, command_rx) = mpsc::channel();
-        let (source_tx, source_rx) = mpsc::channel();
+        let source_tx = crate::fanout::ObservationFanout::new(8);
+        let source_rx = source_tx.register().unwrap();
 
         client
             .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
@@ -3225,8 +3287,8 @@ mod tests {
         let mut ignored = observation();
         ignored.source = "configuration".to_owned();
 
-        source_tx.send(ignored).unwrap();
-        source_tx.send(observation()).unwrap();
+        source_tx.publish(&ignored).unwrap();
+        source_tx.publish(&observation()).unwrap();
 
         assert!(
             !connection
@@ -3273,7 +3335,8 @@ mod tests {
         let latest = Mutex::new(HashMap::new());
 
         let (command_tx, _command_rx) = mpsc::channel();
-        let (observation_tx, observation_rx) = mpsc::channel();
+        let observation_tx = crate::fanout::ObservationFanout::new(8);
+        let observation_rx = observation_tx.register().unwrap();
 
         client
             .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
@@ -3296,7 +3359,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        observation_tx.send(observation()).unwrap();
+        observation_tx.publish(&observation()).unwrap();
 
         assert!(
             !connection
@@ -3327,7 +3390,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        observation_tx.send(observation()).unwrap();
+        observation_tx.publish(&observation()).unwrap();
 
         assert!(
             !connection
@@ -3553,7 +3616,8 @@ mod tests {
         let (mut connection, mut client) = loopback_pair();
 
         let (command_tx, command_rx) = mpsc::channel();
-        let (observation_tx, observation_rx) = mpsc::sync_channel(2);
+        let observation_tx = crate::fanout::ObservationFanout::new(2);
+        let observation_rx = observation_tx.register().unwrap();
 
         let worker = std::thread::spawn(move || {
             let catalog = get_catalog();
@@ -3580,7 +3644,7 @@ mod tests {
         assert_eq!(response["id"], 1);
         assert_eq!(response["status"], "ok");
 
-        observation_tx.send(observation()).unwrap();
+        observation_tx.publish(&observation()).unwrap();
 
         line.clear();
         reader.read_line(&mut line).unwrap();
