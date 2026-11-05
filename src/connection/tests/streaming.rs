@@ -77,6 +77,15 @@ fn tcp_reports_upstream_data_loss() {
     let fanout = crate::fanout::ObservationFanout::new(2);
     let observations = fanout.register().unwrap();
     let (tx, _rx) = mpsc::sync_channel(1);
+    connection
+        .session
+        .dispatch_subscription(
+            1,
+            SubscriptionChange::Subscribe,
+            vec!["sample_temperature".into()],
+            &get_catalog(),
+        )
+        .unwrap();
     fanout
         .loss_epoch()
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -94,9 +103,205 @@ fn tcp_reports_upstream_data_loss() {
     let mut text = String::new();
     client.read_to_string(&mut text).unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&text).unwrap()["error"],
+        serde_json::from_str::<serde_json::Value>(text.lines().last().unwrap()).unwrap()["error"],
         "observation_data_lost"
     );
+}
+
+fn inject_observation_loss(fanout: &crate::fanout::ObservationFanout, upstream: bool) {
+    if upstream {
+        fanout
+            .loss_epoch()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        fanout.publish(&observation()).unwrap();
+        fanout.publish(&observation()).unwrap();
+    }
+}
+
+#[test]
+fn observation_loss_preserves_command_only_client_and_pending_set() {
+    for upstream in [true, false] {
+        let (mut connection, mut client) = loopback_pair();
+        let fanout = crate::fanout::ObservationFanout::new(1);
+        let observations = fanout.register().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let catalog = power_catalog();
+        let latest = Mutex::new(HashMap::new());
+        connection
+            .session
+            .dispatch_set(
+                1,
+                "power".into(),
+                Value::Integer(20),
+                &tx,
+                &catalog,
+                Instant::now(),
+            )
+            .unwrap();
+        let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert!(command.execution.try_start());
+        inject_observation_loss(&fanout, upstream);
+        assert!(
+            !connection
+                .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+                .unwrap()
+        );
+        assert!(!connection.session.is_terminal());
+        assert_eq!(connection.session.pending.len(), 1);
+        connection
+            .session
+            .dispatch_incoming(
+                Incoming::Request(TcpRequest::Ping { id: 2 }),
+                &tx,
+                &catalog,
+                &latest,
+                Instant::now(),
+            )
+            .unwrap();
+        command
+            .execution
+            .complete(|| command.reply.send(Ok(())).unwrap());
+        for _ in 0..2 {
+            assert!(
+                !connection
+                    .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+                    .unwrap()
+            );
+        }
+        assert!(connection.session.pending.is_empty());
+        drop(connection);
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], json!({"id":2,"status":"ok"}));
+        assert_eq!(messages[1], json!({"id":1,"status":"ok"}));
+    }
+}
+
+#[test]
+fn loss_while_unsubscribed_does_not_poison_later_subscription() {
+    for upstream in [true, false] {
+        let (mut connection, mut client) = loopback_pair();
+        connection.session.outbound = OutboundBuffer::new(4096);
+        let fanout = crate::fanout::ObservationFanout::new(1);
+        let observations = fanout.register().unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let catalog = get_catalog();
+        let latest = Mutex::new(HashMap::new());
+        connection
+            .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+            .unwrap();
+        let keys = vec!["sample_temperature".into()];
+        connection
+            .session
+            .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
+            .unwrap();
+        connection
+            .session
+            .dispatch_subscription(2, SubscriptionChange::Unsubscribe, keys.clone(), &catalog)
+            .unwrap();
+        inject_observation_loss(&fanout, upstream);
+        // No connection turn between loss and activation: reset at subscribe itself.
+        connection
+            .session
+            .dispatch_subscription(3, SubscriptionChange::Subscribe, keys, &catalog)
+            .unwrap();
+        assert!(
+            !connection
+                .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+                .unwrap()
+        );
+        fanout.publish(&observation()).unwrap();
+        assert!(
+            !connection
+                .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+                .unwrap()
+        );
+        drop(connection);
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), 4);
+        for (message, id) in messages.iter().zip(1..=3) {
+            assert_eq!(message["id"], id);
+            assert_eq!(message["status"], "ok");
+        }
+        assert_eq!(messages[3]["event"], "measurement");
+    }
+}
+
+#[test]
+fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
+    for upstream in [true, false] {
+        let (mut connection, mut client) = loopback_pair();
+        connection.session.outbound = OutboundBuffer::new(4096);
+        let fanout = crate::fanout::ObservationFanout::new(1);
+        let observations = fanout.register().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut catalog = get_catalog();
+        catalog.extend(power_catalog());
+        let latest = Mutex::new(HashMap::new());
+        connection
+            .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+            .unwrap();
+        connection
+            .session
+            .dispatch_subscription(
+                1,
+                SubscriptionChange::Subscribe,
+                vec!["sample_temperature".into()],
+                &catalog,
+            )
+            .unwrap();
+        connection
+            .session
+            .dispatch_set(
+                2,
+                "power".into(),
+                Value::Integer(20),
+                &tx,
+                &catalog,
+                Instant::now(),
+            )
+            .unwrap();
+        let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert!(command.execution.try_start());
+        inject_observation_loss(&fanout, upstream);
+        assert!(
+            connection
+                .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+                .unwrap()
+        );
+        command
+            .execution
+            .complete(|| command.reply.send(Ok(())).unwrap());
+        connection.session.collect_ready(Instant::now()).unwrap();
+        assert!(connection.session.outbound.is_empty());
+        drop(connection);
+        let mut text = String::new();
+        client.read_to_string(&mut text).unwrap();
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            messages.last().unwrap(),
+            &json!({"status":"error","error":"observation_data_lost"})
+        );
+        assert!(!messages.iter().any(|message| message["id"] == 2));
+    }
 }
 
 #[test]
@@ -427,7 +632,7 @@ fn tcp_closes_after_observation_channel_overflow() {
         responses[2],
         serde_json::json!({
             "status": "error",
-            "error": "observation_stream_closed"
+            "error": "observation_data_lost"
         })
     );
 }

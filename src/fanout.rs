@@ -1,6 +1,6 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::model::Observation;
@@ -13,14 +13,45 @@ pub struct PublishedObservation {
 pub struct ObservationReceiver {
     receiver: Receiver<PublishedObservation>,
     pub clock: Arc<AtomicU64>,
-    _lifetime: Arc<()>,
-    loss_epoch: Arc<AtomicU64>,
+    pub interest: Arc<ObservationInterest>,
+}
+
+struct InterestState {
+    active: bool,
     registered_epoch: u64,
+    overflowed: bool,
+}
+
+pub struct ObservationInterest {
+    state: Mutex<InterestState>,
+    loss_epoch: Arc<AtomicU64>,
+}
+
+impl ObservationInterest {
+    pub fn set_active(&self, active: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("observation interest lock poisoned");
+        if active && !state.active {
+            // Loss while there were no subscriptions does not invalidate a new stream.
+            state.registered_epoch = self.loss_epoch.load(Ordering::SeqCst);
+            state.overflowed = false;
+        }
+        state.active = active;
+    }
 }
 
 impl ObservationReceiver {
     pub fn closed_error(&self) -> &'static str {
-        if self.loss_epoch.load(Ordering::SeqCst) != self.registered_epoch {
+        let state = self
+            .interest
+            .state
+            .lock()
+            .expect("observation interest lock poisoned");
+        if state.overflowed
+            || self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch
+        {
             "observation_data_lost"
         } else {
             "observation_stream_closed"
@@ -28,16 +59,28 @@ impl ObservationReceiver {
     }
 
     pub fn try_recv(&self) -> Result<PublishedObservation, mpsc::TryRecvError> {
-        if self.loss_epoch.load(Ordering::SeqCst) != self.registered_epoch {
-            return Err(mpsc::TryRecvError::Disconnected);
+        let state = self
+            .interest
+            .state
+            .lock()
+            .expect("observation interest lock poisoned");
+        if state.active && self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch
+        {
+            return Err(TryRecvError::Disconnected);
         }
-        self.receiver.try_recv()
+        match self.receiver.try_recv() {
+            // Preserve the queued prefix, then explicitly report personal overflow.
+            Err(TryRecvError::Empty) if state.active && state.overflowed => {
+                Err(TryRecvError::Disconnected)
+            }
+            result => result,
+        }
     }
 }
 
 pub struct ObservationFanout {
     queue_capacity: usize,
-    subscribers: Mutex<Vec<(Weak<()>, SyncSender<PublishedObservation>)>>,
+    subscribers: Mutex<Vec<(Weak<ObservationInterest>, SyncSender<PublishedObservation>)>>,
     clock: Arc<AtomicU64>,
     loss_epoch: Arc<AtomicU64>,
 }
@@ -60,19 +103,24 @@ impl ObservationFanout {
 
     pub fn register(&self) -> io::Result<ObservationReceiver> {
         let (sender, receiver) = mpsc::sync_channel(self.queue_capacity);
-        let lifetime = Arc::new(());
+        let interest = Arc::new(ObservationInterest {
+            state: Mutex::new(InterestState {
+                active: true,
+                registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
+                overflowed: false,
+            }),
+            loss_epoch: self.loss_epoch.clone(),
+        });
         let mut subscribers = self
             .subscribers
             .lock()
             .map_err(|_| io::Error::other("subscriber lock poisoned"))?;
         subscribers.retain(|(lifetime, _)| lifetime.strong_count() > 0);
-        subscribers.push((Arc::downgrade(&lifetime), sender));
+        subscribers.push((Arc::downgrade(&interest), sender));
         Ok(ObservationReceiver {
             receiver,
             clock: self.clock.clone(),
-            _lifetime: lifetime,
-            loss_epoch: self.loss_epoch.clone(),
-            registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
+            interest,
         })
     }
 
@@ -89,14 +137,29 @@ impl ObservationFanout {
             .ok_or_else(|| io::Error::other("observation sequence exhausted"))?;
         // This increment is the publication point, serialized with other publishers.
         self.clock.store(sequence, Ordering::SeqCst);
-        subscribers.retain(|(lifetime, sender)| {
-            lifetime.strong_count() > 0
-                && sender
-                    .try_send(PublishedObservation {
-                        sequence,
-                        observation: observation.clone(),
-                    })
-                    .is_ok()
+        subscribers.retain(|(interest, sender)| {
+            let Some(interest) = interest.upgrade() else {
+                return false;
+            };
+            let mut state = interest
+                .state
+                .lock()
+                .expect("observation interest lock poisoned");
+            if !state.active || state.overflowed {
+                return true;
+            }
+            match sender.try_send(PublishedObservation {
+                sequence,
+                observation: observation.clone(),
+            }) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    state.overflowed = true;
+                    // Pause until this stream closes or is explicitly deactivated.
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
         });
 
         Ok(())
@@ -202,5 +265,44 @@ mod tests {
             slow.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+        assert_eq!(slow.closed_error(), "observation_data_lost");
+    }
+
+    #[test]
+    fn personal_overflow_resets_only_for_a_new_subscription() {
+        let fanout = ObservationFanout::new(1);
+        let receiver = fanout.register().unwrap();
+        fanout.publish(&observation(20.0)).unwrap();
+        fanout.publish(&observation(21.0)).unwrap();
+        receiver.interest.set_active(true);
+        assert_eq!(
+            receiver.try_recv().unwrap().observation.reading,
+            Ok(Value::Float(20.0))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(receiver.closed_error(), "observation_data_lost");
+
+        receiver.interest.set_active(false);
+        fanout.publish(&observation(22.0)).unwrap();
+        receiver.interest.set_active(true);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        fanout.publish(&observation(23.0)).unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap().observation.reading,
+            Ok(Value::Float(23.0))
+        );
+
+        drop(fanout);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(receiver.closed_error(), "observation_stream_closed");
     }
 }

@@ -26,10 +26,14 @@
 //! At most 32 clients have workers; excess connections are closed. Device commands
 //! and upstream observations each have capacity 128. Command admission never
 //! waits: a full queue returns `runtime_busy`, a closed queue `runtime_unavailable`.
-//! Upstream observation overflow continues device polling but invalidates every
-//! existing stream with terminal `observation_data_lost` (without request ID).
-//! Reconnection creates a new stream. Per-client fanout overflow terminates that
-//! client with `observation_stream_closed`. These errors mean delivery is incomplete.
+//! Upstream observation overflow continues device polling but invalidates clients
+//! with active subscriptions with terminal `observation_data_lost` (without request
+//! ID). Per-client fanout overflow reports the same explicit loss of data after
+//! the queued prefix. Reconnection creates a new stream. Clients without subscriptions
+//! keep their TCP connection and pending commands; loss during that inactive period
+//! does not invalidate a later subscription. Fanout skips inactive clients.
+//! Closing a subscribed connection does not determine the outcome of a pending Set.
+//! `observation_stream_closed` denotes closure without a detected overflow.
 //! An exhausted output buffer or transport failure may only permit connection
 //! closure; EOF is never proof of complete measurement delivery or Set failure.
 //! There is no replay across reconnects. The per-client pending, subscription and

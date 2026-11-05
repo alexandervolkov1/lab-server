@@ -325,6 +325,10 @@ pub struct SubscriptionSet {
 }
 
 impl SubscriptionSet {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     pub fn contains(&self, key: &str) -> bool {
         self.keys.contains(key)
     }
@@ -378,6 +382,7 @@ pub struct ClientSession {
     terminal: bool,
     last_request_id: u64,
     observation_clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    observation_interest: Option<std::sync::Arc<crate::fanout::ObservationInterest>>,
     activated_after: HashMap<String, u64>,
 }
 
@@ -391,6 +396,7 @@ impl ClientSession {
             terminal: false,
             last_request_id: 0,
             observation_clock: None,
+            observation_interest: None,
             activated_after: HashMap::new(),
         }
     }
@@ -612,6 +618,9 @@ impl ClientSession {
 
         let response = match self.subscriptions.apply(change, &keys, catalog) {
             Ok(keys) => {
+                if let Some(interest) = &self.observation_interest {
+                    interest.set_active(!keys.is_empty());
+                }
                 let boundary = self
                     .observation_clock
                     .as_ref()
@@ -948,6 +957,10 @@ impl TcpConnection {
         observations: &crate::fanout::ObservationReceiver,
     ) -> io::Result<bool> {
         self.session.observation_clock = Some(observations.clock.clone());
+        self.session.observation_interest = Some(observations.interest.clone());
+        observations
+            .interest
+            .set_active(!self.session.subscriptions.is_empty());
         let finished = self.drive_once(commands, catalog, latest)?;
 
         if finished || self.read_closed || self.session.is_terminal() {
@@ -979,6 +992,9 @@ impl TcpConnection {
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
 
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.session.subscriptions.is_empty() {
+                        break;
+                    }
                     self.session.terminal = true;
 
                     let response = json!({
