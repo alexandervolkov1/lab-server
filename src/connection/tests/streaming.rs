@@ -9,8 +9,10 @@ fn subscribe_excludes_old_publications_and_orders_ack_first() {
     let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
+    connection
+        .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+        .unwrap();
     fanout.publish(&observation()).unwrap();
-    connection.session.observation_clock = Some(observations.clock.clone());
     connection
         .session
         .dispatch_subscription(
@@ -78,6 +80,14 @@ fn tcp_reports_upstream_data_loss() {
     let observations = fanout.register().unwrap();
     let (tx, _rx) = mpsc::sync_channel(1);
     connection
+        .drive_once_with_observations(
+            &tx,
+            &get_catalog(),
+            &Mutex::new(HashMap::new()),
+            &observations,
+        )
+        .unwrap();
+    connection
         .session
         .dispatch_subscription(
             1,
@@ -117,6 +127,70 @@ fn inject_observation_loss(fanout: &crate::fanout::ObservationFanout, upstream: 
         fanout.publish(&observation()).unwrap();
         fanout.publish(&observation()).unwrap();
     }
+}
+
+fn resubscribe_does_not_hide_active_loss(upstream: bool) {
+    let (mut connection, mut client) = loopback_pair();
+    connection.session.outbound = OutboundBuffer::new(4096);
+    let fanout = crate::fanout::ObservationFanout::new(1);
+    let observations = fanout.register().unwrap();
+    let (tx, _rx) = mpsc::sync_channel(1);
+    let catalog = get_catalog();
+    let latest = Mutex::new(HashMap::new());
+    connection
+        .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+        .unwrap();
+    let keys = vec!["sample_temperature".into()];
+    connection
+        .session
+        .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
+        .unwrap();
+    inject_observation_loss(&fanout, upstream);
+
+    // Dispatch both transitions without polling the observation receiver in between.
+    for (id, change) in [
+        (2, SubscriptionChange::Unsubscribe),
+        (3, SubscriptionChange::Subscribe),
+    ] {
+        connection
+            .session
+            .dispatch_subscription(id, change, keys.clone(), &catalog)
+            .unwrap();
+    }
+    assert!(!connection.session.is_terminal());
+    assert!(
+        connection
+            .drive_once_with_observations(&tx, &catalog, &latest, &observations)
+            .unwrap()
+    );
+    assert!(connection.session.is_terminal());
+    drop(connection);
+
+    let mut text = String::new();
+    client.read_to_string(&mut text).unwrap();
+    let messages: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 4);
+    for (message, id) in messages.iter().zip(1..=3) {
+        assert_eq!(message["id"], id);
+        assert_eq!(message["status"], "ok");
+    }
+    assert_eq!(
+        messages[3],
+        json!({"status":"error", "error":"observation_data_lost"})
+    );
+}
+
+#[test]
+fn upstream_loss_survives_unsubscribe_and_resubscribe_before_notification() {
+    resubscribe_does_not_hide_active_loss(true);
+}
+
+#[test]
+fn personal_loss_survives_unsubscribe_and_resubscribe_before_notification() {
+    resubscribe_does_not_hide_active_loss(false);
 }
 
 #[test]
@@ -316,9 +390,12 @@ fn subscription_boundaries_are_per_key_and_per_client() {
     second.session.outbound = OutboundBuffer::new(4096);
     let first_rx = fanout.register().unwrap();
     let second_rx = fanout.register().unwrap();
-    for session in [&mut first.session, &mut second.session] {
-        session.observation_clock = Some(first_rx.clock.clone());
-    }
+    first
+        .drive_once_with_observations(&tx, &catalog, &latest, &first_rx)
+        .unwrap();
+    second
+        .drive_once_with_observations(&tx, &catalog, &latest, &second_rx)
+        .unwrap();
     let keys = vec!["sample_temperature".into()];
     first
         .session

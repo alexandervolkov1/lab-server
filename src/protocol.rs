@@ -32,6 +32,9 @@
 //! the queued prefix. Reconnection creates a new stream. Clients without subscriptions
 //! keep their TCP connection and pending commands; loss during that inactive period
 //! does not invalidate a later subscription. Fanout skips inactive clients.
+//! Loss during an active subscription remains pending across unsubscribe/subscribe;
+//! neither changing subscriptions nor reading an internal error acknowledges delivery
+//! of the loss notification. Such a stream still terminates with the loss error.
 //! Closing a subscribed connection does not determine the outcome of a pending Set.
 //! `observation_stream_closed` denotes closure without a detected overflow.
 //! An exhausted output buffer or transport failure may only permit connection

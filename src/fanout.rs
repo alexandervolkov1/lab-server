@@ -19,6 +19,7 @@ pub struct ObservationReceiver {
 struct InterestState {
     active: bool,
     registered_epoch: u64,
+    upstream_lost: bool,
     overflowed: bool,
 }
 
@@ -33,10 +34,16 @@ impl ObservationInterest {
             .state
             .lock()
             .expect("observation interest lock poisoned");
+        // This load is the transition boundary relative to upstream loss.
+        let epoch = self.loss_epoch.load(Ordering::SeqCst);
+        // Capture loss before leaving the active interval. Subscription changes
+        // are not an acknowledgement: only notification and stream teardown finish it.
+        if state.active && epoch != state.registered_epoch {
+            state.upstream_lost = true;
+        }
         if active && !state.active {
-            // Loss while there were no subscriptions does not invalidate a new stream.
-            state.registered_epoch = self.loss_epoch.load(Ordering::SeqCst);
-            state.overflowed = false;
+            // Ignore only losses from the inactive interval; retain earlier loss.
+            state.registered_epoch = epoch;
         }
         state.active = active;
     }
@@ -50,7 +57,9 @@ impl ObservationReceiver {
             .lock()
             .expect("observation interest lock poisoned");
         if state.overflowed
-            || self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch
+            || state.upstream_lost
+            || (state.active
+                && self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch)
         {
             "observation_data_lost"
         } else {
@@ -64,7 +73,9 @@ impl ObservationReceiver {
             .state
             .lock()
             .expect("observation interest lock poisoned");
-        if state.active && self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch
+        if state.active
+            && (state.upstream_lost
+                || self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch)
         {
             return Err(TryRecvError::Disconnected);
         }
@@ -105,8 +116,9 @@ impl ObservationFanout {
         let (sender, receiver) = mpsc::sync_channel(self.queue_capacity);
         let interest = Arc::new(ObservationInterest {
             state: Mutex::new(InterestState {
-                active: true,
+                active: false,
                 registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
+                upstream_lost: false,
                 overflowed: false,
             }),
             loss_epoch: self.loss_epoch.clone(),
@@ -155,7 +167,7 @@ impl ObservationFanout {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
                     state.overflowed = true;
-                    // Pause until this stream closes or is explicitly deactivated.
+                    // Keep the loss sticky and pause until this stream closes.
                     true
                 }
                 Err(TrySendError::Disconnected(_)) => false,
@@ -173,11 +185,41 @@ mod tests {
 
     use crate::model::Value;
 
+    fn register_active(fanout: &ObservationFanout) -> ObservationReceiver {
+        let receiver = fanout.register().unwrap();
+        receiver.interest.set_active(true);
+        receiver
+    }
+
+    #[test]
+    fn loss_before_first_subscription_does_not_poison_subscription() {
+        for upstream in [true, false] {
+            let fanout = ObservationFanout::new(1);
+            let receiver = fanout.register().unwrap();
+            if upstream {
+                fanout.loss_epoch().fetch_add(1, Ordering::SeqCst);
+            } else {
+                fanout.publish(&observation(20.0)).unwrap();
+                fanout.publish(&observation(21.0)).unwrap();
+            }
+            receiver.interest.set_active(true);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            fanout.publish(&observation(22.0)).unwrap();
+            assert_eq!(
+                receiver.try_recv().unwrap().observation.reading,
+                Ok(Value::Float(22.0))
+            );
+        }
+    }
+
     #[test]
     fn upstream_loss_closes_existing_streams_and_allows_reconnect() {
         let fanout = ObservationFanout::new(2);
-        let first = fanout.register().unwrap();
-        let second = fanout.register().unwrap();
+        let first = register_active(&fanout);
+        let second = register_active(&fanout);
         fanout.publish(&observation(20.0)).unwrap();
         fanout.loss_epoch().fetch_add(1, Ordering::SeqCst);
         assert!(matches!(
@@ -189,7 +231,7 @@ mod tests {
             Err(mpsc::TryRecvError::Disconnected)
         ));
         assert_eq!(first.closed_error(), "observation_data_lost");
-        let reconnected = fanout.register().unwrap();
+        let reconnected = register_active(&fanout);
         fanout.publish(&observation(21.0)).unwrap();
         assert_eq!(
             reconnected.try_recv().unwrap().observation.reading,
@@ -201,7 +243,7 @@ mod tests {
     fn disconnected_registrations_do_not_accumulate_without_publications() {
         let fanout = ObservationFanout::new(1);
         for _ in 0..1000 {
-            drop(fanout.register().unwrap());
+            drop(register_active(&fanout));
         }
         assert_eq!(fanout.subscribers.lock().unwrap().len(), 1);
     }
@@ -219,8 +261,8 @@ mod tests {
     fn publishes_to_multiple_clients() {
         let fanout = ObservationFanout::new(2);
 
-        let first = fanout.register().unwrap();
-        let second = fanout.register().unwrap();
+        let first = register_active(&fanout);
+        let second = register_active(&fanout);
 
         fanout.publish(&observation(20.0)).unwrap();
 
@@ -239,8 +281,8 @@ mod tests {
     fn slow_client_does_not_block_other_clients() {
         let fanout = ObservationFanout::new(1);
 
-        let slow = fanout.register().unwrap();
-        let fast = fanout.register().unwrap();
+        let slow = register_active(&fanout);
+        let fast = register_active(&fanout);
 
         fanout.publish(&observation(20.0)).unwrap();
 
@@ -269,9 +311,9 @@ mod tests {
     }
 
     #[test]
-    fn personal_overflow_resets_only_for_a_new_subscription() {
+    fn personal_overflow_persists_until_receiver_is_replaced() {
         let fanout = ObservationFanout::new(1);
-        let receiver = fanout.register().unwrap();
+        let receiver = register_active(&fanout);
         fanout.publish(&observation(20.0)).unwrap();
         fanout.publish(&observation(21.0)).unwrap();
         receiver.interest.set_active(true);
@@ -290,8 +332,11 @@ mod tests {
         receiver.interest.set_active(true);
         assert!(matches!(
             receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
+            Err(mpsc::TryRecvError::Disconnected)
         ));
+        assert_eq!(receiver.closed_error(), "observation_data_lost");
+        // Reading an error does not acknowledge its delivery to a TCP client.
+        let receiver = register_active(&fanout);
         fanout.publish(&observation(23.0)).unwrap();
         assert_eq!(
             receiver.try_recv().unwrap().observation.reading,
