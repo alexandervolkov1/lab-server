@@ -6,5 +6,6 @@ pub mod config;
 pub mod device_registry;
 pub mod driver;
 pub mod model;
+pub mod observation_aggregator;
 pub mod pending;
 pub mod port_worker;
