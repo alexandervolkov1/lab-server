@@ -130,6 +130,95 @@ Worker доверяет контракту драйвера о завершен�
 Изоляция panic не распространяется на завершение всего процесса (`panic=abort` и аналогичные сбои).
 Прежний runtime пока лишь преобразует типизированные ошибки обратно в текст; политика остановки общего порта относится к новому worker.
 
+## DeviceRegistry и CommandRouter (этап 3C1)
+
+`lab_server::device_registry` и `lab_server::command_router` — самостоятельные компоненты library.
+Они пока не подключены к TCP, `ClientSession`, TOML или фактическому запуску сервера.
+Имена сигналов и команды существующего Arduino/TCP runtime остаются прежними.
+
+`DeviceRegistry` хранит физические порты, логические приборы и точный индекс глобальных ключей
+`device_id/local_parameter`, например `furnace1/power` и `gauge1/temperature`.
+У разных приборов могут совпадать локальные имена; коротких псевдонимов нет.
+`device_id` не может быть пустым или содержать `/`. Локальное имя не разбирается и не нормализуется:
+например, локальный `nested/value` у прибора `gauge1` даёт ключ `gauge1/nested/value`.
+
+Основной API реестра:
+
+- `DeviceRegistry::new()`; `register_port(port_id, PortHandle)` регистрирует один handle на физический порт.
+- `register_unavailable_port(port_id, reason)` сохраняет порт, который не удалось открыть или запустить, и текст причины.
+- `register_device(port_id, &DeviceInstance)` копирует проверенный каталог прибора, включая настроенные периоды опроса.
+  Повторные идентификаторы портов/приборов и ссылка на незарегистрированный порт возвращают `RegistryError`.
+- `port(id)`, `device(id)`, `parameter(global_key)` и итераторы `ports()`, `devices()`, `parameters()` дают доступ только для чтения.
+  `RegisteredParameter` содержит `global_key`, `device_id`, `port_id` и существующий `ParameterDescription`;
+  в `description.id` сохранено локальное имя драйвера, а в `spec`, `unit`, `writable`, `default_poll_period` — исходные свойства.
+- `availability(device_id)` возвращает `Option<Availability>`; неизвестный прибор даёт `None`.
+  `RegisteredPort::availability()` вычисляет тот же статус непосредственно для порта.
+- `observation_parameter(&DeviceObservation)` сопоставляет точную пару `(device_id, Observation.source)` с записью глобального каталога.
+- `RegisteredPort::handle()` и `loss_epoch()` доступны и после остановки; для порта без worker оба возвращают `None`.
+
+Доступность представлена `Availability::Available`, `Unavailable { reason: String }` и `Stopped { reason: StopReason }`.
+Для зарегистрированного handle состояние вычисляется по `PortHandle::stop_reason()` при каждом обращении.
+Это снимок состояния, который может измениться сразу после чтения; отдельной копии статуса worker нет.
+При явном `shutdown` handle закрывает приём команд сразу, хотя текущая операция ещё может завершаться.
+Все приборы общего порта видят одну причину остановки. Другие порты продолжают работу.
+Каталог недоступного или остановленного прибора сохраняется целиком.
+
+Сначала нужно настроить периоды `DeviceInstance::set_poll_period`, затем создать worker и зарегистрировать
+именно его экземпляры через read-only `PortWorker::devices()`. `DeviceInstance::id()` и `parameters()`
+позволяют читать этот каталог без повторного вызова драйвера. Пример сборки из уже подготовленных `io` и `devices`:
+
+```rust
+let (worker, channels) = PortWorker::new(io, devices, 32, 128)?;
+let mut registry = DeviceRegistry::new();
+registry.register_port("shared_bus", channels.commands.clone())?;
+for device in worker.devices() {
+    registry.register_device("shared_bus", device)?;
+}
+registry.register_unavailable_port("offline_link", "COM4: access denied")?;
+registry.register_device("offline_link", &offline_device)?;
+let router = CommandRouter::new(registry);
+let worker_thread = std::thread::spawn(move || worker.run());
+// Владелец системы сохраняет channels.observations и управляет shutdown/join.
+let pending = router.read(1, "gauge1/temperature", deadline)?;
+```
+
+Регистрация не открывает порт и не запускает поток. Вызывающий код отвечает за соответствие handle,
+физического порта и переданных worker приборов, запуск `run()` и сохранение приёмника наблюдений.
+Для недоступного порта каталог можно получить из созданного `DeviceInstance` без какого-либо I/O.
+Драйверы общего порта могут совпадать или различаться; реестр не проверяет совместимость протоколов.
+
+`CommandRouter::new(registry)` принимает готовый реестр; клоны router разделяют один неизменяемый каталог через `Arc`.
+`registry()` предоставляет доступ к нему. `description(global_key)` ищет описание,
+`availability(device_id)` — доступность, с явной ошибкой для неизвестного прибора.
+`read(id, global_key, deadline)` и `set(id, global_key, value, deadline)` находят прибор и порт,
+передают только локальное имя в `PortHandle` и сразу возвращают исходный `Pending`.
+Маршрутизация не ожидает физического ответа или свободного места в очереди, не создаёт поток ожидания
+и не добавляет очередь поверх ограниченной очереди порта. Потоки приложения могут использовать клоны router конкурентно.
+
+Ошибки при приёме команды представлены `RouteError`: `UnknownSignal`, `UnknownDevice` (при запросе доступности),
+`Unavailable` с текстовой причиной, `Stopped` с исходным `StopReason`, `QueueFull` с идентификатором порта,
+`ReadOnly` и `InvalidValue` с глобальным ключом. Проверка записи выполняется до помещения в очередь;
+worker повторно проверяет её по своему каталогу. Boolean не преобразуется в число, числовые диапазоны сохраняются.
+Остановку при отправке проверяет сам `PortHandle` под существующей блокировкой приёма команд,
+поэтому предварительный снимок `Available` не является обещанием принять следующую команду.
+
+Принятая операция сохраняет прежние типы результата:
+`Pending<Result<DeviceObservation, CommandError>>` для чтения и `Pending<Result<(), CommandError>>` для записи.
+Ошибка физического чтения остаётся в `Observation.reading`; отказ ожидающей операции — в `CommandError`.
+`Observation.source` остаётся локальным; публичный глобальный ключ определяется через каталог.
+Идентификатор запроса и дедлайн проходят без изменений. Router не меняет `SetExecution`:
+таймаут/отмена до начала исключает вызов записи драйвера, неопределённый результат начатой записи сохраняется
+как `CommandError::OutcomeUnknown` либо `Completion::OutcomeUnknown` при опросе `Pending`.
+Автоматических повторов нет. `Pending::poll` потребляет завершённый запрос; удаление `Pending` само по себе не отменяет запись.
+
+Для этапа 3C2 доступны отдельные счётчики потерь через `registry.port(port_id).loss_epoch()`.
+Будущий агрегатор должен связывать каждый приёмник с его портом, сверять `RegisteredParameter::port_id`
+при сопоставлении наблюдения и отслеживать счётчик отдельно для каждого порта по правилам этапа 3B выше.
+Реестр не объединяет потоки, не определяет точную позицию потери и не восстанавливает пропущенные наблюдения.
+Сохраняются ограничения синхронного драйвера и восстановления синхронизации из этапа 3B.
+Создание драйверов по имени, жизненный цикл частичного запуска, открытие портов, TCP-маршрутизация
+и переподключение остаются задачами следующих этапов.
+
 ## Формат обмена
 
 TCP, NDJSON, UTF-8: одно JSON-сообщение на строку, завершённую LF (`\n`).
