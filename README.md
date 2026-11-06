@@ -2,6 +2,7 @@
 
 lab-server предоставляет TCP-доступ к измерениям и управлению параметрами Arduino.
 Клиент может запрашивать значения, изменять доступные для записи параметры и получать поток измерений.
+Протокол поддерживает `integer`, `float` и `boolean`; существующий Arduino-драйвер пока не предоставляет булевых параметров.
 
 ## Запуск
 
@@ -35,19 +36,27 @@ JSON-примеры запросов нужно отправлять с заве
 | `describe` — каталог параметров | — | `{"id":2,"op":"describe"}` | `id`, `status: "ok"`, массив `parameters` |
 | `ping` — проверка связи | — | `{"id":3,"op":"ping"}` | `{"id":3,"status":"ok"}` |
 | `get` — получить значение | `key`: строка | `{"id":4,"op":"get","key":"heater_temperature"}` | `id`, `status: "ok"`, `key`, `value`, `unit`, `completed_at_unix_ms` |
-| `set` — записать значение | `key`: строка, `value`: число | `{"id":5,"op":"set","key":"power","value":20}` | `{"id":5,"status":"ok"}` |
+| `set` — записать значение | `key`: строка, `value`: число или Boolean | `{"id":5,"op":"set","key":"power","value":20}` | `{"id":5,"status":"ok"}` |
 | `subscribe` — добавить подписки | `keys`: массив строк; либо одиночный `key` | `{"id":6,"op":"subscribe","keys":["heater_temperature"]}` | `{"id":6,"status":"ok","keys":["heater_temperature"]}` при отсутствии других подписок |
 | `unsubscribe` — удалить подписки | `keys`: массив строк | `{"id":7,"op":"unsubscribe","keys":["heater_temperature"]}` | `{"id":7,"status":"ok","keys":[]}` при удалении последней подписки |
 
 ### Каталог и значения
 
 В `describe.parameters` каждый объект содержит `key`, `type`, `min`, `max`, `unit`, `writable`, `poll_period_ns`.
-`type` принимает `integer` или `float`; границы `min` и `max` включительны.
+`type` принимает `integer`, `float` или `boolean`. Для числовых типов границы `min` и `max` включительны.
+Для `boolean`: `min: null`, `max: null`, `unit: ""`; оба значения `true` и `false` допустимы без числовых ограничений.
 `poll_period_ns` — период опроса в наносекундах, либо `null`, если периодического опроса нет.
 Например, элемент каталога для `power` (это фрагмент ответа `describe`):
 
 ```json
 {"key":"power","type":"integer","min":0,"max":100,"unit":"%","writable":true,"poll_period_ns":1000000000}
+```
+
+Пример булевых параметров имитационного драйвера (они не входят в каталог Arduino):
+
+```json
+{"key":"enabled","type":"boolean","min":null,"max":null,"unit":"","writable":true,"poll_period_ns":null}
+{"key":"fault","type":"boolean","min":null,"max":null,"unit":"","writable":false,"poll_period_ns":10000000}
 ```
 
 Текущий каталог Arduino; у всех параметров период опроса — 1 с (`1000000000` нс):
@@ -62,6 +71,16 @@ JSON-примеры запросов нужно отправлять с заве
 Для `set` литералы `20` и `20.0` различаются: первый — `integer`, второй — `float`.
 Запись требует `writable: true` и соответствия типу и диапазону; `20.0` для `power` будет отклонено.
 Экспоненциальная запись также считается `float`; бесконечные значения и целые за пределами `i64` не принимаются.
+Boolean передаётся JSON-литералами `true` и `false`, без кавычек. Неявных преобразований между Boolean и числами нет:
+для булевого параметра `1`, `0`, `1.0`, `0.0` и строка `"true"` отклоняются до обращения к драйверу;
+для числового параметра `true` и `false` также недопустимы. Например, запросы к имитационному драйверу:
+
+```json
+{"id":8,"op":"set","key":"enabled","value":true}
+{"id":9,"op":"set","key":"enabled","value":false}
+```
+
+Успешный ответ `set` остаётся ACK с `id` и `status: "ok"`. Правила таймаута и `outcome_unknown` одинаковы для всех типов.
 
 `get` периодически опрашиваемого параметра возвращает последнее измерение, включая последнюю ошибку чтения.
 Если измерений ещё нет, ответ имеет `status: "no_data"`. Для параметра без периодического опроса выполняется отдельное чтение.
@@ -71,6 +90,14 @@ JSON-примеры запросов нужно отправлять с заве
 {"id":4,"status":"ok","key":"heater_temperature","value":25.0,"unit":"degC","completed_at_unix_ms":1700000000000}
 {"id":4,"status":"no_data","key":"heater_temperature"}
 {"id":4,"status":"error","key":"heater_temperature","error":"Empty response","completed_at_unix_ms":1700000000000}
+```
+
+Успешный `get` булевого параметра возвращает JSON Boolean, а не число или строку; `unit` всегда пустая строка.
+Например, после записи `enabled` в имитационном драйвере:
+
+```json
+{"id":10,"op":"get","key":"enabled"}
+{"id":10,"status":"ok","key":"enabled","value":false,"unit":"","completed_at_unix_ms":1700000000000}
 ```
 
 ### Подписки
@@ -90,6 +117,16 @@ JSON-примеры запросов нужно отправлять с заве
 {"event":"measurement","status":"ok","key":"heater_temperature","value":25.0,"unit":"degC","completed_at_unix_ms":1700000000000}
 {"event":"measurement","status":"error","key":"heater_temperature","error":"Empty response","completed_at_unix_ms":1700000001000}
 ```
+
+Для булевого параметра `value` — JSON Boolean, `unit` — пустая строка. Примеры событий `fault` имитационного драйвера:
+
+```json
+{"event":"measurement","status":"ok","key":"fault","value":true,"unit":"","completed_at_unix_ms":1700000000000}
+{"event":"measurement","status":"ok","key":"fault","value":false,"unit":"","completed_at_unix_ms":1700000000010}
+{"event":"measurement","status":"error","key":"fault","error":"simulated read failure","completed_at_unix_ms":1700000000020}
+```
+
+Добавление Boolean не меняет версию протокола: `hello.version` остаётся `1`.
 
 `completed_at_unix_ms` — время завершения измерения в миллисекундах от Unix epoch, а не время отправки клиенту.
 При ошибке чтения вместо `value` и `unit` передаётся строка `error`; поля `id` у событий нет в обоих случаях.
