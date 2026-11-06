@@ -187,6 +187,7 @@ fn parse_numeric_reply(line: &str, request_id: u16, spec: &Spec) -> Result<Value
 
             Value::Integer(number)
         }
+        Spec::Boolean => return Err("Boolean is not supported by Arduino"),
     };
 
     if !spec.accepts(&value) {

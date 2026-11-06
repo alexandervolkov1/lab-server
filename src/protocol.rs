@@ -241,6 +241,10 @@ pub fn parse_parameter_key(
 pub fn parse_set_value(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<crate::model::Value, RequestError> {
+    if let Some(value) = object.get("value").and_then(serde_json::Value::as_bool) {
+        return Ok(crate::model::Value::Boolean(value));
+    }
+
     let number = object
         .get("value")
         .and_then(serde_json::Value::as_number)
@@ -726,11 +730,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_or_non_numeric_values() {
+    fn parses_boolean_literals() {
+        for value in [false, true] {
+            let frame = format!(r#"{{"id":1,"op":"set","key":"enabled","value":{value}}}"#);
+            assert_eq!(
+                parse_tcp_request(&frame),
+                Ok(TcpRequest::Set {
+                    id: 1,
+                    key: "enabled".into(),
+                    value: crate::model::Value::Boolean(value),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_unsupported_values() {
         let cases = [
             r#"{"id":1}"#,
             r#"{"value":null}"#,
-            r#"{"value":true}"#,
+            r#"{"value":"true"}"#,
+            r#"{"value":"false"}"#,
             r#"{"value":"20"}"#,
             r#"{"value":[]}"#,
             r#"{"value":{}}"#,

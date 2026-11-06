@@ -576,9 +576,14 @@ impl ClientSession {
         let parameters: Vec<_> = descriptions
             .into_iter()
             .map(|description| {
-                let (kind, min, max) = match &description.spec {
-                    crate::model::Spec::Float { min, max } => ("float", json!(min), json!(max)),
-                    crate::model::Spec::Integer { min, max } => ("integer", json!(min), json!(max)),
+                let (kind, min, max, unit) = match &description.spec {
+                    crate::model::Spec::Float { min, max } => {
+                        ("float", json!(min), json!(max), description.unit.as_str())
+                    }
+                    crate::model::Spec::Integer { min, max } => {
+                        ("integer", json!(min), json!(max), description.unit.as_str())
+                    }
+                    crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
                 };
 
                 json!({
@@ -586,7 +591,7 @@ impl ClientSession {
                     "type": kind,
                     "min": min,
                     "max": max,
-                    "unit": &description.unit,
+                    "unit": unit,
                     "writable": description.writable,
                     "poll_period_ns": description
                         .default_poll_period

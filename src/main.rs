@@ -148,15 +148,16 @@ fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<St
 
     let mut message = match &observation.reading {
         Ok(value) => {
-            let json_value = match value {
-                Value::Float(value) => json!(value),
-                Value::Integer(value) => json!(value),
+            let (json_value, unit) = match value {
+                Value::Float(value) => (json!(value), observation.unit.as_str()),
+                Value::Integer(value) => (json!(value), observation.unit.as_str()),
+                Value::Boolean(value) => (json!(value), ""),
             };
             json!({
                 "status": "ok",
                 "key": &observation.source,
                 "value": json_value,
-                "unit": &observation.unit,
+                "unit": unit,
                 "completed_at_unix_ms": timestamp_ms
             })
         }
