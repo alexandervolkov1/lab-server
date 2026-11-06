@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -107,7 +108,6 @@ pub enum StopReason {
     Shutdown,
     NoCommandSenders,
     Driver(DriverError),
-    ObservationOverflow,
     ObservationReceiverDropped,
     ScheduleOverflow,
 }
@@ -193,6 +193,7 @@ pub struct PortHandle {
     sender: mpsc::SyncSender<Command>,
     // Admission and closing share a lock: after close the drain has a finite end.
     stopped: Arc<Mutex<Option<StopReason>>>,
+    loss_epoch: Arc<AtomicU64>,
 }
 
 impl PortHandle {
@@ -256,12 +257,21 @@ impl PortHandle {
         }
     }
 
-    /// Also exposes observation overflow explicitly after the queued prefix.
     pub fn stop_reason(&self) -> Option<StopReason> {
         self.stopped
             .lock()
             .expect("port control lock poisoned")
             .clone()
+    }
+
+    /// Number of observations dropped because the bounded queue was full.
+    /// Independent of queue contents and the control lock; never reset by reads.
+    /// Compare with the last observed value (initially zero), including after
+    /// draining the queue. A change indicates a gap, not its position among
+    /// queued messages: try_send and increment are separate operations, so a gap
+    /// may be noticed on a later check. u64::MAX is sticky loss/unknown continuity.
+    pub fn loss_epoch(&self) -> u64 {
+        self.loss_epoch.load(Ordering::SeqCst)
     }
 
     pub fn port_state(&self) -> PortState {
@@ -283,6 +293,7 @@ pub struct PortWorker<P: DeviceIo> {
     commands: mpsc::Receiver<Command>,
     output: mpsc::SyncSender<DeviceObservation>,
     stopped: Arc<Mutex<Option<StopReason>>>,
+    loss_epoch: Arc<AtomicU64>,
     scheduler: Scheduler,
 }
 
@@ -318,9 +329,11 @@ impl<P: DeviceIo> PortWorker<P> {
         let (sender, commands) = mpsc::sync_channel(command_capacity);
         let (output, observations) = mpsc::sync_channel(observation_capacity);
         let stopped = Arc::new(Mutex::new(None));
+        let loss_epoch = Arc::new(AtomicU64::new(0));
         let handle = PortHandle {
             sender,
             stopped: stopped.clone(),
+            loss_epoch: loss_epoch.clone(),
         };
         Ok((
             Self {
@@ -329,6 +342,7 @@ impl<P: DeviceIo> PortWorker<P> {
                 commands,
                 output,
                 stopped,
+                loss_epoch,
                 scheduler,
             },
             PortChannels {
@@ -551,7 +565,17 @@ impl<P: DeviceIo> PortWorker<P> {
         let observation = self.read(task.device, task.parameter);
         let stop = match self.output.try_send(observation) {
             Ok(()) => None,
-            Err(mpsc::TrySendError::Full(_)) => Some(StopReason::ObservationOverflow),
+            Err(mpsc::TrySendError::Full(_)) => {
+                // A slow observer must not stop device polling or control. Keep
+                // loss visible out of band, including after the queue is drained.
+                // Saturate instead of wrapping and making old loss look absent.
+                let _ = self
+                    .loss_epoch
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                        Some(epoch.saturating_add(1))
+                    });
+                None
+            }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 Some(StopReason::ObservationReceiverDropped)
             }

@@ -693,21 +693,272 @@ fn idle_worker_stops_on_shutdown_or_last_sender_drop() {
 #[test]
 fn observation_overflow_is_explicit_and_never_blocks_worker() {
     let trace = Arc::new(Mutex::new(Trace::default()));
-    let mut device = DeviceInstance::new("one", FakeDriver::<1>::new(1, trace.clone())).unwrap();
+    let (gate, calls, release) = gate();
+    let mut driver = FakeDriver::<1>::new(1, trace.clone());
+    driver.gate = Some(gate);
+    let mut device = DeviceInstance::new("one", driver).unwrap();
     device
         .set_poll_period("value", Some(Duration::from_nanos(1)))
         .unwrap();
-    let (worker, channels) = PortWorker::new(FakeIo::new(trace), vec![device], 1, 1).unwrap();
-    assert_eq!(worker.run(), StopReason::ObservationOverflow);
+    let (worker, channels) =
+        PortWorker::new(FakeIo::new(trace.clone()), vec![device], 2, 1).unwrap();
+    let observer = channels.commands.clone();
+    let join = thread::spawn(move || worker.run());
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 1);
+    assert_eq!(observer.loss_epoch(), 0);
+    release.send(()).unwrap();
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 2);
+    assert_eq!(observer.loss_epoch(), 0); // First observation fits in the queue.
+
+    // Each gate is entered after the preceding publication attempt. No timing
+    // assumptions: hold the next transaction while inspecting the loss counter.
+    for losses in 1..=2 {
+        release.send(()).unwrap();
+        calls.recv_timeout(WAIT).unwrap();
+        assert_eq!(observer.loss_epoch(), losses);
+        assert!(observer.stop_reason().is_none());
+        assert_eq!(observer.port_state(), PortState::Synchronized);
+    }
+
+    let get = channels
+        .commands
+        .read(1, "one", "enabled", deadline())
+        .unwrap();
+    release.send(()).unwrap(); // Poll 4 is lost; get 5 starts.
+    let call = calls.recv_timeout(WAIT).unwrap();
+    assert_eq!(call.sequence, 5);
+    assert!(!call.write);
+    assert_eq!(observer.loss_epoch(), 3);
+    release.send(()).unwrap();
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 6);
+    assert_eq!(value(get), Value::Boolean(false));
+
+    let set = channels
+        .commands
+        .set(2, "one", "enabled", Value::Boolean(true), deadline())
+        .unwrap();
+    release.send(()).unwrap(); // Poll 6 is lost; set 7 starts.
+    let call = calls.recv_timeout(WAIT).unwrap();
+    assert_eq!(call.sequence, 7);
+    assert!(call.write);
+    assert_eq!(observer.loss_epoch(), 4);
+    release.send(()).unwrap();
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 8);
+    assert_eq!(received(set), Ok(()));
+
+    let get = channels
+        .commands
+        .read(3, "one", "enabled", deadline())
+        .unwrap();
+    release.send(()).unwrap(); // Poll 8 is lost; get 9 verifies the write.
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 9);
+    release.send(()).unwrap();
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 10);
+    assert_eq!(value(get), Value::Boolean(true));
+    assert_eq!(observer.loss_epoch(), 5);
+
+    let first = channels.observations.try_recv().unwrap();
+    assert_eq!(first.observation.reading, Ok(Value::Integer(1)));
+    assert!(matches!(
+        channels.observations.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(observer.loss_epoch(), 5); // Draining never acknowledges/reset loss.
+    release.send(()).unwrap();
+    assert_eq!(calls.recv_timeout(WAIT).unwrap().sequence, 11);
+    let resumed = channels.observations.try_recv().unwrap();
+    assert_eq!(resumed.observation.reading, Ok(Value::Integer(10)));
+    assert_eq!(channels.commands.loss_epoch(), 5);
+    assert!(observer.stop_reason().is_none());
+
+    channels.commands.shutdown();
+    release.send(()).unwrap();
+    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+    assert_eq!(
+        channels
+            .observations
+            .try_recv()
+            .unwrap()
+            .observation
+            .reading,
+        Ok(Value::Integer(11))
+    );
+    assert!(matches!(
+        channels.observations.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert_eq!(observer.loss_epoch(), 5);
+    assert_eq!(trace.lock().unwrap().completed, 11);
+}
+
+#[test]
+fn observation_overflow_is_local_to_one_worker() {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let (gate, calls, release) = gate();
+    let mut driver = FakeDriver::<1>::new(1, trace.clone());
+    driver.gate = Some(gate);
+    let mut device = DeviceInstance::new("one", driver).unwrap();
+    device
+        .set_poll_period("value", Some(Duration::from_nanos(1)))
+        .unwrap();
+    let (worker, channels) = PortWorker::new(FakeIo::new(trace), vec![device], 2, 1).unwrap();
+    let join = thread::spawn(move || worker.run());
+    calls.recv_timeout(WAIT).unwrap();
+    for _ in 0..2 {
+        release.send(()).unwrap();
+        calls.recv_timeout(WAIT).unwrap();
+    }
+    assert_eq!(channels.commands.loss_epoch(), 1);
+    assert!(channels.commands.stop_reason().is_none());
+
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let device = DeviceInstance::new("one", FakeDriver::<2>::new(1, trace.clone())).unwrap();
+    let (other, independent) = PortWorker::new(FakeIo::new(trace), vec![device], 2, 1).unwrap();
+    let other_join = thread::spawn(move || other.run());
+    assert_eq!(
+        value(
+            independent
+                .commands
+                .read(1, "one", "enabled", deadline())
+                .unwrap()
+        ),
+        Value::Boolean(false)
+    );
+    assert_eq!(
+        received(
+            independent
+                .commands
+                .set(2, "one", "enabled", Value::Boolean(true), deadline())
+                .unwrap()
+        ),
+        Ok(())
+    );
+    assert_eq!(independent.commands.loss_epoch(), 0);
+    assert_eq!(independent.commands.port_state(), PortState::Synchronized);
+
+    channels.observations.try_recv().unwrap();
+    channels.commands.shutdown();
+    release.send(()).unwrap();
+    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+    assert_eq!(channels.commands.loss_epoch(), 1);
+    assert_eq!(
+        value(
+            independent
+                .commands
+                .read(3, "one", "enabled", deadline())
+                .unwrap()
+        ),
+        Value::Boolean(true)
+    );
+    assert!(independent.commands.stop_reason().is_none());
+    assert_eq!(independent.commands.loss_epoch(), 0);
+    independent.commands.shutdown();
+    assert_eq!(other_join.join().unwrap(), StopReason::Shutdown);
+}
+
+#[test]
+fn observation_receiver_dropped_after_overflow_still_stops_worker() {
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let (gate, calls, release) = gate();
+    let mut driver = FakeDriver::<1>::new(1, trace.clone());
+    driver.gate = Some(gate);
+    let mut device = DeviceInstance::new("one", driver).unwrap();
+    device
+        .set_poll_period("value", Some(Duration::from_nanos(1)))
+        .unwrap();
+    let (worker, channels) =
+        PortWorker::new(FakeIo::new(trace.clone()), vec![device], 2, 1).unwrap();
+    let join = thread::spawn(move || worker.run());
+    calls.recv_timeout(WAIT).unwrap();
+    for _ in 0..2 {
+        release.send(()).unwrap();
+        calls.recv_timeout(WAIT).unwrap();
+    }
+    assert_eq!(channels.commands.loss_epoch(), 1);
+    drop(channels.observations);
+    let read = channels
+        .commands
+        .read(1, "one", "value", deadline())
+        .unwrap();
+    let write = channels
+        .commands
+        .set(2, "one", "enabled", Value::Boolean(true), deadline())
+        .unwrap();
+    release.send(()).unwrap();
+    assert_eq!(join.join().unwrap(), StopReason::ObservationReceiverDropped);
+    assert!(matches!(
+        received(read),
+        Err(CommandError::PortStopped(
+            StopReason::ObservationReceiverDropped
+        ))
+    ));
+    assert_eq!(
+        received(write),
+        Err(CommandError::PortStopped(
+            StopReason::ObservationReceiverDropped
+        ))
+    );
     assert_eq!(
         channels.commands.stop_reason(),
-        Some(StopReason::ObservationOverflow)
+        Some(StopReason::ObservationReceiverDropped)
     );
-    assert_eq!(channels.observations.try_iter().count(), 1);
-    assert!(matches!(
-        channels.commands.read(1, "one", "value", deadline()),
-        Err(SubmitError::Stopped(StopReason::ObservationOverflow))
-    ));
+    assert_eq!(channels.commands.port_state(), PortState::Synchronized);
+    assert_eq!(channels.commands.loss_epoch(), 1);
+    assert_eq!(trace.lock().unwrap().calls.len(), 3);
+}
+
+#[test]
+fn observation_overflow_does_not_mask_fatal_driver_errors() {
+    for state in [PortState::Desynchronized, PortState::Disconnected] {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let (gate, calls, release) = gate();
+        let mut driver = FakeDriver::<1>::new(1, trace.clone());
+        driver.gate = Some(gate);
+        driver.failures = [
+            DriverError::new("measurement failed", PortState::Synchronized),
+            DriverError::new("measurement failed", PortState::Synchronized),
+            DriverError::new("physical failure", state),
+        ]
+        .into();
+        let mut device = DeviceInstance::new("one", driver).unwrap();
+        device
+            .set_poll_period("value", Some(Duration::from_nanos(1)))
+            .unwrap();
+        let (worker, channels) =
+            PortWorker::new(FakeIo::new(trace.clone()), vec![device], 2, 1).unwrap();
+        let join = thread::spawn(move || worker.run());
+        calls.recv_timeout(WAIT).unwrap();
+        for _ in 0..2 {
+            release.send(()).unwrap();
+            calls.recv_timeout(WAIT).unwrap();
+        }
+        assert_eq!(channels.commands.loss_epoch(), 1);
+        assert!(channels.commands.stop_reason().is_none());
+        let read = channels
+            .commands
+            .read(1, "one", "value", deadline())
+            .unwrap();
+        let write = channels
+            .commands
+            .set(2, "one", "enabled", Value::Boolean(true), deadline())
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(
+            matches!(join.join().unwrap(), StopReason::Driver(error) if error.port_state == state)
+        );
+        assert!(
+            matches!(received(read), Err(CommandError::PortStopped(StopReason::Driver(error))) if error.port_state == state)
+        );
+        assert!(
+            matches!(received(write), Err(CommandError::PortStopped(StopReason::Driver(error))) if error.port_state == state)
+        );
+        assert_eq!(channels.commands.port_state(), state);
+        // The fatal measurement also did not fit; the physical failure remains
+        // independently visible even though that observation cannot be delivered.
+        assert_eq!(channels.observations.try_iter().count(), 1);
+        assert_eq!(channels.commands.loss_epoch(), 2);
+        assert_eq!(trace.lock().unwrap().calls.len(), 3);
+    }
 }
 
 #[test]
