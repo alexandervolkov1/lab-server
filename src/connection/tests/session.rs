@@ -253,6 +253,21 @@ fn output_overflow_makes_session_terminal() {
 fn validates_set_spec_before_queueing() {
     for (writable, spec, value, expected) in [
         (
+            true,
+            crate::model::Spec::Integer { min: 0, max: 100 },
+            Value::Boolean(true),
+            Some("Value does not match parameter spec"),
+        ),
+        (
+            true,
+            crate::model::Spec::Float {
+                min: 0.0,
+                max: 100.0,
+            },
+            Value::Boolean(false),
+            Some("Value does not match parameter spec"),
+        ),
+        (
             false,
             crate::model::Spec::Integer { min: 0, max: 100 },
             Value::Integer(20),

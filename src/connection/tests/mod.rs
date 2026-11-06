@@ -11,6 +11,7 @@ use crate::model::Value;
 
 use support::*;
 
+mod boolean;
 mod outbound;
 mod pending;
 mod session;

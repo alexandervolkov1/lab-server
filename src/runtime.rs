@@ -272,6 +272,21 @@ mod tests {
     }
 
     fn set_timeout_case(expired_in_queue: bool, delayed_reply: bool) {
+        for (spec, value) in [
+            (Spec::Integer { min: 0, max: 100 }, Value::Integer(20)),
+            (Spec::Boolean, Value::Boolean(true)),
+            (Spec::Boolean, Value::Boolean(false)),
+        ] {
+            set_timeout_value_case(expired_in_queue, delayed_reply, spec, value);
+        }
+    }
+
+    fn set_timeout_value_case(
+        expired_in_queue: bool,
+        delayed_reply: bool,
+        spec: Spec,
+        value: Value,
+    ) {
         use crate::connection::ClientSession;
         use std::collections::HashMap;
         let now = Instant::now();
@@ -284,7 +299,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
         let description = ParameterDescription {
             id: "power".into(),
-            spec: Spec::Integer { min: 0, max: 100 },
+            spec,
             unit: "%".into(),
             writable: true,
             default_poll_period: None,
@@ -293,7 +308,7 @@ mod tests {
             .dispatch_set(
                 1,
                 "power".into(),
-                Value::Integer(20),
+                value,
                 &tx,
                 &HashMap::from([("power".into(), description)]),
                 requested_at,
