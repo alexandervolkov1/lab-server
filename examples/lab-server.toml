@@ -1,0 +1,52 @@
+# Stage 3A: this example is parsed and validated only.
+# It is NOT used when starting the server; startup still uses Arduino on COM3.
+
+[tcp]
+bind = "127.0.0.1:7240"
+
+[[ports]]
+id = "arduino_link"
+name = "COM3"
+baud = 57600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 3000
+
+[[ports]]
+id = "shared_bus"
+name = "COM4"
+baud = 9600
+data_bits = 8
+parity = "even"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 1000
+
+[[devices]]
+id = "furnace1"
+driver = "arduino"
+port = "arduino_link"
+
+# Optional future polling overrides by local signal name, in milliseconds.
+# Stage 3A stores these settings without applying them.
+[devices.poll_periods_ms]
+sample_temperature = 1000
+power = 2000
+
+[[devices]]
+id = "gauge1"
+driver = "metakon" # Demonstration name; no driver implementation is required.
+port = "shared_bus"
+
+[devices.options]
+address = 1
+
+[[devices]]
+id = "controller1"
+driver = "custom_ascii" # Another demonstration driver on the same physical port.
+port = "shared_bus"
+
+[devices.options]
+address = 2
