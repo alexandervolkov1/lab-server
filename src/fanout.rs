@@ -1,9 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::device_registry::DeviceRegistry;
 use crate::model::Observation;
+use crate::port_worker::PortHandle;
 
 pub struct PublishedObservation {
     pub sequence: u64,
@@ -16,72 +19,167 @@ pub struct ObservationReceiver {
     pub interest: Arc<ObservationInterest>,
 }
 
+struct PortStream {
+    handle: Option<PortHandle>,
+    reported_epoch: AtomicU64,
+    closed: AtomicBool,
+    corrupted: AtomicBool,
+}
+impl PortStream {
+    fn epoch(&self) -> u64 {
+        self.reported_epoch
+            .load(Ordering::SeqCst)
+            .max(self.handle.as_ref().map_or(0, PortHandle::loss_epoch))
+    }
+}
+struct Domains {
+    keys: HashMap<String, String>,
+    ports: BTreeMap<String, PortStream>,
+}
+
 struct InterestState {
     active: bool,
     registered_epoch: u64,
     upstream_lost: bool,
     overflowed: bool,
+    stream_closed: bool,
+    keys: HashSet<String>,
+    ports: BTreeMap<String, u64>,
 }
 
 pub struct ObservationInterest {
     state: Mutex<InterestState>,
     loss_epoch: Arc<AtomicU64>,
+    domains: Option<Arc<Domains>>,
 }
 
 impl ObservationInterest {
+    /// Compatibility entry point for the single-device runtime.
     pub fn set_active(&self, active: bool) {
+        assert!(
+            self.domains.is_none(),
+            "routed subscriptions must specify keys"
+        );
         let mut state = self
             .state
             .lock()
             .expect("observation interest lock poisoned");
-        // This load is the transition boundary relative to upstream loss.
         let epoch = self.loss_epoch.load(Ordering::SeqCst);
-        // Capture loss before leaving the active interval. Subscription changes
-        // are not an acknowledgement: only notification and stream teardown finish it.
         if state.active && epoch != state.registered_epoch {
             state.upstream_lost = true;
         }
         if active && !state.active {
-            // Ignore only losses from the inactive interval; retain earlier loss.
             state.registered_epoch = epoch;
         }
         state.active = active;
+    }
+
+    /// Linearize subscription boundaries against each affected worker's
+    /// publication + loss commit. All affected gates are held together in port
+    /// id order. The worker never takes interest/subscriber locks, and its gate
+    /// never covers driver I/O. No network calls occur under these locks.
+    pub fn set_keys(&self, keys: &[String]) {
+        let Some(domains) = &self.domains else {
+            self.set_active(!keys.is_empty());
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .expect("observation interest lock poisoned");
+        let next_ports: BTreeSet<_> = keys
+            .iter()
+            .filter_map(|key| domains.keys.get(key).cloned())
+            .collect();
+        let affected: BTreeSet<_> = state
+            .ports
+            .keys()
+            .cloned()
+            .chain(next_ports.iter().cloned())
+            .collect();
+        let _boundaries: Vec<_> = affected
+            .iter()
+            .filter_map(|id| domains.ports[id].handle.as_ref())
+            .map(PortHandle::observation_boundary)
+            .collect();
+        self.refresh(&mut state);
+        let mut next = BTreeMap::new();
+        for id in next_ports {
+            let port = &domains.ports[&id];
+            let epoch = port.epoch();
+            if epoch == u64::MAX || port.corrupted.load(Ordering::SeqCst) {
+                state.upstream_lost = true;
+            }
+            if port.closed.load(Ordering::SeqCst) {
+                state.stream_closed = true;
+            }
+            next.insert(id.clone(), state.ports.get(&id).copied().unwrap_or(epoch));
+        }
+        state.ports = next;
+        state.keys = keys.iter().cloned().collect();
+        state.active = !keys.is_empty();
+    }
+
+    fn refresh(&self, state: &mut InterestState) {
+        if let Some(domains) = &self.domains {
+            for (id, baseline) in &state.ports {
+                let port = &domains.ports[id];
+                let epoch = port.epoch();
+                if epoch != *baseline || epoch == u64::MAX || port.corrupted.load(Ordering::SeqCst)
+                {
+                    state.upstream_lost = true;
+                }
+                if port.closed.load(Ordering::SeqCst) {
+                    state.stream_closed = true;
+                }
+            }
+        } else if state.active && self.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch {
+            state.upstream_lost = true;
+        }
     }
 }
 
 impl ObservationReceiver {
     pub fn closed_error(&self) -> &'static str {
-        let state = self
+        let mut state = self
             .interest
             .state
             .lock()
             .expect("observation interest lock poisoned");
-        if state.overflowed
-            || state.upstream_lost
-            || (state.active
-                && self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch)
-        {
+        self.interest.refresh(&mut state);
+        if state.overflowed || state.upstream_lost {
             "observation_data_lost"
         } else {
             "observation_stream_closed"
         }
     }
 
-    pub fn try_recv(&self) -> Result<PublishedObservation, mpsc::TryRecvError> {
+    /// In routed mode an unsubscribe cannot acknowledge an already detected
+    /// stream failure, even if no subscriptions remain at the next TCP turn.
+    pub fn terminal_when_inactive(&self) -> bool {
         let state = self
             .interest
             .state
             .lock()
             .expect("observation interest lock poisoned");
-        if state.active
-            && (state.upstream_lost
-                || self.interest.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch)
-        {
+        self.interest.domains.is_some()
+            && (state.upstream_lost || state.overflowed || state.stream_closed)
+    }
+
+    pub fn try_recv(&self) -> Result<PublishedObservation, TryRecvError> {
+        let mut state = self
+            .interest
+            .state
+            .lock()
+            .expect("observation interest lock poisoned");
+        self.interest.refresh(&mut state);
+        let relevant = state.active || self.interest.domains.is_some();
+        if relevant && state.upstream_lost {
             return Err(TryRecvError::Disconnected);
         }
         match self.receiver.try_recv() {
-            // Preserve the queued prefix, then explicitly report personal overflow.
-            Err(TryRecvError::Empty) if state.active && state.overflowed => {
+            // Preserve the queued prefix for personal overflow and orderly EOF.
+            Err(TryRecvError::Empty) if relevant && (state.overflowed || state.stream_closed) => {
                 Err(TryRecvError::Disconnected)
             }
             result => result,
@@ -94,22 +192,79 @@ pub struct ObservationFanout {
     subscribers: Mutex<Vec<(Weak<ObservationInterest>, SyncSender<PublishedObservation>)>>,
     clock: Arc<AtomicU64>,
     loss_epoch: Arc<AtomicU64>,
+    domains: Option<Arc<Domains>>,
 }
 
 impl ObservationFanout {
     pub fn new(queue_capacity: usize) -> Self {
         assert!(queue_capacity > 0);
-
         Self {
             queue_capacity,
             clock: Arc::new(AtomicU64::new(0)),
             loss_epoch: Arc::new(AtomicU64::new(0)),
             subscribers: Mutex::new(Vec::new()),
+            domains: None,
         }
     }
 
+    pub fn routed(queue_capacity: usize, registry: &DeviceRegistry) -> Self {
+        let mut fanout = Self::new(queue_capacity);
+        fanout.domains = Some(Arc::new(Domains {
+            keys: registry
+                .parameters()
+                .map(|p| (p.global_key.clone(), p.port_id.clone()))
+                .collect(),
+            ports: registry
+                .ports()
+                .map(|p| {
+                    (
+                        p.id().into(),
+                        PortStream {
+                            handle: p.handle().cloned(),
+                            reported_epoch: AtomicU64::new(0),
+                            closed: AtomicBool::new(p.handle().is_none()),
+                            corrupted: AtomicBool::new(false),
+                        },
+                    )
+                })
+                .collect(),
+        }));
+        fanout
+    }
+
+    /// Legacy single-runtime counter. Routed mode reads each PortHandle counter.
     pub fn loss_epoch(&self) -> Arc<AtomicU64> {
         self.loss_epoch.clone()
+    }
+
+    fn port(&self, id: &str) -> io::Result<&PortStream> {
+        self.domains
+            .as_ref()
+            .and_then(|d| d.ports.get(id))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown stream port {id:?}"),
+                )
+            })
+    }
+    pub(crate) fn report_loss(&self, id: &str, epoch: u64) -> io::Result<()> {
+        self.port(id)?
+            .reported_epoch
+            .fetch_max(epoch, Ordering::SeqCst);
+        Ok(())
+    }
+    pub(crate) fn close_port(&self, id: &str) -> io::Result<()> {
+        self.port(id)?.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    pub(crate) fn corrupt_port(&self, id: &str) -> io::Result<()> {
+        self.port(id)?.corrupted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    pub(crate) fn port_usable(&self, id: &str) -> bool {
+        self.port(id)
+            .is_ok_and(|p| !p.closed.load(Ordering::SeqCst) && !p.corrupted.load(Ordering::SeqCst))
     }
 
     pub fn register(&self) -> io::Result<ObservationReceiver> {
@@ -120,8 +275,12 @@ impl ObservationFanout {
                 registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
                 upstream_lost: false,
                 overflowed: false,
+                stream_closed: false,
+                keys: HashSet::new(),
+                ports: BTreeMap::new(),
             }),
             loss_epoch: self.loss_epoch.clone(),
+            domains: self.domains.clone(),
         });
         let mut subscribers = self
             .subscribers
@@ -141,13 +300,11 @@ impl ObservationFanout {
             .subscribers
             .lock()
             .map_err(|_| io::Error::other("subscriber lock poisoned"))?;
-
         let sequence = self
             .clock
             .load(Ordering::SeqCst)
             .checked_add(1)
             .ok_or_else(|| io::Error::other("observation sequence exhausted"))?;
-        // This increment is the publication point, serialized with other publishers.
         self.clock.store(sequence, Ordering::SeqCst);
         subscribers.retain(|(interest, sender)| {
             let Some(interest) = interest.upgrade() else {
@@ -157,7 +314,13 @@ impl ObservationFanout {
                 .state
                 .lock()
                 .expect("observation interest lock poisoned");
-            if !state.active || state.overflowed {
+            interest.refresh(&mut state);
+            if !state.active
+                || state.overflowed
+                || state.stream_closed
+                || state.upstream_lost
+                || (interest.domains.is_some() && !state.keys.contains(&observation.source))
+            {
                 return true;
             }
             match sender.try_send(PublishedObservation {
@@ -167,13 +330,11 @@ impl ObservationFanout {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
                     state.overflowed = true;
-                    // Keep the loss sticky and pause until this stream closes.
                     true
                 }
                 Err(TrySendError::Disconnected(_)) => false,
             }
         });
-
         Ok(())
     }
 }

@@ -6,6 +6,12 @@ pub const MAX_CLIENTS: usize = 32;
 #[derive(Clone)]
 pub struct ClientSlots(Arc<AtomicUsize>);
 
+impl Default for ClientSlots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ClientSlot(Arc<AtomicUsize>);
 
 impl ClientSlots {

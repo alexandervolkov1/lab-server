@@ -204,9 +204,17 @@ pub struct PortHandle {
     // Admission and closing share a lock: after close the drain has a finite end.
     stopped: Arc<Mutex<Option<StopReason>>>,
     loss_epoch: Arc<AtomicU64>,
+    observation_boundary: Arc<Mutex<()>>,
 }
 
 impl PortHandle {
+    // Subscription transitions share this boundary with try_send + loss commit.
+    // Never held during driver I/O, network I/O, or waiting for queue capacity.
+    pub(crate) fn observation_boundary(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.observation_boundary
+            .lock()
+            .expect("observation boundary poisoned")
+    }
     fn submit(&self, command: Command) -> Result<(), SubmitError> {
         let stopped = self.stopped.lock().expect("port control lock poisoned");
         if let Some(reason) = stopped.as_ref() {
@@ -304,7 +312,10 @@ pub struct PortWorker<P: DeviceIo> {
     output: mpsc::SyncSender<DeviceObservation>,
     stopped: Arc<Mutex<Option<StopReason>>>,
     loss_epoch: Arc<AtomicU64>,
+    observation_boundary: Arc<Mutex<()>>,
     scheduler: Scheduler,
+    #[cfg(test)]
+    before_loss_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<P: DeviceIo> PortWorker<P> {
@@ -340,10 +351,12 @@ impl<P: DeviceIo> PortWorker<P> {
         let (output, observations) = mpsc::sync_channel(observation_capacity);
         let stopped = Arc::new(Mutex::new(None));
         let loss_epoch = Arc::new(AtomicU64::new(0));
+        let observation_boundary = Arc::new(Mutex::new(()));
         let handle = PortHandle {
             sender,
             stopped: stopped.clone(),
             loss_epoch: loss_epoch.clone(),
+            observation_boundary: observation_boundary.clone(),
         };
         Ok((
             Self {
@@ -353,7 +366,10 @@ impl<P: DeviceIo> PortWorker<P> {
                 output,
                 stopped,
                 loss_epoch,
+                observation_boundary,
                 scheduler,
+                #[cfg(test)]
+                before_loss_commit: None,
             },
             PortChannels {
                 commands: handle,
@@ -579,9 +595,17 @@ impl<P: DeviceIo> PortWorker<P> {
         }
         let task = &self.scheduler.tasks[index];
         let observation = self.read(task.device, task.parameter);
+        let boundary = self
+            .observation_boundary
+            .lock()
+            .expect("observation boundary poisoned");
         let stop = match self.output.try_send(observation) {
             Ok(()) => None,
             Err(mpsc::TrySendError::Full(_)) => {
+                #[cfg(test)]
+                if let Some(hook) = self.before_loss_commit.take() {
+                    hook();
+                }
                 // A slow observer must not stop device polling or control. Keep
                 // loss visible out of band, including after the queue is drained.
                 // Saturate instead of wrapping and making old loss look absent.
@@ -596,6 +620,7 @@ impl<P: DeviceIo> PortWorker<P> {
                 Some(StopReason::ObservationReceiverDropped)
             }
         };
+        drop(boundary);
         if let Some(reason) = stop {
             self.finish(reason);
         }
@@ -612,3 +637,6 @@ impl<P: DeviceIo> Drop for PortWorker<P> {
         self.finish(StopReason::Shutdown);
     }
 }
+
+#[cfg(test)]
+mod subscription_races;

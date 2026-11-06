@@ -1,5 +1,6 @@
-//! Shared models, drivers and standalone multi-device components. Configuration,
-//! port workers, registry and router are not connected to executable startup.
+//! Shared models, drivers and TCP components for legacy and routed backends.
+//! The executable still starts the legacy Arduino runtime; configuration-based
+//! multi-port startup is not connected to main.
 
 pub mod command_router;
 pub mod config;
@@ -9,3 +10,12 @@ pub mod model;
 pub mod observation_aggregator;
 pub mod pending;
 pub mod port_worker;
+
+pub mod client_limit;
+pub mod connection;
+pub mod fanout;
+pub mod protocol;
+pub mod runtime;
+pub mod tcp;
+mod tcp_legacy;
+pub use tcp_legacy::{observation_json, queue_read, queue_set};

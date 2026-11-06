@@ -17,15 +17,127 @@ pub enum EnqueueError {
     Full,
     RuntimeUnavailable,
     RuntimeBusy,
+    UnknownKey,
+    ReadOnly,
+    InvalidValue,
+}
+
+impl EnqueueError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::DuplicateId => "duplicate_id",
+            Self::Full => "too_many_pending",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::RuntimeBusy => "runtime_busy",
+            Self::UnknownKey => "unknown_key",
+            Self::ReadOnly => "Parameter is read-only",
+            Self::InvalidValue => "Value does not match parameter spec",
+        }
+    }
+}
+
+/// The same session/transport serves the legacy runtime and routed devices.
+/// Implementations only admit bounded asynchronous requests; no physical I/O.
+pub trait CommandBackend {
+    fn enqueue_read(
+        &self,
+        pending: &mut PendingRequests,
+        id: u64,
+        deadline: Instant,
+        description: ParameterDescription,
+    ) -> Result<(), EnqueueError>;
+    fn enqueue_set(
+        &self,
+        pending: &mut PendingRequests,
+        id: u64,
+        deadline: Instant,
+        key: String,
+        value: Value,
+    ) -> Result<(), EnqueueError>;
+    fn available(&self, _key: &str) -> bool {
+        true
+    }
+}
+
+impl CommandBackend for SyncSender<crate::runtime::DeviceCommand> {
+    fn enqueue_read(
+        &self,
+        pending: &mut PendingRequests,
+        id: u64,
+        deadline: Instant,
+        description: ParameterDescription,
+    ) -> Result<(), EnqueueError> {
+        pending.add_read(id, deadline, || crate::queue_read(self, description))
+    }
+    fn enqueue_set(
+        &self,
+        pending: &mut PendingRequests,
+        id: u64,
+        deadline: Instant,
+        key: String,
+        value: Value,
+    ) -> Result<(), EnqueueError> {
+        pending.add_set(id, deadline, |execution| {
+            crate::queue_set(self, key, value, execution)
+        })
+    }
+}
+
+pub(crate) fn command_error_code(error: &crate::port_worker::CommandError) -> &'static str {
+    use crate::port_worker::CommandError::*;
+    match error {
+        UnknownDevice | UnknownParameter => "unknown_key",
+        ReadOnly => "Parameter is read-only",
+        InvalidValue => "Value does not match parameter spec",
+        RuntimeTimeout => "runtime_timeout",
+        OutcomeUnknown => "outcome_unknown",
+        PortStopped(_) => "runtime_unavailable",
+    }
+}
+
+fn routed_completion<T>(
+    completion: Completion<Result<T, crate::port_worker::CommandError>>,
+    success: impl FnOnce(u64, T) -> io::Result<String>,
+) -> io::Result<String> {
+    let (id, error) = match completion {
+        Completion::Received {
+            id,
+            value: Ok(value),
+        } => return success(id, value),
+        Completion::Received {
+            id,
+            value: Err(error),
+        } => (id, command_error_code(&error)),
+        Completion::Timeout { id } => (id, "runtime_timeout"),
+        Completion::Disconnected { id } => (id, "runtime_unavailable"),
+        Completion::OutcomeUnknown { id } => (id, "outcome_unknown"),
+    };
+    Ok(json!({ "id": id, "status": "error", "error": error }).to_string())
 }
 
 pub enum FinishedRequest {
     Read(Completion<Observation>),
     Set(Completion<Result<(), String>>),
+    RoutedRead {
+        key: String,
+        completion: Completion<
+            Result<crate::port_worker::DeviceObservation, crate::port_worker::CommandError>,
+        >,
+    },
+    RoutedSet(Completion<Result<(), crate::port_worker::CommandError>>),
 }
 
 fn completion_json(completion: FinishedRequest) -> io::Result<String> {
     match completion {
+        FinishedRequest::RoutedRead { key, completion } => {
+            routed_completion(completion, |id, mut value| {
+                value.observation.source = key;
+                crate::observation_json(Some(id), &value.observation)
+            })
+        }
+        FinishedRequest::RoutedSet(completion) => routed_completion(completion, |id, ()| {
+            Ok(json!({ "id": id, "status": "ok" }).to_string())
+        }),
         FinishedRequest::Read(Completion::Received { id, value }) => {
             crate::observation_json(Some(id), &value)
         }
@@ -72,6 +184,17 @@ fn completion_json(completion: FinishedRequest) -> io::Result<String> {
 }
 
 enum Entry {
+    RoutedRead {
+        id: u64,
+        key: String,
+        pending: Pending<
+            Result<crate::port_worker::DeviceObservation, crate::port_worker::CommandError>,
+        >,
+    },
+    RoutedSet {
+        id: u64,
+        pending: Pending<Result<(), crate::port_worker::CommandError>>,
+    },
     Read {
         id: u64,
         pending: Pending<Observation>,
@@ -85,7 +208,10 @@ enum Entry {
 impl Entry {
     fn id(&self) -> u64 {
         match self {
-            Self::Read { id, .. } | Self::Set { id, .. } => *id,
+            Self::Read { id, .. }
+            | Self::Set { id, .. }
+            | Self::RoutedRead { id, .. }
+            | Self::RoutedSet { id, .. } => *id,
         }
     }
 }
@@ -116,7 +242,7 @@ impl PendingRequests {
         self.entries.iter().any(|entry| entry.id() == id)
     }
 
-    fn ensure_available(&self, id: u64) -> Result<(), EnqueueError> {
+    pub(crate) fn ensure_available(&self, id: u64) -> Result<(), EnqueueError> {
         if self.contains_id(id) {
             return Err(EnqueueError::DuplicateId);
         }
@@ -167,6 +293,25 @@ impl PendingRequests {
         Ok(())
     }
 
+    pub(crate) fn add_routed_read(
+        &mut self,
+        id: u64,
+        key: String,
+        pending: Pending<
+            Result<crate::port_worker::DeviceObservation, crate::port_worker::CommandError>,
+        >,
+    ) {
+        self.entries
+            .push_back(Entry::RoutedRead { id, key, pending });
+    }
+    pub(crate) fn add_routed_set(
+        &mut self,
+        id: u64,
+        pending: Pending<Result<(), crate::port_worker::CommandError>>,
+    ) {
+        self.entries.push_back(Entry::RoutedSet { id, pending });
+    }
+
     pub fn poll(&mut self, now: Instant) -> Vec<FinishedRequest> {
         let mut finished = Vec::new();
         let count = self.entries.len();
@@ -175,6 +320,23 @@ impl PendingRequests {
             let entry = self.entries.pop_front().expect("entry count is known");
 
             match entry {
+                Entry::RoutedRead { id, key, pending } => match pending.poll(now) {
+                    Poll::Waiting(pending) => {
+                        self.entries
+                            .push_back(Entry::RoutedRead { id, key, pending })
+                    }
+                    Poll::Finished(completion) => {
+                        finished.push(FinishedRequest::RoutedRead { key, completion })
+                    }
+                },
+                Entry::RoutedSet { id, pending } => match pending.poll(now) {
+                    Poll::Waiting(pending) => {
+                        self.entries.push_back(Entry::RoutedSet { id, pending })
+                    }
+                    Poll::Finished(completion) => {
+                        finished.push(FinishedRequest::RoutedSet(completion))
+                    }
+                },
                 Entry::Read { id, pending } => match pending.poll(now) {
                     Poll::Waiting(pending) => {
                         self.entries.push_back(Entry::Read { id, pending });
@@ -463,7 +625,7 @@ impl ClientSession {
         id: u64,
         key: String,
         value: Value,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         now: Instant,
     ) -> io::Result<()> {
@@ -477,25 +639,18 @@ impl ClientSession {
             return self.queue_error(id, "Value does not match parameter spec");
         }
 
-        let result = self
-            .pending
-            .add_set(id, now + Duration::from_secs(10), |execution| {
-                crate::queue_set(commands, key, value, execution)
-            });
+        let result = commands.enqueue_set(
+            &mut self.pending,
+            id,
+            now + Duration::from_secs(10),
+            key,
+            value,
+        );
 
         match result {
             Ok(()) => Ok(()),
 
-            Err(error) => {
-                let code = match error {
-                    EnqueueError::DuplicateId => "duplicate_id",
-                    EnqueueError::Full => "too_many_pending",
-                    EnqueueError::RuntimeUnavailable => "runtime_unavailable",
-                    EnqueueError::RuntimeBusy => "runtime_busy",
-                };
-
-                self.queue_error(id, code)
-            }
+            Err(error) => self.queue_error(id, error.code()),
         }
     }
 
@@ -503,7 +658,7 @@ impl ClientSession {
         &mut self,
         id: u64,
         key: String,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
@@ -522,6 +677,10 @@ impl ClientSession {
                     .lock()
                     .map_err(|_| io::Error::other("observation lock poisoned"))?;
 
+                if !commands.available(&key) {
+                    return self.queue_error(id, "runtime_unavailable");
+                }
+
                 match guard.get(&key) {
                     Some(observation) => crate::observation_json(Some(id), observation)?,
 
@@ -539,25 +698,17 @@ impl ClientSession {
 
         let description = description.clone();
 
-        let result = self
-            .pending
-            .add_read(id, now + Duration::from_secs(10), || {
-                crate::queue_read(commands, description)
-            });
+        let result = commands.enqueue_read(
+            &mut self.pending,
+            id,
+            now + Duration::from_secs(10),
+            description,
+        );
 
         match result {
             Ok(()) => Ok(()),
 
-            Err(error) => {
-                let code = match error {
-                    EnqueueError::DuplicateId => "duplicate_id",
-                    EnqueueError::Full => "too_many_pending",
-                    EnqueueError::RuntimeUnavailable => "runtime_unavailable",
-                    EnqueueError::RuntimeBusy => "runtime_busy",
-                };
-
-                self.queue_error(id, code)
-            }
+            Err(error) => self.queue_error(id, error.code()),
         }
     }
 
@@ -624,7 +775,7 @@ impl ClientSession {
         let response = match self.subscriptions.apply(change, &keys, catalog) {
             Ok(keys) => {
                 if let Some(interest) = &self.observation_interest {
-                    interest.set_active(!keys.is_empty());
+                    interest.set_keys(&keys);
                 }
                 let boundary = self
                     .observation_clock
@@ -665,7 +816,7 @@ impl ClientSession {
     pub fn dispatch_incoming(
         &mut self,
         incoming: Incoming,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
@@ -917,7 +1068,7 @@ impl TcpConnection {
 
     pub fn drive_once(
         &mut self,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
     ) -> io::Result<bool> {
@@ -956,7 +1107,7 @@ impl TcpConnection {
 
     pub fn drive_once_with_observations(
         &mut self,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         observations: &crate::fanout::ObservationReceiver,
@@ -965,7 +1116,7 @@ impl TcpConnection {
         self.session.observation_interest = Some(observations.interest.clone());
         observations
             .interest
-            .set_active(!self.session.subscriptions.is_empty());
+            .set_keys(&self.session.subscriptions.keys());
         let finished = self.drive_once(commands, catalog, latest)?;
 
         if finished || self.read_closed || self.session.is_terminal() {
@@ -997,7 +1148,9 @@ impl TcpConnection {
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
 
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if self.session.subscriptions.is_empty() {
+                    if self.session.subscriptions.is_empty()
+                        && !observations.terminal_when_inactive()
+                    {
                         break;
                     }
                     self.session.terminal = true;
@@ -1025,7 +1178,7 @@ impl TcpConnection {
 
     pub fn run(
         &mut self,
-        commands: &SyncSender<crate::runtime::DeviceCommand>,
+        commands: &impl CommandBackend,
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         observations: &crate::fanout::ObservationReceiver,
