@@ -1,7 +1,9 @@
-//! Shared models, drivers and standalone port worker. Configuration and the new
-//! worker are not yet connected to the server executable's startup.
+//! Shared models, drivers and standalone multi-device components. Configuration,
+//! port workers, registry and router are not connected to executable startup.
 
+pub mod command_router;
 pub mod config;
+pub mod device_registry;
 pub mod driver;
 pub mod model;
 pub mod pending;

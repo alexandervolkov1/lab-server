@@ -64,6 +64,16 @@ impl DeviceInstance {
         })
     }
 
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Cached driver catalog, including any polling overrides. Register this
+    /// snapshot after configuration, before starting the worker.
+    pub fn parameters(&self) -> &[ParameterDescription] {
+        &self.parameters
+    }
+
     /// Configure local polling without coupling this core to TOML or global keys.
     pub fn set_poll_period(
         &mut self,
@@ -350,6 +360,12 @@ impl<P: DeviceIo> PortWorker<P> {
                 observations,
             },
         ))
+    }
+
+    /// Read-only catalog access for registration before run consumes the worker.
+    /// Driver ownership and configuration remain inside this worker.
+    pub fn devices(&self) -> &[DeviceInstance] {
+        &self.devices
     }
 
     /// Runs on the caller's thread. Moving the worker to a thread requires P: Send.
