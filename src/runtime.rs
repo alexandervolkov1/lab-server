@@ -95,8 +95,8 @@ fn execute_command<D: Driver, P: DeviceIo>(driver: &mut D, port: &mut P, command
                 });
                 return;
             }
-            // The driver returns untyped errors, including transport failures after
-            // the write. Conservatively report uncertainty for every such failure.
+            // Preserve the legacy runtime's conservative write semantics for all
+            // driver errors. Port-state handling belongs to the new PortWorker.
             let result = driver
                 .write(&command.parameter, &command.value, port)
                 .map_err(|_| "outcome_unknown".to_owned());
@@ -113,13 +113,16 @@ fn read_observation<D: Driver, P: DeviceIo>(
     source: &str,
     description: &ParameterDescription,
 ) -> Observation {
-    let reading = driver.read(&description.id, port).and_then(|value| {
-        if description.spec.accepts(&value) {
-            Ok(value)
-        } else {
-            Err("Value out of range".to_string())
-        }
-    });
+    let reading = driver
+        .read(&description.id, port)
+        .map_err(|error| error.to_string())
+        .and_then(|value| {
+            if description.spec.accepts(&value) {
+                Ok(value)
+            } else {
+                Err("Value out of range".to_string())
+            }
+        });
 
     Observation {
         source: source.to_string(),
@@ -203,6 +206,7 @@ mod tests {
     use std::io::{BufReader, Cursor};
 
     use super::*;
+    use crate::driver::DriverError;
     use crate::model::Spec;
 
     #[test]
@@ -228,7 +232,7 @@ mod tests {
 
     struct CallbackDriver<F: FnMut()> {
         writes: usize,
-        result: Result<(), String>,
+        result: Result<(), DriverError>,
         on_write: F,
     }
 
@@ -236,10 +240,10 @@ mod tests {
         fn parameters(&self) -> Vec<ParameterDescription> {
             Vec::new()
         }
-        fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, String> {
+        fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
             unreachable!()
         }
-        fn write(&mut self, _: &str, _: &Value, _: &mut dyn DeviceIo) -> Result<(), String> {
+        fn write(&mut self, _: &str, _: &Value, _: &mut dyn DeviceIo) -> Result<(), DriverError> {
             self.writes += 1;
             (self.on_write)();
             self.result.clone()
@@ -396,7 +400,7 @@ mod tests {
             Vec::new()
         }
 
-        fn read(&mut self, _parameter: &str, _io: &mut dyn DeviceIo) -> Result<Value, String> {
+        fn read(&mut self, _parameter: &str, _io: &mut dyn DeviceIo) -> Result<Value, DriverError> {
             thread::sleep(self.read_delay);
             Ok(Value::Float(1.0))
         }
@@ -406,7 +410,7 @@ mod tests {
             _parameter: &str,
             _value: &Value,
             _io: &mut dyn DeviceIo,
-        ) -> Result<(), String> {
+        ) -> Result<(), DriverError> {
             thread::sleep(self.write_delay);
             Ok(())
         }

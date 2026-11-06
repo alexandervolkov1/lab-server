@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
+use lab_server::{driver, model, pending};
 use serde_json::json;
 
 use crate::connection::TcpConnection;
@@ -14,10 +15,7 @@ use crate::model::{Observation, ParameterDescription, Value};
 
 mod client_limit;
 mod connection;
-mod driver;
 mod fanout;
-mod model;
-mod pending;
 mod protocol;
 mod runtime;
 

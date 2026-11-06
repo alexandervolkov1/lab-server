@@ -17,16 +17,8 @@ pub struct Observation {
 
 #[derive(Debug, Clone)]
 pub enum Spec {
-    Float {
-        min: f64,
-        max: f64,
-    },
-    Integer {
-        min: i64,
-        max: i64,
-    },
-    // Supported by the protocol; the current Arduino catalog is numeric only.
-    #[allow(dead_code)]
+    Float { min: f64, max: f64 },
+    Integer { min: i64, max: i64 },
     Boolean,
 }
 

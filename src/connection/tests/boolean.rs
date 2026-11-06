@@ -1,5 +1,5 @@
 use super::*;
-use crate::driver::{DeviceIo, Driver};
+use crate::driver::{DeviceIo, Driver, DriverError, PortState};
 use crate::fanout::{ObservationFanout, ObservationReceiver};
 use crate::model::Spec;
 use crate::runtime::{self, DeviceCommand, ObservationOutput, PollTask};
@@ -42,14 +42,17 @@ impl Driver for BooleanDriver {
         ]
     }
 
-    fn read(&mut self, parameter: &str, _: &mut dyn DeviceIo) -> Result<Value, String> {
+    fn read(&mut self, parameter: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
         match parameter {
             "enabled" => Ok(Value::Boolean(self.enabled)),
             "fault" => {
                 let reading = match self.fault_reads % 3 {
                     0 => Ok(Value::Boolean(true)),
                     1 => Ok(Value::Boolean(false)),
-                    _ => Err("simulated read failure".into()),
+                    _ => Err(DriverError::new(
+                        "simulated read failure",
+                        PortState::Synchronized,
+                    )),
                 };
                 self.fault_reads += 1;
                 reading
@@ -63,7 +66,7 @@ impl Driver for BooleanDriver {
         parameter: &str,
         value: &Value,
         _: &mut dyn DeviceIo,
-    ) -> Result<(), String> {
+    ) -> Result<(), DriverError> {
         self.state
             .writes
             .lock()

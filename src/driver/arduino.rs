@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::driver::{DeviceIo, Driver};
+use crate::driver::{DeviceIo, Driver, DriverError, PortState};
 use crate::model::{ParameterDescription, Spec, Value};
 
 pub struct Arduino {
@@ -10,6 +10,12 @@ pub struct Arduino {
 impl Arduino {
     pub fn new() -> Self {
         Self { next_id: 1 }
+    }
+}
+
+impl Default for Arduino {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -56,13 +62,18 @@ impl Driver for Arduino {
         ]
     }
 
-    fn read(&mut self, parameter: &str, io: &mut dyn DeviceIo) -> Result<Value, String> {
+    fn read(&mut self, parameter: &str, io: &mut dyn DeviceIo) -> Result<Value, DriverError> {
         let device_key = match parameter {
             "sample_temperature" => "t.sample",
             "heater_temperature" => "t.heater",
             "room_temperature" => "t.room",
             "power" => "power",
-            _ => return Err(format!("Unknown Arduino parameter: {parameter}")),
+            _ => {
+                return Err(DriverError::new(
+                    format!("Unknown Arduino parameter: {parameter}"),
+                    PortState::Synchronized,
+                ));
+            }
         };
 
         let description = self
@@ -77,20 +88,34 @@ impl Driver for Arduino {
 
         let command = format!("o {id} get {device_key}\n");
 
-        io.send(command.as_bytes())
-            .map_err(|error| error.to_string())?;
+        io.send(command.as_bytes()).map_err(DriverError::from)?;
 
         let mut response = String::new();
 
-        let bytes = io
-            .read_line(&mut response)
-            .map_err(|error| error.to_string())?;
+        let bytes = io.read_line(&mut response).map_err(DriverError::from)?;
 
         if bytes == 0 {
-            return Err("Empty response".to_string());
+            return Err(DriverError::new("Empty response", PortState::Disconnected));
         }
 
-        parse_numeric_reply(&response, id, &description.spec).map_err(|error| error.to_string())
+        if !response.ends_with('\n') {
+            return Err(DriverError::new(
+                "Incomplete response",
+                PortState::Desynchronized,
+            ));
+        }
+        parse_numeric_reply(&response, id, &description.spec).map_err(|message| {
+            // Only recognized, correlated frames establish a transaction boundary.
+            let fields: Vec<_> = response.split_whitespace().collect();
+            let correlated = fields.first() == Some(&format!("@{id}").as_str());
+            let complete = fields.len() == 3 && matches!(fields.get(1), Some(&"ok" | &"err"));
+            let state = if correlated && complete {
+                PortState::Synchronized
+            } else {
+                PortState::Desynchronized
+            };
+            DriverError::new(message, state)
+        })
     }
 
     fn write(
@@ -98,19 +123,30 @@ impl Driver for Arduino {
         parameter: &str,
         value: &Value,
         io: &mut dyn DeviceIo,
-    ) -> Result<(), String> {
+    ) -> Result<(), DriverError> {
         let description = self
             .parameters()
             .into_iter()
             .find(|item| item.id == parameter)
-            .ok_or_else(|| format!("Unknown Arduino parameter: {parameter}"))?;
+            .ok_or_else(|| {
+                DriverError::new(
+                    format!("Unknown Arduino parameter: {parameter}"),
+                    PortState::Synchronized,
+                )
+            })?;
 
         if !description.writable {
-            return Err("Parameter is read-only".to_string());
+            return Err(DriverError::new(
+                "Parameter is read-only",
+                PortState::Synchronized,
+            ));
         }
 
         if !description.spec.accepts(value) {
-            return Err("Value does not match parameter spec".to_string());
+            return Err(DriverError::new(
+                "Value does not match parameter spec",
+                PortState::Synchronized,
+            ));
         }
 
         let id = self.next_id;
@@ -120,38 +156,55 @@ impl Driver for Arduino {
                 format!("o {id} set power {power}\n")
             }
 
-            _ => return Err("Unsupported Arduino write".to_string()),
+            _ => {
+                return Err(DriverError::new(
+                    "Unsupported Arduino write",
+                    PortState::Synchronized,
+                ));
+            }
         };
 
         self.next_id = if id == u16::MAX { 1 } else { id + 1 };
 
-        io.send(command.as_bytes())
-            .map_err(|error| error.to_string())?;
+        io.send(command.as_bytes()).map_err(DriverError::from)?;
 
         let mut response = String::new();
 
-        let bytes = io
-            .read_line(&mut response)
-            .map_err(|error| error.to_string())?;
+        let bytes = io.read_line(&mut response).map_err(DriverError::from)?;
 
         if bytes == 0 {
-            return Err("Empty response".to_string());
+            return Err(DriverError::new("Empty response", PortState::Disconnected));
         }
 
+        if !response.ends_with('\n') {
+            return Err(DriverError::new(
+                "Incomplete response",
+                PortState::Desynchronized,
+            ));
+        }
         let mut parts = response.split_whitespace();
 
         let expected_id = format!("@{id}");
 
         if parts.next() != Some(expected_id.as_str()) {
-            return Err("Unexpected response".to_string());
+            return Err(DriverError::new(
+                "Unexpected response",
+                PortState::Desynchronized,
+            ));
         }
 
         match (parts.next(), parts.next(), parts.next()) {
             (Some("ok"), None, None) => Ok(()),
 
-            (Some("err"), Some(reason), None) => Err(format!("Arduino error: {reason}")),
+            (Some("err"), Some(reason), None) => Err(DriverError::new(
+                format!("Arduino error: {reason}"),
+                PortState::Synchronized,
+            )),
 
-            _ => Err("Unexpected response".to_string()),
+            _ => Err(DriverError::new(
+                "Unexpected response",
+                PortState::Desynchronized,
+            )),
         }
     }
 }
@@ -242,6 +295,45 @@ mod tests {
     }
 
     #[test]
+    fn error_states_require_a_complete_correlated_transaction() {
+        for (response, expected) in [
+            ("@1 ok invalid\n", PortState::Synchronized),
+            ("@1 ok 9999\n", PortState::Synchronized),
+            ("@1 err sensor\n", PortState::Synchronized),
+            ("@2 ok 20\n", PortState::Desynchronized),
+            ("@1 ok 20", PortState::Desynchronized),
+            ("@1 ok 20 extra\n", PortState::Desynchronized),
+            ("garbage\n", PortState::Desynchronized),
+            ("", PortState::Disconnected),
+        ] {
+            let mut io = BufReader::new(FakePort {
+                input: Cursor::new(response.as_bytes().to_vec()),
+                output: vec![],
+            });
+            let error = Arduino::new()
+                .read("sample_temperature", &mut io)
+                .unwrap_err();
+            assert_eq!(error.port_state, expected, "{response:?}");
+        }
+        for (response, expected) in [
+            ("@1 err range\n", PortState::Synchronized),
+            ("@2 ok\n", PortState::Desynchronized),
+            ("@1 ok", PortState::Desynchronized),
+            ("@1 ok extra\n", PortState::Desynchronized),
+            ("", PortState::Disconnected),
+        ] {
+            let mut io = BufReader::new(FakePort {
+                input: Cursor::new(response.as_bytes().to_vec()),
+                output: vec![],
+            });
+            let error = Arduino::new()
+                .write("power", &Value::Integer(1), &mut io)
+                .unwrap_err();
+            assert_eq!(error.port_state, expected, "{response:?}");
+        }
+    }
+
+    #[test]
     fn rejects_unexpected_response() {
         let fake = FakePort {
             input: Cursor::new(b"ERR\r\n".to_vec()),
@@ -253,7 +345,13 @@ mod tests {
 
         let result = driver.read("sample_temperature", &mut port);
 
-        assert_eq!(result, Err("Unexpected response".to_string()));
+        assert_eq!(
+            result,
+            Err(DriverError::new(
+                "Unexpected response",
+                PortState::Desynchronized
+            ))
+        );
     }
 
     #[test]
@@ -408,7 +506,13 @@ mod tests {
 
         let result = driver.write("power", &Value::Integer(10), &mut port);
 
-        assert_eq!(result, Err("Arduino error: range".to_string()));
+        assert_eq!(
+            result,
+            Err(DriverError::new(
+                "Arduino error: range",
+                PortState::Synchronized
+            ))
+        );
     }
 
     #[test]
