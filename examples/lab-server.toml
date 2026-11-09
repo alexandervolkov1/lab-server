@@ -1,5 +1,6 @@
-# Stage 3A: this example is parsed and validated only.
-# It is NOT used when starting the server; startup still uses Arduino on COM3.
+# Architecture example only: metakon and custom_ascii are NOT implemented.
+# Startup with this file fails with an unknown-driver configuration error.
+# Use examples/arduino.toml for a runnable configuration.
 
 [tcp]
 bind = "127.0.0.1:7240"
@@ -29,8 +30,7 @@ id = "furnace1"
 driver = "arduino"
 port = "arduino_link"
 
-# Optional future polling overrides by local signal name, in milliseconds.
-# Stage 3A stores these settings without applying them.
+# Optional polling overrides by local signal name, in milliseconds.
 [devices.poll_periods_ms]
 sample_temperature = 1000
 power = 2000
