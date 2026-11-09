@@ -1,0 +1,24 @@
+# Runnable configuration: one Arduino on COM3, 57600 baud.
+# TCP keys: furnace1/sample_temperature, furnace1/power, etc.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[[ports]]
+id = "arduino_link"
+name = "COM3"
+baud = 57600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 3000
+
+[[devices]]
+id = "furnace1"
+driver = "arduino"
+port = "arduino_link"
+
+# Optional per-device overrides; omitted parameters keep driver defaults.
+# [devices.poll_periods_ms]
+# sample_temperature = 1000
+# power = 2000

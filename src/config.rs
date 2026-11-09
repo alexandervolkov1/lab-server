@@ -69,8 +69,8 @@ pub struct DeviceConfig {
     /// Opaque driver settings, including nested tables, arrays and datetimes.
     #[serde(default)]
     pub options: toml::Table,
-    /// Future per-signal overrides. Names are local to this device and are not
-    /// checked against a driver catalog here. Missing entries keep driver defaults.
+    /// Per-signal overrides. Startup checks local names against the driver
+    /// catalog; this parser only validates values. Missing entries keep defaults.
     #[serde(default)]
     pub poll_periods_ms: BTreeMap<String, u64>,
 }

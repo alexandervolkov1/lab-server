@@ -39,6 +39,14 @@ impl DeviceInstance {
         id: impl Into<String>,
         driver: impl Driver + Send + 'static,
     ) -> Result<Self, BuildError> {
+        Self::new_boxed(id, Box::new(driver))
+    }
+
+    /// Construct from a runtime-selected driver without changing its interface.
+    pub fn new_boxed(
+        id: impl Into<String>,
+        driver: Box<dyn Driver + Send>,
+    ) -> Result<Self, BuildError> {
         let id = id.into();
         if id.trim().is_empty() {
             return Err(BuildError("device id must not be empty".into()));
@@ -59,7 +67,7 @@ impl DeviceInstance {
         }
         Ok(Self {
             id,
-            driver: Box::new(driver),
+            driver,
             parameters,
         })
     }

@@ -1,6 +1,5 @@
 //! Shared models, drivers and TCP components for legacy and routed backends.
-//! The executable still starts the legacy Arduino runtime; configuration-based
-//! multi-port startup is not connected to main.
+//! The executable supports legacy Arduino and configured multi-port startup.
 
 pub mod command_router;
 pub mod config;
@@ -10,6 +9,7 @@ pub mod model;
 pub mod observation_aggregator;
 pub mod pending;
 pub mod port_worker;
+pub mod startup;
 
 pub mod client_limit;
 pub mod connection;

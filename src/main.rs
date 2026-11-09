@@ -14,7 +14,20 @@ use crate::driver::{Driver, arduino::Arduino};
 use crate::fanout::ObservationFanout;
 use crate::model::{Observation, ParameterDescription};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match lab_server::startup::LaunchMode::parse(std::env::args_os().skip(1))? {
+        lab_server::startup::LaunchMode::Legacy => run_legacy(),
+        lab_server::startup::LaunchMode::Config(path) => {
+            let config = lab_server::config::ServerConfig::load(path)?;
+            let server = lab_server::startup::start(&config)?;
+            println!("TCP server listening on {}", server.local_addr()?);
+            server.run()?;
+            Ok(())
+        }
+    }
+}
+
+fn run_legacy() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let port = serialport::new("COM3", 57_600)
         .timeout(Duration::from_secs(3))
         .open()?;
