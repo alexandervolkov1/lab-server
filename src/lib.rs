@@ -9,6 +9,7 @@ pub mod model;
 pub mod observation_aggregator;
 pub mod pending;
 pub mod port_worker;
+pub mod recorder;
 pub mod startup;
 
 pub mod client_limit;
