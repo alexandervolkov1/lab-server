@@ -1,0 +1,11 @@
+# Local TCP + WebSocket protocol checks without physical equipment.
+ports = []
+devices = []
+
+[tcp]
+bind = "127.0.0.1:7240"
+
+[websocket]
+enabled = true
+bind = "127.0.0.1:7241"
+allowed_origins = ["http://localhost:3000"]

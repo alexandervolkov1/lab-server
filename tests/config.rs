@@ -6,6 +6,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lab_server::config::{ConfigError, FlowControl, Parity, ServerConfig};
 
 const TCP: &str = "[tcp]\nbind = '127.0.0.1:7240'\n";
+
+#[test]
+fn websocket_is_optional_and_requires_a_loopback_bind_when_enabled() {
+    assert!(
+        ServerConfig::from_toml(&single())
+            .unwrap()
+            .websocket
+            .is_none()
+    );
+    let disabled =
+        ServerConfig::from_toml(&format!("{}\n[websocket]\nenabled=false", single())).unwrap();
+    assert!(!disabled.websocket.unwrap().enabled);
+    for bind in ["127.0.0.1:7241", "[::1]:7241"] {
+        let config = ServerConfig::from_toml(&format!("{}\n[websocket]\nenabled=true\nbind='{bind}'\nallowed_origins=['http://localhost:3000']", single())).unwrap();
+        assert!(config.websocket.unwrap().enabled);
+    }
+    for section in [
+        "enabled=true",
+        "enabled=true\nbind='0.0.0.0:7241'",
+        "enabled=true\nbind='[::]:7241'",
+        "enabled=true\nbind='192.168.1.1:7241'",
+        "enabled=true\nbind='127.0.0.1:7240'",
+        "enabled=false\nallowed_origins=['*']",
+        "enabled=false\nallowed_origins=['']",
+        "enabled=false\nallowed_origins=[' http://localhost']",
+    ] {
+        assert_invalid(
+            &format!("{}\n[websocket]\n{section}", single()),
+            "websocket",
+        );
+    }
+    for (section, diagnostic) in [
+        (
+            "enabled=true\nbind='localhost:7241'",
+            "invalid socket address",
+        ),
+        ("enabled=false\nunknown=true", "unknown"),
+    ] {
+        assert_invalid(&format!("{}\n[websocket]\n{section}", single()), diagnostic);
+    }
+    let example = ServerConfig::from_toml(include_str!("../examples/websocket.toml")).unwrap();
+    assert!(example.ports.is_empty() && example.devices.is_empty());
+    assert!(example.websocket.unwrap().enabled);
+}
 const PORT: &str = r#"
 [[ports]]
 id = "link1"
