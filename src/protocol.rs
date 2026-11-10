@@ -42,6 +42,10 @@
 //! There is no replay across reconnects. The per-client pending, subscription and
 //! output limits remain 64, 64 and 64 KiB respectively.
 
+use crate::model::{Observation, Value};
+use serde_json::json;
+use std::io;
+
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -309,7 +313,7 @@ pub fn parse_subscription_keys(
 }
 
 #[derive(Debug, PartialEq)]
-pub enum TcpRequest {
+pub enum Request {
     Hello {
         id: u64,
     },
@@ -344,42 +348,86 @@ pub enum ParseError {
     Request(RequestError),
 }
 
-pub fn parse_tcp_request(frame: &str) -> Result<TcpRequest, ParseError> {
+pub fn parse_request(frame: &str) -> Result<Request, ParseError> {
     let object = parse_json_object(frame).map_err(ParseError::Json)?;
 
     let RequestHeader { id, op } = parse_request_header(&object).map_err(ParseError::Request)?;
 
     match op {
-        RequestOp::Hello => Ok(TcpRequest::Hello { id }),
-        RequestOp::Describe => Ok(TcpRequest::Describe { id }),
-        RequestOp::Ping => Ok(TcpRequest::Ping { id }),
+        RequestOp::Hello => Ok(Request::Hello { id }),
+        RequestOp::Describe => Ok(Request::Describe { id }),
+        RequestOp::Ping => Ok(Request::Ping { id }),
 
         RequestOp::Get => {
             let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
-            Ok(TcpRequest::Get { id, key })
+            Ok(Request::Get { id, key })
         }
 
         RequestOp::Set => {
             let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
             let value = parse_set_value(&object).map_err(ParseError::Request)?;
 
-            Ok(TcpRequest::Set { id, key, value })
+            Ok(Request::Set { id, key, value })
         }
 
         RequestOp::Subscribe => {
             let keys = parse_subscription_keys(&object, &RequestOp::Subscribe)
                 .map_err(ParseError::Request)?;
 
-            Ok(TcpRequest::Subscribe { id, keys })
+            Ok(Request::Subscribe { id, keys })
         }
 
         RequestOp::Unsubscribe => {
             let keys = parse_subscription_keys(&object, &RequestOp::Unsubscribe)
                 .map_err(ParseError::Request)?;
 
-            Ok(TcpRequest::Unsubscribe { id, keys })
+            Ok(Request::Unsubscribe { id, keys })
         }
     }
+}
+
+/// Compatibility names for protocol-v1 TCP callers.
+pub use Request as TcpRequest;
+pub use parse_request as parse_tcp_request;
+
+pub fn observation_json(id: Option<u64>, observation: &Observation) -> io::Result<String> {
+    let duration = observation
+        .completed_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+
+    let timestamp_ms = u64::try_from(duration.as_millis()).map_err(io::Error::other)?;
+
+    let mut message = match &observation.reading {
+        Ok(value) => {
+            let (json_value, unit) = match value {
+                Value::Float(value) => (json!(value), observation.unit.as_str()),
+                Value::Integer(value) => (json!(value), observation.unit.as_str()),
+                Value::Boolean(value) => (json!(value), ""),
+            };
+            json!({
+                "status": "ok",
+                "key": &observation.source,
+                "value": json_value,
+                "unit": unit,
+                "completed_at_unix_ms": timestamp_ms
+            })
+        }
+
+        Err(error) => json!({
+            "status": "error",
+            "key": &observation.source,
+            "error": error,
+            "completed_at_unix_ms": timestamp_ms
+        }),
+    };
+
+    match id {
+        Some(id) => message["id"] = json!(id),
+        None => message["event"] = json!("measurement"),
+    }
+
+    Ok(message.to_string())
 }
 
 #[cfg(test)]

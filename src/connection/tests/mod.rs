@@ -1,7 +1,11 @@
 //! Test groups follow the production responsibilities; shared fixtures live in support.
 
 use super::*;
+use crate::pending::Completion;
+use crate::protocol::{FrameError, ParseError, TcpRequest};
+use serde_json::json;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, TcpListener};
 use std::sync::mpsc;
