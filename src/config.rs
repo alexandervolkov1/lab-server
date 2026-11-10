@@ -19,6 +19,16 @@ pub struct ServerConfig {
     pub tcp: TcpConfig,
     pub ports: Vec<PortConfig>,
     pub devices: Vec<DeviceConfig>,
+    pub recording: Option<RecordingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingConfig {
+    pub enabled: bool,
+    /// Relative paths are resolved against the process working directory.
+    pub path: Option<PathBuf>,
+    pub queue_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -125,6 +135,25 @@ impl ServerConfig {
     /// Also usable after constructing or editing the public model in memory.
     /// Returns the first error; no driver implementations or ports are consulted.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(recording) = &self.recording {
+            if recording.enabled
+                && recording
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().to_string_lossy().trim().is_empty())
+            {
+                return Err(invalid(
+                    "recording.path",
+                    "must be nonempty when recording is enabled",
+                ));
+            }
+            if recording.queue_capacity == Some(0) {
+                return Err(invalid(
+                    "recording.queue_capacity",
+                    "must be greater than zero",
+                ));
+            }
+        }
         if !self.tcp.bind.ip().is_loopback() {
             return Err(invalid(
                 "tcp.bind",

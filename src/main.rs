@@ -19,9 +19,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lab_server::startup::LaunchMode::Legacy => run_legacy(),
         lab_server::startup::LaunchMode::Config(path) => {
             let config = lab_server::config::ServerConfig::load(path)?;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal_stop = stop.clone();
+            ctrlc::set_handler(move || {
+                signal_stop.store(true, std::sync::atomic::Ordering::Release);
+            })?;
             let server = lab_server::startup::start(&config)?;
             println!("TCP server listening on {}", server.local_addr()?);
-            server.run()?;
+            server.run_until(&stop)?;
             Ok(())
         }
     }

@@ -525,3 +525,71 @@ fn load_reports_io_parse_and_validation_errors() {
         Err(ConfigError::Io { .. })
     ));
 }
+
+#[test]
+fn recording_is_optional_disabled_or_validated_without_creating_a_database() {
+    assert!(
+        ServerConfig::from_toml(&single())
+            .unwrap()
+            .recording
+            .is_none()
+    );
+    let disabled =
+        ServerConfig::from_toml(&format!("{}\n[recording]\nenabled=false", single())).unwrap();
+    assert!(!disabled.recording.unwrap().enabled);
+    let root = PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
+    let path = root.join(format!("config-no-io-{}.sqlite", std::process::id()));
+    assert!(!path.exists());
+    let text = format!(
+        "{}\n[recording]\nenabled=true\npath='{}'",
+        single(),
+        path.display()
+    );
+    let config = ServerConfig::from_toml(&text).unwrap();
+    config.validate().unwrap();
+    assert!(!path.exists());
+    let recording = config.recording.unwrap();
+    assert_eq!(recording.path, Some(path));
+    assert_eq!(recording.queue_capacity, None);
+    let explicit = ServerConfig::from_toml(&format!("{text}\nqueue_capacity=7")).unwrap();
+    assert_eq!(explicit.recording.unwrap().queue_capacity, Some(7));
+    let relative = ServerConfig::from_toml(&format!(
+        "{}\n[recording]\nenabled=true\npath='../measurements.sqlite'",
+        single()
+    ))
+    .unwrap();
+    assert_eq!(
+        relative.recording.unwrap().path.unwrap(),
+        PathBuf::from("../measurements.sqlite")
+    );
+}
+
+#[test]
+fn recording_rejects_missing_empty_paths_zero_capacity_and_unknown_fields() {
+    for block in [
+        "enabled=true",
+        "enabled=true\npath=''",
+        "enabled=true\npath='  '",
+    ] {
+        assert_invalid(
+            &format!("{}\n[recording]\n{block}", single()),
+            "recording.path",
+        );
+    }
+    for enabled in [true, false] {
+        assert_invalid(
+            &format!(
+                "{}\n[recording]\nenabled={enabled}\npath='x'\nqueue_capacity=0",
+                single()
+            ),
+            "recording.queue_capacity",
+        );
+        assert_invalid(
+            &format!(
+                "{}\n[recording]\nenabled={enabled}\npath='x'\nunknown=1",
+                single()
+            ),
+            "unknown",
+        );
+    }
+}

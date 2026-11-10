@@ -635,3 +635,6 @@ fn legacy_runtime_and_tcp_keep_local_arduino_catalog_and_commands() {
     worker.join().unwrap();
     assert!(probe.dropped.load(Ordering::Acquire));
 }
+
+#[path = "startup/recording.rs"]
+mod recording;

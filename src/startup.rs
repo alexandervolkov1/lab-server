@@ -16,8 +16,11 @@ use crate::command_router::CommandRouter;
 use crate::config::{ConfigError, DeviceConfig, FlowControl, Parity, PortConfig, ServerConfig};
 use crate::device_registry::DeviceRegistry;
 use crate::driver::{DeviceIo, Driver, arduino::Arduino};
-use crate::observation_aggregator::ObservationAggregator;
+use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::{DeviceInstance, DeviceObservation, PortHandle, PortWorker, StopReason};
+use crate::recorder::{
+    DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
+};
 use crate::runtime::{COMMAND_QUEUE_CAPACITY, OBSERVATION_QUEUE_CAPACITY};
 use crate::tcp::MultiDeviceTcp;
 
@@ -161,67 +164,92 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;
     listener.set_nonblocking(true)?;
-    let mut registry = DeviceRegistry::new();
-    let mut prepared = Vec::new();
-    let mut sources = Vec::new();
-    for port in &config.ports {
-        let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
-        match open(port, delay) {
-            Ok(io) => {
-                let (worker, channels) = PortWorker::new(
-                    io,
-                    devices,
-                    COMMAND_QUEUE_CAPACITY,
-                    OBSERVATION_QUEUE_CAPACITY,
-                )?;
-                registry.register_port(&port.id, channels.commands.clone())?;
-                for device in worker.devices() {
-                    registry.register_device(&port.id, device)?;
+    // Open and validate SQLite before touching physical ports. An enabled
+    // recorder is mandatory; construction failure also releases the listener.
+    let mut recording = Recording::open(config)?;
+    let prepared_server = (|| -> StartupResult<_> {
+        let mut registry = DeviceRegistry::new();
+        let mut prepared = Vec::new();
+        let mut sources = Vec::new();
+        for port in &config.ports {
+            let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
+            match open(port, delay) {
+                Ok(io) => {
+                    let (worker, channels) = PortWorker::new(
+                        io,
+                        devices,
+                        COMMAND_QUEUE_CAPACITY,
+                        OBSERVATION_QUEUE_CAPACITY,
+                    )?;
+                    registry.register_port(&port.id, channels.commands.clone())?;
+                    for device in worker.devices() {
+                        registry.register_device(&port.id, device)?;
+                    }
+                    sources.push((port.id.clone(), channels.observations));
+                    prepared.push((port.id.clone(), channels.commands, worker));
                 }
-                sources.push((port.id.clone(), channels.observations));
-                prepared.push((port.id.clone(), channels.commands, worker));
-            }
-            Err(error) => {
-                let reason = format!("cannot open {:?}: {error}", port.name);
-                eprintln!("Port {:?} unavailable: {reason}", port.id);
-                registry.register_unavailable_port(&port.id, reason)?;
-                for device in &devices {
-                    registry.register_device(&port.id, device)?;
+                Err(error) => {
+                    let reason = format!("cannot open {:?}: {error}", port.name);
+                    eprintln!("Port {:?} unavailable: {reason}", port.id);
+                    registry.register_unavailable_port(&port.id, reason)?;
+                    for device in &devices {
+                        registry.register_device(&port.id, device)?;
+                    }
                 }
             }
         }
+        let tcp = Arc::new(MultiDeviceTcp::new(
+            CommandRouter::new(registry),
+            OBSERVATION_QUEUE_CAPACITY,
+        ));
+        let mut workers = Workers::default();
+        // All ports are prepared before polling begins (including Arduino resets).
+        for (id, handle, worker) in prepared {
+            let join = thread::Builder::new()
+                .name(format!("port-{id}"))
+                .spawn(move || worker.run())?;
+            workers.0.push((handle, join));
+        }
+        Ok((tcp, sources, workers))
+    })();
+    match prepared_server {
+        Ok((tcp, sources, workers)) => Ok(StartedServer {
+            workers,
+            listener,
+            tcp,
+            sources,
+            recording,
+        }),
+        Err(error) => {
+            let mut errors = ServerErrors(vec![error]);
+            recording.finish(&mut errors);
+            Err(Box::new(errors))
+        }
     }
-    let tcp = Arc::new(MultiDeviceTcp::new(
-        CommandRouter::new(registry),
-        OBSERVATION_QUEUE_CAPACITY,
-    ));
-    let mut workers = Workers::default();
-    // All ports are prepared before polling begins (including Arduino resets).
-    for (id, handle, worker) in prepared {
-        let join = thread::Builder::new()
-            .name(format!("port-{id}"))
-            .spawn(move || worker.run())?;
-        workers.0.push((handle, join));
-    }
-    Ok(StartedServer {
-        listener,
-        tcp,
-        sources,
-        _workers: workers,
-    })
 }
 
 #[derive(Default)]
 struct Workers(Vec<(PortHandle, JoinHandle<StopReason>)>);
 
-impl Drop for Workers {
-    fn drop(&mut self) {
+impl Workers {
+    fn shutdown(&mut self) -> io::Result<()> {
         for (handle, _) in &self.0 {
             handle.shutdown();
         }
+        let mut panicked = false;
         for (_, join) in self.0.drain(..) {
-            let _ = join.join();
+            panicked |= join.join().is_err();
         }
+        if panicked {
+            Err(io::Error::other("port worker thread panicked"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for Workers {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -245,10 +273,12 @@ impl Drop for Clients {
 }
 
 pub struct StartedServer {
+    // Fallback Drop must join workers before dropping their receivers.
+    workers: Workers,
     listener: TcpListener,
     tcp: Arc<MultiDeviceTcp>,
     sources: Vec<(String, mpsc::Receiver<DeviceObservation>)>,
-    _workers: Workers,
+    recording: Recording,
 }
 
 impl StartedServer {
@@ -268,49 +298,204 @@ impl StartedServer {
     /// On return sockets close and workers are stopped/joined; current driver
     /// transactions must finish within their configured I/O bounds.
     pub fn run_until(mut self, stop: &AtomicBool) -> io::Result<()> {
+        let tcp = self.tcp.clone();
         let mut aggregator =
-            ObservationAggregator::new(self.tcp.registry(), std::mem::take(&mut self.sources))
+            ObservationAggregator::new(tcp.registry(), std::mem::take(&mut self.sources))
                 .map_err(io::Error::other)?;
         let slots = ClientSlots::new();
         let mut clients = Clients::default();
-        while !stop.load(Ordering::Acquire) {
-            // Reap finished clients so repeated reconnects cannot retain sockets.
-            let mut index = 0;
-            while index < clients.0.len() {
-                if clients.0[index].join.is_finished() {
-                    let _ = clients.0.swap_remove(index).join.join();
-                } else {
-                    index += 1;
+        let result = (|| -> io::Result<()> {
+            while !stop.load(Ordering::Acquire) {
+                // Reap finished clients so repeated reconnects cannot retain sockets.
+                let mut index = 0;
+                while index < clients.0.len() {
+                    if clients.0[index].join.is_finished() {
+                        let _ = clients.0.swap_remove(index).join.join();
+                    } else {
+                        index += 1;
+                    }
+                }
+                // Bound accepts so connection floods cannot starve observations.
+                for _ in 0..MAX_CLIENTS {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let stream = match self.listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    };
+                    let Some(slot) = slots.try_acquire() else {
+                        continue;
+                    };
+                    let socket = stream.try_clone()?;
+                    let tcp = self.tcp.clone();
+                    let join =
+                        thread::Builder::new()
+                            .name("tcp-client".into())
+                            .spawn(move || {
+                                let _slot = slot;
+                                if let Err(error) = tcp.serve_connection(stream) {
+                                    eprintln!("TCP client error: {error}");
+                                }
+                            })?;
+                    clients.0.push(Client { socket, join });
+                }
+                if dispatch(&tcp, &mut aggregator, &mut self.recording)? == 0 {
+                    // Also sleeps when no ports opened, or every receiver reached EOF.
+                    thread::sleep(IDLE_WAIT);
                 }
             }
-            // Bound accepts so connection floods cannot starve observations.
-            for _ in 0..MAX_CLIENTS {
-                let stream = match self.listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                };
-                let Some(slot) = slots.try_acquire() else {
-                    continue;
-                };
-                let socket = stream.try_clone()?;
-                let tcp = self.tcp.clone();
-                let join = thread::Builder::new()
-                    .name("tcp-client".into())
-                    .spawn(move || {
-                        let _slot = slot;
-                        if let Err(error) = tcp.serve_connection(stream) {
-                            eprintln!("TCP client error: {error}");
-                        }
-                    })?;
-                clients.0.push(Client { socket, join });
+            Ok(())
+        })();
+        let mut errors = ServerErrors::default();
+        errors.capture(result);
+        // No more accepts. Closing and joining clients ends command admission
+        // before worker shutdown; driver operations already begun may finish.
+        drop(clients);
+        errors.capture(self.workers.shutdown());
+        // Joining workers leaves finite queues and final counters. Receivers
+        // remain alive until every queued observation and terminal event is read.
+        let mut drain_error = None;
+        while !aggregator.is_finished() {
+            if let Err(error) = dispatch(&tcp, &mut aggregator, &mut self.recording) {
+                drain_error.get_or_insert(error);
             }
-            if self.tcp.collect(&mut aggregator, 64)? == 0 {
-                // Also sleeps when no ports opened, or every receiver reached EOF.
-                thread::sleep(IDLE_WAIT);
+        }
+        if let Some(error) = drain_error {
+            errors.capture(Err(error));
+        }
+        self.recording.finish(&mut errors);
+        errors.result()
+    }
+}
+
+/// Poll once and fan out the same FIFO events, preserving the local source for
+/// SQLite before TCP replaces it with the global key. Finish the whole batch
+/// even if TCP fails, so events already removed from the aggregator aren't lost.
+fn dispatch(
+    tcp: &MultiDeviceTcp,
+    aggregator: &mut ObservationAggregator<'_>,
+    recording: &mut Recording,
+) -> io::Result<usize> {
+    let events = aggregator.poll(64);
+    let count = events.len();
+    let mut first_error = None;
+    for event in events {
+        recording.record(&event);
+        if let Err(error) = tcp.apply_event(event) {
+            first_error.get_or_insert(error);
+        }
+    }
+    recording.check_state();
+    first_error.map_or(Ok(count), Err)
+}
+
+#[derive(Default)]
+struct Recording {
+    recorder: Option<Recorder>,
+    handle: Option<RecorderHandle>,
+    invalid: Option<DataError>,
+    terminal: Option<SubmitError>,
+}
+impl Recording {
+    fn open(config: &ServerConfig) -> StartupResult<Self> {
+        let Some(options) = config.recording.as_ref().filter(|r| r.enabled) else {
+            return Ok(Self::default());
+        };
+        let recorder = Recorder::open(
+            options.path.as_ref().expect("validated recording path"),
+            options
+                .queue_capacity
+                .unwrap_or_else(|| RecorderOptions::default().queue_capacity),
+        )?;
+        Ok(Self {
+            handle: Some(recorder.handle()),
+            recorder: Some(recorder),
+            ..Self::default()
+        })
+    }
+    fn record(&mut self, event: &AggregatorEvent) {
+        if let Some(handle) = &self.handle {
+            let result = handle.try_record(event.clone());
+            self.submitted(result);
+        }
+    }
+    fn submitted(&mut self, result: Result<(), SubmitError>) {
+        match result {
+            Ok(()) | Err(SubmitError::Full) => {} // Recorder alone accounts overflow.
+            Err(SubmitError::InvalidData(error)) => {
+                if self.invalid.is_none() {
+                    eprintln!("Recording incomplete: invalid data: {error}");
+                    self.invalid = Some(error);
+                }
             }
+            Err(error @ (SubmitError::Closed | SubmitError::Failed(_))) => {
+                if self.terminal.is_none() {
+                    eprintln!("Recording unavailable: {error}");
+                    self.terminal = Some(error);
+                }
+            }
+        }
+    }
+    fn check_state(&mut self) {
+        // A writer can fail after its last submission, including an idle server.
+        if let Some(handle) = &self.handle
+            && let RecorderState::Failed(error) = handle.state()
+        {
+            self.submitted(Err(SubmitError::Failed(error)));
+        }
+    }
+    fn finish(&mut self, errors: &mut ServerErrors) {
+        self.check_state();
+        if let Some(error) = self.invalid.take() {
+            errors.capture(Err(io::Error::other(format!(
+                "recording incomplete: invalid data: {error}"
+            ))));
+        }
+        if let Some(error) = self.terminal.take() {
+            errors.capture(Err(io::Error::other(error)));
+        }
+        if let Some(recorder) = self.recorder.take() {
+            errors.capture(recorder.shutdown().map(|_| ()).map_err(io::Error::other));
+        }
+    }
+}
+
+/// Keep the original cause and every distinct cleanup stage's failure.
+#[derive(Debug, Default)]
+struct ServerErrors(Vec<Box<dyn std::error::Error + Send + Sync>>);
+impl ServerErrors {
+    fn capture(&mut self, result: io::Result<()>) {
+        if let Err(error) = result {
+            self.0.push(Box::new(error));
+        }
+    }
+    fn result(self) -> io::Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(self))
+        }
+    }
+}
+impl std::fmt::Display for ServerErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str("; additionally: ")?;
+            }
+            write!(f, "{error}")?;
         }
         Ok(())
     }
 }
+impl std::error::Error for ServerErrors {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.first().map(|error| &**error as _)
+    }
+}
+
+#[cfg(test)]
+mod tests;
