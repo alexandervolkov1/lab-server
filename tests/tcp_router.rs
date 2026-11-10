@@ -342,6 +342,101 @@ fn publish(server: &MultiDeviceTcp, port: &str, key: &str, reading: Result<Value
 }
 
 #[test]
+fn message_and_tcp_sessions_share_cache_fanout_and_port_loss_isolation() {
+    use lab_server::service::DeviceService;
+    use lab_server::session::Session;
+
+    fn take(session: &mut Session) -> Json {
+        serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap()
+    }
+    fn send(service: &DeviceService, session: &mut Session, request: Json) {
+        service
+            .receive_message(session, &request.to_string(), Instant::now())
+            .unwrap();
+    }
+
+    let mut registry = DeviceRegistry::new();
+    let _p = port(&mut registry, "p", vec![device("a")], 8, 8);
+    let _q = port(&mut registry, "q", vec![device("b")], 8, 8);
+    let service = DeviceService::new(CommandRouter::new(registry), 32);
+    let a_receiver = service.register_client().unwrap();
+    let b_receiver = service.register_client().unwrap();
+    let mut a = Session::new(64, 64 * 1024);
+    let mut b = Session::new(64, 64 * 1024);
+    a.bind_observations(&a_receiver);
+    b.bind_observations(&b_receiver);
+    let endpoint = listener();
+    let mut tcp_b = Client::connect(&endpoint, &service);
+    tcp_b.request(&service, json!({"op":"subscribe","keys":["b/sample"]}));
+    send(
+        &service,
+        &mut a,
+        json!({"id":1,"op":"subscribe","keys":["a/sample"]}),
+    );
+    send(
+        &service,
+        &mut b,
+        json!({"id":1,"op":"subscribe","keys":["b/sample"]}),
+    );
+    publish(&service, "p", "a/sample", Ok(Value::Integer(i64::MAX)));
+    publish(&service, "q", "b/sample", Ok(Value::Integer(i64::MIN)));
+    a.collect_observations(&a_receiver).unwrap();
+    b.collect_observations(&b_receiver).unwrap();
+    assert_eq!(take(&mut a)["keys"], json!(["a/sample"]));
+    assert_eq!(take(&mut a)["value"].as_i64(), Some(i64::MAX));
+    assert_eq!(take(&mut b)["keys"], json!(["b/sample"]));
+    let event = take(&mut b);
+    assert_eq!(event["value"].as_i64(), Some(i64::MIN));
+    assert_eq!(event, tcp_b.next(&service));
+    send(
+        &service,
+        &mut b,
+        json!({"id":2,"op":"get","key":"b/sample"}),
+    );
+    assert_eq!(take(&mut b)["value"].as_i64(), Some(i64::MIN));
+
+    service
+        .apply_event(AggregatorEvent::DataLost {
+            port_id: "p".into(),
+            loss_epoch: 1,
+        })
+        .unwrap();
+    send(
+        &service,
+        &mut a,
+        json!({"id":2,"op":"unsubscribe","keys":["a/sample"]}),
+    );
+    a.collect_observations(&a_receiver).unwrap();
+    assert_eq!(take(&mut a)["keys"], json!([]));
+    assert_eq!(take(&mut a)["error"], "observation_data_lost");
+    assert!(a.is_finished());
+    publish(&service, "q", "b/sample", Ok(Value::Integer(7)));
+    b.collect_observations(&b_receiver).unwrap();
+    assert_eq!(take(&mut b), tcp_b.next(&service));
+    assert!(!b.is_terminal());
+
+    service
+        .apply_event(AggregatorEvent::PortStopped {
+            port_id: "p".into(),
+            reason: StopReason::Shutdown,
+        })
+        .unwrap();
+    let mut commands = Session::new(64, 4096);
+    send(
+        &service,
+        &mut commands,
+        json!({"id":1,"op":"get","key":"a/sample"}),
+    );
+    assert_eq!(take(&mut commands)["error"], "runtime_unavailable");
+    send(
+        &service,
+        &mut commands,
+        json!({"id":2,"op":"get","key":"b/sample"}),
+    );
+    assert_eq!(take(&mut commands)["value"], 7);
+}
+
+#[test]
 fn endpoint_routes_shared_and_independent_ports_and_preserves_catalog_and_types() {
     let mut registry = DeviceRegistry::new();
     let mut p = port(
