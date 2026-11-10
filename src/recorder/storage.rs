@@ -71,6 +71,7 @@ impl Storage {
                 None,
                 json!({"dropped_events": losses.dropped_events.to_string(),
                     "dropped_data_lost_events": losses.dropped_data_lost_events.to_string(),
+                    "rejected_invalid_data": losses.rejected_invalid_data.to_string(),
                     "port_worker_continuity_unknown": losses.dropped_data_lost_events != 0,
                     "counts_are_cumulative": true, "gap_position_known": false}),
             )

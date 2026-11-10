@@ -405,8 +405,23 @@ fn rejects_unrepresentable_time_and_nonfinite_values_before_acceptance() {
             Err(SubmitError::InvalidData(DataError::NonFiniteFloat))
         );
     }
-    assert!(!handle.losses().is_incomplete());
-    assert_eq!(recorder.shutdown().unwrap().accepted_records, 0);
+    assert!(handle.losses().is_incomplete());
+    assert_eq!(handle.losses().rejected_invalid_data, 5);
+    handle.try_record(event(i64::MAX)).unwrap();
+    assert_eq!(recorder.shutdown().unwrap().accepted_records, 1);
+    let connection = db.connect();
+    assert_eq!(
+        scalar(&connection, "SELECT recorder_incomplete FROM sessions"),
+        1
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT integer_value FROM measurements"),
+        i64::MAX
+    );
+    let details: String = connection.query_row("SELECT details_json FROM events WHERE event_type='RecorderDataLost' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let details: Json = serde_json::from_str(&details).unwrap();
+    assert_eq!(details["rejected_invalid_data"], "5");
+    assert_eq!(details["dropped_events"], "0");
 }
 
 #[test]
@@ -447,7 +462,8 @@ fn concurrent_overflow_never_waits_for_writer_and_lost_datalost_remains_visible(
         losses,
         LossInfo {
             dropped_events: 1001,
-            dropped_data_lost_events: 1
+            dropped_data_lost_events: 1,
+            rejected_invalid_data: 0,
         }
     );
     assert_eq!(handle.losses(), losses);
@@ -499,6 +515,7 @@ fn saturated_loss_is_sticky_and_persisted_as_exact_decimal_text() {
     control(&handle.shared).losses = LossInfo {
         dropped_events: u64::MAX - 1,
         dropped_data_lost_events: u64::MAX - 1,
+        rejected_invalid_data: 0,
     };
     for _ in 0..3 {
         assert_eq!(
@@ -515,7 +532,8 @@ fn saturated_loss_is_sticky_and_persisted_as_exact_decimal_text() {
         handle.losses(),
         LossInfo {
             dropped_events: u64::MAX,
-            dropped_data_lost_events: u64::MAX
+            dropped_data_lost_events: u64::MAX,
+            rejected_invalid_data: 0,
         }
     );
     assert!(handle.losses().is_incomplete());
@@ -1000,4 +1018,131 @@ fn invalid_observation_keeps_nonfinite_float_bits_and_out_of_range_time() {
         details["observation"]["completed_at"]["seconds"],
         "10000000000"
     );
+}
+
+fn invalid_event() -> AggregatorEvent {
+    let mut obs = observation(0);
+    obs.reading = Ok(Value::Float(f64::NAN));
+    AggregatorEvent::Measurement {
+        port_id: "bus".into(),
+        global_key: "device/value".into(),
+        observation: obs,
+    }
+}
+
+#[test]
+fn concurrent_invalid_and_overflow_keep_distinct_counts_after_reopen() {
+    let db = Database::new();
+    let (hooks, entered, release, _) = first_flush_gate();
+    let recorder = Recorder::start(&db.0, options(1, 1), hooks).unwrap();
+    let handle = recorder.handle();
+    handle.try_record(event(0)).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    handle.try_record(event(1)).unwrap();
+    assert_eq!(handle.try_record(event(2)), Err(SubmitError::Full));
+    for _ in 0..3 {
+        assert!(matches!(
+            handle.try_record(invalid_event()),
+            Err(SubmitError::InvalidData(_))
+        ));
+    }
+    release.send(()).unwrap();
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.losses.dropped_events, 1);
+    assert_eq!(summary.losses.rejected_invalid_data, 3);
+    let second = Recorder::open(&db.0, 8).unwrap();
+    second.handle().try_record(event(3)).unwrap();
+    second.shutdown().unwrap();
+    let connection = db.connect();
+    assert_eq!(scalar(&connection, "PRAGMA user_version"), 1);
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM sessions WHERE ended_at_ns IS NOT NULL"
+        ),
+        2
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT recorder_incomplete FROM sessions WHERE id=1"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT recorder_incomplete FROM sessions WHERE id=2"
+        ),
+        0
+    );
+    let details: String = connection.query_row("SELECT details_json FROM events WHERE session_id=1 AND event_type='RecorderDataLost' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let details: Json = serde_json::from_str(&details).unwrap();
+    assert_eq!(details["dropped_events"], "1");
+    assert_eq!(details["rejected_invalid_data"], "3");
+}
+
+#[test]
+fn concurrent_invalid_data_and_shutdown_preserve_final_snapshot() {
+    let db = Database::new();
+    let (hooks, entered, release, _) = first_flush_gate();
+    let recorder = Recorder::start(&db.0, options(8, 1), hooks).unwrap();
+    let handle = recorder.handle();
+    handle.try_record(event(0)).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    assert!(matches!(
+        handle.try_record(invalid_event()),
+        Err(SubmitError::InvalidData(_))
+    ));
+    let barrier = Arc::new(Barrier::new(2));
+    let producer_barrier = barrier.clone();
+    let producer_handle = handle.clone();
+    let producer = thread::spawn(move || {
+        producer_barrier.wait();
+        let mut rejected = 1;
+        for _ in 0..1000 {
+            match producer_handle.try_record(invalid_event()) {
+                Err(SubmitError::InvalidData(_)) => rejected += 1,
+                Err(SubmitError::Closed) => {}
+                result => panic!("unexpected {result:?}"),
+            }
+        }
+        rejected
+    });
+    let closer = thread::spawn(move || {
+        barrier.wait();
+        recorder.shutdown().unwrap()
+    });
+    let rejected = producer.join().unwrap();
+    release.send(()).unwrap();
+    let summary = closer.join().unwrap();
+    assert_eq!(summary.losses.rejected_invalid_data, rejected);
+    assert_eq!(handle.losses(), summary.losses);
+    let connection = db.connect();
+    let value: String = connection.query_row("SELECT json_extract(details_json, '$.rejected_invalid_data') FROM events WHERE event_type='RecorderDataLost' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(value, rejected.to_string());
+    assert_eq!(
+        scalar(&connection, "SELECT recorder_incomplete FROM sessions"),
+        1
+    );
+}
+
+#[test]
+fn invalid_data_counter_saturates_independently() {
+    let db = Database::new();
+    let recorder = Recorder::open(&db.0, 8).unwrap();
+    let handle = recorder.handle();
+    control(&handle.shared).losses.rejected_invalid_data = u64::MAX - 1;
+    for _ in 0..3 {
+        assert!(matches!(
+            handle.try_record(invalid_event()),
+            Err(SubmitError::InvalidData(_))
+        ));
+    }
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.losses.rejected_invalid_data, u64::MAX);
+    assert_eq!(summary.losses.dropped_events, 0);
+    let connection = db.connect();
+    let value: String = connection.query_row("SELECT json_extract(details_json, '$.rejected_invalid_data') FROM events WHERE event_type='RecorderDataLost' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(value, u64::MAX.to_string());
 }

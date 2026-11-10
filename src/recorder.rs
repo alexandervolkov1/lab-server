@@ -104,11 +104,14 @@ pub struct LossInfo {
     /// that could not themselves enter the recorder queue. Port details may be
     /// lost, but the fact that worker continuity was broken cannot disappear.
     pub dropped_data_lost_events: u64,
+    /// Events rejected before enqueueing because their data cannot be stored.
+    /// Separate from queue overflow, but also makes the session incomplete.
+    pub rejected_invalid_data: u64,
 }
 
 impl LossInfo {
     pub fn is_incomplete(self) -> bool {
-        self.dropped_events != 0
+        self.dropped_events != 0 || self.rejected_invalid_data != 0
     }
 
     fn record(&mut self, event: &AggregatorEvent) {
@@ -222,7 +225,8 @@ impl RecorderHandle {
 
     /// Consumes an existing aggregator event; clone it first to also feed TCP.
     /// Full means NOT accepted and increments the out-of-queue loss counters.
-    /// InvalidData/Closed/Failed mean NOT accepted and do not count as overflow.
+    /// InvalidData increments rejected_invalid_data, independently of overflow.
+    /// Closed/Failed mean NOT accepted and do not change the loss counters.
     pub fn try_record(&self, event: AggregatorEvent) -> Result<(), SubmitError> {
         let mut shared = control(&self.shared);
         match &shared.state {
@@ -230,13 +234,20 @@ impl RecorderHandle {
             RecorderState::Failed(error) => return Err(SubmitError::Failed(error.clone())),
             _ => return Err(SubmitError::Closed),
         }
-        if let AggregatorEvent::Measurement { observation, .. } = &event {
-            unix_ns(observation.completed_at).map_err(SubmitError::InvalidData)?;
-            if matches!(observation.reading, Ok(Value::Float(value)) if !value.is_finite()) {
-                return Err(SubmitError::InvalidData(DataError::NonFiniteFloat));
+        let validate = || {
+            if let AggregatorEvent::Measurement { observation, .. } = &event {
+                unix_ns(observation.completed_at)?;
+                if matches!(observation.reading, Ok(Value::Float(value)) if !value.is_finite()) {
+                    return Err(DataError::NonFiniteFloat);
+                }
             }
-        }
-        let registered_at_ns = unix_ns(SystemTime::now()).map_err(SubmitError::InvalidData)?;
+            unix_ns(SystemTime::now())
+        };
+        let registered_at_ns = validate().map_err(|error| {
+            shared.losses.rejected_invalid_data =
+                shared.losses.rejected_invalid_data.saturating_add(1);
+            SubmitError::InvalidData(error)
+        })?;
         match self.sender.try_send(Message::Event(Entry {
             event,
             registered_at_ns,
@@ -301,7 +312,7 @@ impl Recorder {
         Self::start(path.as_ref(), options, Hooks::default())
     }
 
-    fn start(
+    pub(crate) fn start(
         path: &Path,
         options: RecorderOptions,
         mut hooks: Hooks,
@@ -417,13 +428,13 @@ fn duration_ns(duration: Duration, before_epoch: bool) -> Result<i64, DataError>
 // Test-only synchronization at the actual transaction boundary; no sleeps or
 // simulated substitute database on the production write path.
 #[derive(Default)]
-struct Hooks {
+pub(crate) struct Hooks {
     #[cfg(test)]
-    before_flush: Option<Box<dyn FnMut() + Send>>,
+    pub(crate) before_flush: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
-    after_flush: Option<Box<dyn FnMut() + Send>>,
+    pub(crate) after_flush: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
-    stopped: Option<mpsc::Sender<()>>,
+    pub(crate) stopped: Option<mpsc::Sender<()>>,
 }
 impl Hooks {
     fn before_flush(&mut self) {
