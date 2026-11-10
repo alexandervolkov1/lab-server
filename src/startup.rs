@@ -232,10 +232,13 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
 struct Workers(Vec<(PortHandle, JoinHandle<StopReason>)>);
 
 impl Workers {
-    fn shutdown(&mut self) -> io::Result<()> {
+    fn request_shutdown(&self) {
         for (handle, _) in &self.0 {
             handle.shutdown();
         }
+    }
+
+    fn join(&mut self) -> io::Result<()> {
         let mut panicked = false;
         for (_, join) in self.0.drain(..) {
             panicked |= join.join().is_err();
@@ -249,7 +252,8 @@ impl Workers {
 }
 impl Drop for Workers {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        self.request_shutdown();
+        let _ = self.join();
     }
 }
 
@@ -354,18 +358,24 @@ impl StartedServer {
         // No more accepts. Closing and joining clients ends command admission
         // before worker shutdown; driver operations already begun may finish.
         drop(clients);
-        errors.capture(self.workers.shutdown());
-        // Joining workers leaves finite queues and final counters. Receivers
-        // remain alive until every queued observation and terminal event is read.
+        self.workers.request_shutdown();
+        // Keep freeing queue space while drivers finish their current reads.
+        // EOF includes the final counters and terminal event of each worker;
+        // only then is it safe to wait for thread completion without draining.
         let mut drain_error = None;
         while !aggregator.is_finished() {
-            if let Err(error) = dispatch(&tcp, &mut aggregator, &mut self.recording) {
-                drain_error.get_or_insert(error);
+            match dispatch(&tcp, &mut aggregator, &mut self.recording) {
+                Ok(0) => thread::sleep(IDLE_WAIT),
+                Ok(_) => {}
+                Err(error) => {
+                    drain_error.get_or_insert(error);
+                }
             }
         }
         if let Some(error) = drain_error {
             errors.capture(Err(error));
         }
+        errors.capture(self.workers.join());
         self.recording.finish(&mut errors);
         errors.result()
     }
@@ -398,6 +408,11 @@ struct Recording {
     handle: Option<RecorderHandle>,
     invalid: Option<DataError>,
     terminal: Option<SubmitError>,
+    overflow_warned: bool,
+    // Observe the actual diagnostic path without redirecting process stderr
+    // (which would interfere with concurrently running tests).
+    #[cfg(test)]
+    diagnostics: Vec<String>,
 }
 impl Recording {
     fn open(config: &ServerConfig) -> StartupResult<Self> {
@@ -424,20 +439,32 @@ impl Recording {
     }
     fn submitted(&mut self, result: Result<(), SubmitError>) {
         match result {
-            Ok(()) | Err(SubmitError::Full) => {} // Recorder alone accounts overflow.
+            Ok(()) => {}
+            Err(SubmitError::Full) => {
+                if !self.overflow_warned {
+                    self.report(format_args!("Warning: recorder queue is full; recording is incomplete; polling and TCP continue"));
+                    self.overflow_warned = true;
+                }
+                // Recorder alone accounts overflow; this flag only limits logs.
+            }
             Err(SubmitError::InvalidData(error)) => {
                 if self.invalid.is_none() {
-                    eprintln!("Recording incomplete: invalid data: {error}");
+                    self.report(format_args!("Recording incomplete: invalid data: {error}"));
                     self.invalid = Some(error);
                 }
             }
             Err(error @ (SubmitError::Closed | SubmitError::Failed(_))) => {
                 if self.terminal.is_none() {
-                    eprintln!("Recording unavailable: {error}");
+                    self.report(format_args!("Recording unavailable: {error}"));
                     self.terminal = Some(error);
                 }
             }
         }
+    }
+    fn report(&mut self, message: std::fmt::Arguments<'_>) {
+        eprintln!("{message}");
+        #[cfg(test)]
+        self.diagnostics.push(message.to_string());
     }
     fn check_state(&mut self) {
         // A writer can fail after its last submission, including an idle server.
@@ -458,7 +485,18 @@ impl Recording {
             errors.capture(Err(io::Error::other(error)));
         }
         if let Some(recorder) = self.recorder.take() {
-            errors.capture(recorder.shutdown().map(|_| ()).map_err(io::Error::other));
+            match recorder.shutdown() {
+                Ok(summary) => self.report(format_args!(
+                    "Recording summary: session_id={} accepted_records={} dropped_events={} dropped_data_lost_events={} rejected_invalid_data={} incomplete={}",
+                    summary.session_id,
+                    summary.accepted_records,
+                    summary.losses.dropped_events,
+                    summary.losses.dropped_data_lost_events,
+                    summary.losses.rejected_invalid_data,
+                    summary.losses.is_incomplete(),
+                )),
+                Err(error) => errors.capture(Err(io::Error::other(error))),
+            }
         }
     }
 }
