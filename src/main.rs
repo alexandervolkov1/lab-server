@@ -26,6 +26,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             })?;
             let server = lab_server::startup::start(&config)?;
             println!("TCP server listening on {}", server.local_addr()?);
+            if let Some(address) = server.websocket_addr()? {
+                println!(
+                    "WebSocket server listening on ws://{address}{}",
+                    lab_server::websocket::PATH
+                );
+            }
             server.run_until(&stop)?;
             Ok(())
         }

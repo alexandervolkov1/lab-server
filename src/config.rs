@@ -20,6 +20,16 @@ pub struct ServerConfig {
     pub ports: Vec<PortConfig>,
     pub devices: Vec<DeviceConfig>,
     pub recording: Option<RecordingConfig>,
+    pub websocket: Option<WebSocketConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketConfig {
+    pub enabled: bool,
+    pub bind: Option<SocketAddr>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -135,6 +145,35 @@ impl ServerConfig {
     /// Also usable after constructing or editing the public model in memory.
     /// Returns the first error; no driver implementations or ports are consulted.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(ws) = &self.websocket {
+            if ws.enabled && ws.bind.is_none() {
+                return Err(invalid("websocket.bind", "required when enabled"));
+            }
+            if let Some(bind) = ws.bind {
+                if !bind.ip().is_loopback() {
+                    return Err(invalid(
+                        "websocket.bind",
+                        "only loopback IP addresses are allowed",
+                    ));
+                }
+                // Two port-zero listeners receive distinct ephemeral ports.
+                if ws.enabled && bind.port() != 0 && bind == self.tcp.bind {
+                    return Err(invalid("websocket.bind", "conflicts with tcp.bind"));
+                }
+            }
+            for origin in &ws.allowed_origins {
+                if origin.is_empty()
+                    || origin.trim() != origin
+                    || origin == "*"
+                    || tungstenite::http::HeaderValue::from_str(origin).is_err()
+                {
+                    return Err(invalid(
+                        "websocket.allowed_origins",
+                        "expected exact nonempty Origin header values; wildcard is unsupported",
+                    ));
+                }
+            }
+        }
         if let Some(recording) = &self.recording {
             if recording.enabled
                 && recording

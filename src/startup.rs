@@ -164,6 +164,16 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;
     listener.set_nonblocking(true)?;
+    let websocket = config.websocket.as_ref().filter(|ws| ws.enabled);
+    let websocket_listener = websocket
+        .map(|ws| -> io::Result<TcpListener> {
+            let listener = TcpListener::bind(ws.bind.expect("validated WebSocket bind"))?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })
+        .transpose()?;
+    let websocket_origins =
+        Arc::new(websocket.map_or_else(Vec::new, |ws| ws.allowed_origins.clone()));
     // Open and validate SQLite before touching physical ports. An enabled
     // recorder is mandatory; construction failure also releases the listener.
     let mut recording = Recording::open(config)?;
@@ -216,6 +226,8 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
         Ok((tcp, sources, workers)) => Ok(StartedServer {
             workers,
             listener,
+            websocket_listener,
+            websocket_origins,
             tcp,
             sources,
             recording,
@@ -259,17 +271,32 @@ impl Drop for Workers {
 
 struct Client {
     socket: TcpStream,
+    websocket_stop: Option<Arc<AtomicBool>>,
     join: JoinHandle<()>,
 }
 
 #[derive(Default)]
 struct Clients(Vec<Client>);
 
+impl Clients {
+    fn request_close(&self) {
+        for client in &self.0 {
+            if let Some(stop) = &client.websocket_stop {
+                stop.store(true, Ordering::Release);
+            } else {
+                let _ = client.socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.iter().all(|client| client.join.is_finished())
+    }
+}
+
 impl Drop for Clients {
     fn drop(&mut self) {
-        for client in &self.0 {
-            let _ = client.socket.shutdown(Shutdown::Both);
-        }
+        self.request_close();
         for client in self.0.drain(..) {
             let _ = client.join.join();
         }
@@ -280,6 +307,8 @@ pub struct StartedServer {
     // Fallback Drop must join workers before dropping their receivers.
     workers: Workers,
     listener: TcpListener,
+    websocket_listener: Option<TcpListener>,
+    websocket_origins: Arc<Vec<String>>,
     tcp: Arc<MultiDeviceTcp>,
     sources: Vec<(String, mpsc::Receiver<DeviceObservation>)>,
     recording: Recording,
@@ -288,6 +317,13 @@ pub struct StartedServer {
 impl StartedServer {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    pub fn websocket_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.websocket_listener
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()
     }
 
     pub fn backend(&self) -> &Arc<MultiDeviceTcp> {
@@ -319,32 +355,54 @@ impl StartedServer {
                         index += 1;
                     }
                 }
-                // Bound accepts so connection floods cannot starve observations.
-                for _ in 0..MAX_CLIENTS {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let stream = match self.listener.accept() {
-                        Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(error),
-                    };
-                    let Some(slot) = slots.try_acquire() else {
-                        continue;
-                    };
-                    let socket = stream.try_clone()?;
-                    let tcp = self.tcp.clone();
-                    let join =
-                        thread::Builder::new()
-                            .name("tcp-client".into())
+                // Bound EACH listener's accepts; one shared permit covers TCP,
+                // WS and unfinished upgrades. Handshake never runs in this loop.
+                for (listener, websocket) in std::iter::once((&self.listener, false)).chain(
+                    self.websocket_listener
+                        .as_ref()
+                        .map(|listener| (listener, true)),
+                ) {
+                    for _ in 0..MAX_CLIENTS {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(error),
+                        };
+                        let Some(slot) = slots.try_acquire() else {
+                            continue;
+                        };
+                        let socket = stream.try_clone()?;
+                        let service = self.tcp.clone();
+                        let origins = self.websocket_origins.clone();
+                        let websocket_stop = websocket.then(|| Arc::new(AtomicBool::new(false)));
+                        let client_stop = websocket_stop.clone();
+                        let join = thread::Builder::new()
+                            .name(if websocket { "ws-client" } else { "tcp-client" }.into())
                             .spawn(move || {
                                 let _slot = slot;
-                                if let Err(error) = tcp.serve_connection(stream) {
-                                    eprintln!("TCP client error: {error}");
+                                let result = match client_stop {
+                                    Some(stop) => crate::websocket::serve_connection(
+                                        stream, &service, &origins, &stop,
+                                    ),
+                                    None => service.serve_connection(stream),
+                                };
+                                if let Err(error) = result {
+                                    eprintln!(
+                                        "{} client error: {error}",
+                                        if websocket { "WS" } else { "TCP" }
+                                    );
                                 }
                             })?;
-                    clients.0.push(Client { socket, join });
+                        clients.0.push(Client {
+                            socket,
+                            websocket_stop,
+                            join,
+                        });
+                    }
                 }
                 if dispatch(&tcp, &mut aggregator, &mut self.recording)? == 0 {
                     // Also sleeps when no ports opened, or every receiver reached EOF.
@@ -355,14 +413,25 @@ impl StartedServer {
         })();
         let mut errors = ServerErrors::default();
         errors.capture(result);
-        // No more accepts. Closing and joining clients ends command admission
-        // before worker shutdown; driver operations already begun may finish.
+        // No more accepts. WS closing is bounded but may take seconds. Keep
+        // draining the SAME aggregator while clients finish, so this wait cannot
+        // cause upstream overflow. Workers are stopped only after clients end.
+        clients.request_close();
+        let mut drain_error = None;
+        while !clients.is_finished() {
+            match dispatch(&tcp, &mut aggregator, &mut self.recording) {
+                Ok(0) => thread::sleep(IDLE_WAIT),
+                Ok(_) => {}
+                Err(error) => {
+                    drain_error.get_or_insert(error);
+                }
+            }
+        }
         drop(clients);
         self.workers.request_shutdown();
         // Keep freeing queue space while drivers finish their current reads.
         // EOF includes the final counters and terminal event of each worker;
         // only then is it safe to wait for thread completion without draining.
-        let mut drain_error = None;
         while !aggregator.is_finished() {
             match dispatch(&tcp, &mut aggregator, &mut self.recording) {
                 Ok(0) => thread::sleep(IDLE_WAIT),

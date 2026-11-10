@@ -22,4 +22,5 @@ pub mod service;
 pub mod session;
 pub mod tcp;
 mod tcp_legacy;
+pub mod websocket;
 pub use tcp_legacy::{observation_json, queue_read, queue_set};

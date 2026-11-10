@@ -468,6 +468,8 @@ fn finishing_reads(queued: &[usize]) -> ShutdownFixture {
     listener.set_nonblocking(true).unwrap();
     ShutdownFixture {
         server: StartedServer {
+            websocket_listener: None,
+            websocket_origins: Arc::new(Vec::new()),
             workers,
             listener,
             tcp: Arc::new(MultiDeviceTcp::new(
