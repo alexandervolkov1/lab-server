@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lab_server::config::ServerConfig;
 use lab_server::driver::{DeviceIo, Driver, DriverError};
-use lab_server::model::{Observation, ParameterDescription, Spec, Value};
+use lab_server::model::{ActionDescription, Observation, ParameterDescription, Spec, Value};
 use lab_server::observation_aggregator::AggregatorEvent;
 use lab_server::port_worker::StopReason;
 use lab_server::service::DeviceService;
@@ -71,6 +71,20 @@ impl MockDriver {
     }
 }
 impl Driver for MockDriver {
+    fn actions(&self) -> Vec<ActionDescription> {
+        vec![ActionDescription {
+            name: "decrement".into(),
+            description: "Decrease count once".into(),
+        }]
+    }
+    fn invoke_action(&mut self, action: &str, io: &mut dyn DeviceIo) -> Result<(), DriverError> {
+        assert_eq!(action, "decrement");
+        let Value::Integer(count) = self.values["count"] else {
+            panic!("wrong count type")
+        };
+        self.write("count", &Value::Integer(count - 1), io)
+    }
+
     fn parameters(&self) -> Vec<ParameterDescription> {
         [
             (
@@ -912,4 +926,161 @@ fn concurrent_sqlite_records_without_tcp_or_ws_subscribers_and_drains_on_stop() 
             .unwrap(),
         "ok"
     );
+}
+
+// Exercise identical requests over real TCP and WS sockets on one DeviceService.
+enum ActionClient {
+    Tcp(BufReader<TcpStream>),
+    Ws(Box<WebSocket<TcpStream>>),
+}
+impl ActionClient {
+    fn new(server: &Running, ws: bool) -> Self {
+        if ws {
+            Self::Ws(Box::new(server.connect()))
+        } else {
+            Self::Tcp(server.tcp())
+        }
+    }
+    fn send(&mut self, value: Json) {
+        match self {
+            Self::Tcp(client) => writeln!(client.get_mut(), "{value}").unwrap(),
+            Self::Ws(client) => client
+                .send(Message::Text(value.to_string().into()))
+                .unwrap(),
+        }
+    }
+    fn receive(&mut self) -> Json {
+        match self {
+            Self::Tcp(client) => tcp_receive(client),
+            Self::Ws(client) => receive(client),
+        }
+    }
+    fn request(&mut self, value: Json) -> Json {
+        self.send(value);
+        self.receive()
+    }
+    fn disconnect(&mut self) {
+        match self {
+            Self::Tcp(client) => client.get_mut().shutdown(Shutdown::Both).unwrap(),
+            Self::Ws(client) => client.get_mut().shutdown(Shutdown::Both).unwrap(),
+        }
+    }
+}
+
+#[test]
+fn actions_catalog_commands_ids_and_subscriptions_match_tcp_and_ws() {
+    let server = Running::new();
+    let mut tcp = ActionClient::new(&server, false);
+    let mut ws = ActionClient::new(&server, true);
+    let catalog = tcp.request(json!({"id":1,"op":"describe"}));
+    assert_eq!(catalog, ws.request(json!({"id":1,"op":"describe"})));
+    assert_eq!(catalog["parameters"].as_array().unwrap().len(), 12);
+    assert_eq!(
+        catalog["actions"],
+        json!([
+            {"key":"a/decrement","description":"Decrease count once"},
+            {"key":"b/decrement","description":"Decrease count once"}
+        ])
+    );
+    for client in [&mut tcp, &mut ws] {
+        assert_eq!(
+            client.request(json!({"id":2,"op":"set","key":"a/count","value":10}))["status"],
+            "ok"
+        );
+        assert_eq!(
+            client.request(json!({"id":3,"op":"invoke_action","key":"a/decrement"})),
+            json!({"id":3,"status":"ok"})
+        );
+        for id in [3, 2] {
+            assert_eq!(
+                client.request(json!({"id":id,"op":"invoke_action","key":"a/decrement"})),
+                json!({"status":"error","error":"duplicate_id"})
+            );
+        }
+        assert_eq!(
+            client.request(json!({"id":4,"op":"get","key":"a/count"}))["value"],
+            9
+        );
+        for (id, key) in [(5, "missing/decrement"), (6, "a/missing")] {
+            assert_eq!(
+                client.request(json!({"id":id,"op":"invoke_action","key":key})),
+                json!({"id":id,"status":"error","error":"unknown_key"})
+            );
+        }
+        assert_eq!(
+            client.request(json!({"id":7,"op":"invoke_action"}))["error"],
+            "invalid_key"
+        );
+        assert_eq!(
+            client.request(json!({"id":8,"op":"subscribe","keys":["a/sample"]}))["status"],
+            "ok"
+        );
+    }
+    tcp.send(json!({"id":9,"op":"invoke_action","key":"a/decrement"}));
+    ws.send(json!({"id":9,"op":"invoke_action","key":"a/decrement"}));
+    assert_eq!(tcp.receive(), json!({"id":9,"status":"ok"}));
+    assert_eq!(ws.receive(), json!({"id":9,"status":"ok"}));
+    publish(&server, "p", "a/sample", Value::Integer(42));
+    assert_eq!(tcp.receive(), ws.receive());
+    assert_eq!(
+        tcp.request(json!({"id":10,"op":"get","key":"a/count"}))["value"],
+        7
+    );
+}
+
+#[test]
+fn actions_timeout_disconnect_and_other_port_progress_on_both_transports() {
+    for use_ws in [false, true] {
+        let server = Running::new();
+        let mut client = ActionClient::new(&server, use_ws);
+        let mut peer = ActionClient::new(&server, !use_ws);
+        assert_eq!(
+            client.request(json!({"id":1,"op":"set","key":"a/count","value":10}))["status"],
+            "ok"
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *server.gate.lock().unwrap() = Some(Gate {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        client.send(json!({"id":2,"op":"invoke_action","key":"a/decrement"}));
+        entered_rx.recv_timeout(WAIT).unwrap();
+        // Another port and transport remain usable while a's action is in flight.
+        assert_eq!(
+            peer.request(json!({"id":1,"op":"invoke_action","key":"b/decrement"})),
+            json!({"id":1,"status":"ok"})
+        );
+        assert_eq!(
+            client.receive(),
+            json!({"id":2,"status":"error","error":"outcome_unknown"})
+        );
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            client.request(json!({"id":3,"op":"get","key":"a/count"}))["value"],
+            9
+        );
+        assert_eq!(
+            client.request(json!({"id":4,"op":"ping"})),
+            json!({"id":4,"status":"ok"})
+        );
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *server.gate.lock().unwrap() = Some(Gate {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        client.send(json!({"id":5,"op":"invoke_action","key":"a/decrement"}));
+        entered_rx.recv_timeout(WAIT).unwrap();
+        client.disconnect();
+        drop(client);
+        resume_tx.send(()).unwrap();
+        // Read is queued after the disconnected client's action, proving that it
+        // completed exactly once even though its response could not be delivered.
+        assert_eq!(
+            peer.request(json!({"id":2,"op":"get","key":"a/count"}))["value"],
+            8
+        );
+    }
 }
