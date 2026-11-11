@@ -501,7 +501,8 @@ fn real_arduino_factory_uses_one_reset_delay_and_global_keys() {
     let running = Running::new(server);
     let mut client = Client::new(running.addr);
     let catalog = client.request(json!({"op":"describe"}));
-    assert_eq!(catalog["parameters"].as_array().unwrap().len(), 8);
+    assert_eq!(catalog["parameters"].as_array().unwrap().len(), 46);
+    assert_eq!(catalog["actions"].as_array().unwrap().len(), 4);
     for id in [&config.devices[0].id, &config.devices[1].id] {
         let key = format!("{id}/power");
         assert_eq!(
@@ -557,10 +558,12 @@ fn legacy_runtime_and_tcp_keep_local_arduino_catalog_and_commands() {
         .collect();
     let tasks = parameters
         .into_iter()
-        .map(|description| PollTask {
-            source: description.id.clone(),
-            period: description.default_poll_period.unwrap(),
-            description,
+        .filter_map(|description| {
+            Some(PollTask {
+                source: description.id.clone(),
+                period: description.default_poll_period?,
+                description,
+            })
         })
         .collect();
     let probe = Arc::new(PortProbe::default());
@@ -609,12 +612,20 @@ fn legacy_runtime_and_tcp_keep_local_arduino_catalog_and_commands() {
     assert_eq!(client.request(json!({"op":"hello"}))["version"], 1);
     let description = client.request(json!({"op":"describe"}));
     let catalog = description["parameters"].as_array().unwrap();
-    assert_eq!(catalog.len(), 4);
-    assert!(
+    assert_eq!(catalog.len(), 23);
+    assert_eq!(
         catalog
             .iter()
-            .all(|p| !p["key"].as_str().unwrap().contains('/'))
+            .filter(|p| p["poll_period_ns"].is_number())
+            .count(),
+        4
     );
+    assert!(catalog.iter().all(|p| {
+        let key = p["key"].as_str().unwrap();
+        !key.contains('/') || key.starts_with("designer/")
+    }));
+    // Legacy runtime supports read/write, but universal actions use --config.
+    assert_eq!(description["actions"], json!([]));
     assert_eq!(
         client.request(json!({"op":"get", "key":first_key}))["value"],
         17.0
