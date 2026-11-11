@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::model::ParameterDescription;
+use crate::model::{ActionDescription, ParameterDescription};
 use crate::port_worker::{DeviceInstance, DeviceObservation, PortHandle, StopReason};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,7 @@ pub struct RegisteredDevice {
     pub port_id: String,
     /// Exact global keys; look up their descriptions through the registry.
     pub parameters: Vec<String>,
+    pub actions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +77,15 @@ pub struct RegisteredParameter {
     pub port_id: String,
     /// The existing model, with the driver's local name in description.id.
     pub description: ParameterDescription,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredAction {
+    pub global_key: String,
+    pub device_id: String,
+    pub port_id: String,
+    /// The driver's local action name and description.
+    pub description: ActionDescription,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +117,7 @@ pub struct DeviceRegistry {
     ports: BTreeMap<String, RegisteredPort>,
     devices: BTreeMap<String, RegisteredDevice>,
     parameters: BTreeMap<String, RegisteredParameter>,
+    actions: BTreeMap<String, RegisteredAction>,
 }
 
 impl DeviceRegistry {
@@ -179,12 +190,27 @@ impl DeviceRegistry {
             );
             keys.push(global_key);
         }
+        let mut actions = Vec::with_capacity(device.actions().len());
+        for description in device.actions() {
+            let global_key = format!("{id}/{}", description.name);
+            self.actions.insert(
+                global_key.clone(),
+                RegisteredAction {
+                    global_key: global_key.clone(),
+                    device_id: id.into(),
+                    port_id: port_id.into(),
+                    description: description.clone(),
+                },
+            );
+            actions.push(global_key);
+        }
         self.devices.insert(
             id.into(),
             RegisteredDevice {
                 id: id.into(),
                 port_id: port_id.into(),
                 parameters: keys,
+                actions,
             },
         );
         Ok(())
@@ -212,6 +238,14 @@ impl DeviceRegistry {
 
     pub fn parameters(&self) -> impl Iterator<Item = &RegisteredParameter> {
         self.parameters.values()
+    }
+
+    pub fn action(&self, global_key: &str) -> Option<&RegisteredAction> {
+        self.actions.get(global_key)
+    }
+
+    pub fn actions(&self) -> impl Iterator<Item = &RegisteredAction> {
+        self.actions.values()
     }
 
     pub fn availability(&self, device_id: &str) -> Option<Availability> {

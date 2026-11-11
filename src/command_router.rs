@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::device_registry::{Availability, DeviceRegistry, RegisteredParameter};
+use crate::device_registry::{Availability, DeviceRegistry, RegisteredAction, RegisteredParameter};
 use crate::model::Value;
 use crate::pending::Pending;
 use crate::port_worker::{CommandError, DeviceObservation, PortHandle, StopReason, SubmitError};
@@ -15,6 +15,7 @@ use crate::port_worker::{CommandError, DeviceObservation, PortHandle, StopReason
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     UnknownSignal(String),
+    UnknownAction(String),
     UnknownDevice(String),
     Unavailable {
         device_id: String,
@@ -40,6 +41,7 @@ pub enum RouteError {
 impl fmt::Display for RouteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownAction(key) => write!(f, "unknown global action {key:?}"),
             Self::UnknownSignal(key) => write!(f, "unknown global signal {key:?}"),
             Self::UnknownDevice(id) => write!(f, "unknown device {id:?}"),
             Self::Unavailable {
@@ -109,14 +111,14 @@ impl CommandRouter {
         deadline: Instant,
     ) -> Result<Pending<Result<DeviceObservation, CommandError>>, RouteError> {
         let parameter = self.description(global_key)?;
-        self.handle(parameter)?
+        self.handle(&parameter.device_id, &parameter.port_id)?
             .read(
                 id,
                 &parameter.device_id,
                 &parameter.description.id,
                 deadline,
             )
-            .map_err(|error| Self::submit_error(parameter, error))
+            .map_err(|error| Self::submit_error(&parameter.device_id, &parameter.port_id, error))
     }
 
     /// Validation happens before queue admission; the worker validates again.
@@ -141,7 +143,7 @@ impl CommandRouter {
                 global_key: global_key.into(),
             });
         }
-        self.handle(parameter)?
+        self.handle(&parameter.device_id, &parameter.port_id)?
             .set(
                 id,
                 &parameter.device_id,
@@ -149,13 +151,35 @@ impl CommandRouter {
                 value,
                 deadline,
             )
-            .map_err(|error| Self::submit_error(parameter, error))
+            .map_err(|error| Self::submit_error(&parameter.device_id, &parameter.port_id, error))
     }
 
-    fn handle(&self, parameter: &RegisteredParameter) -> Result<&PortHandle, RouteError> {
+    pub fn action_description(&self, global_key: &str) -> Result<&RegisteredAction, RouteError> {
+        let device_id = global_key.split_once('/').map_or(global_key, |(id, _)| id);
+        if self.registry.device(device_id).is_none() {
+            return Err(RouteError::UnknownDevice(device_id.into()));
+        }
+        self.registry
+            .action(global_key)
+            .ok_or_else(|| RouteError::UnknownAction(global_key.into()))
+    }
+
+    pub fn invoke_action(
+        &self,
+        id: u64,
+        global_key: &str,
+        deadline: Instant,
+    ) -> Result<Pending<Result<(), CommandError>>, RouteError> {
+        let action = self.action_description(global_key)?;
+        self.handle(&action.device_id, &action.port_id)?
+            .invoke_action(id, &action.device_id, &action.description.name, deadline)
+            .map_err(|error| Self::submit_error(&action.device_id, &action.port_id, error))
+    }
+
+    fn handle(&self, device_id: &str, port_id: &str) -> Result<&PortHandle, RouteError> {
         let port = self
             .registry
-            .port(&parameter.port_id)
+            .port(port_id)
             .expect("registered device must reference a registered port");
         // Let PortHandle check stop_reason atomically with queue admission. A
         // separate availability check would race with shutdown or driver failure.
@@ -164,21 +188,21 @@ impl CommandRouter {
                 unreachable!("a registered port without a handle is unavailable")
             };
             RouteError::Unavailable {
-                device_id: parameter.device_id.clone(),
-                port_id: parameter.port_id.clone(),
+                device_id: device_id.into(),
+                port_id: port_id.into(),
                 reason,
             }
         })
     }
 
-    fn submit_error(parameter: &RegisteredParameter, error: SubmitError) -> RouteError {
+    fn submit_error(device_id: &str, port_id: &str, error: SubmitError) -> RouteError {
         match error {
             SubmitError::Full => RouteError::QueueFull {
-                port_id: parameter.port_id.clone(),
+                port_id: port_id.into(),
             },
             SubmitError::Stopped(reason) => RouteError::Stopped {
-                device_id: parameter.device_id.clone(),
-                port_id: parameter.port_id.clone(),
+                device_id: device_id.into(),
+                port_id: port_id.into(),
                 reason,
             },
         }

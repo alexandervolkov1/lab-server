@@ -237,7 +237,7 @@ fn boolean_tcp_describe_set_and_get_preserve_types() {
     assert_eq!(
         fixture.request(json!({"op":"describe"})),
         json!({
-            "id":2, "status":"ok", "parameters":[
+            "id":2, "status":"ok", "actions":[], "parameters":[
                 {"key":"enabled", "type":"boolean", "min":null, "max":null, "unit":"", "writable":true, "poll_period_ns":null},
                 {"key":"fault", "type":"boolean", "min":null, "max":null, "unit":"", "writable":false, "poll_period_ns":10_000_000},
             ],

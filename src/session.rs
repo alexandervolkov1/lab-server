@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::model::{Observation, ParameterDescription, Value};
+use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::outbound::{OutboundBuffer, is_output_error};
 use crate::pending::{Completion, Pending, Poll};
 use crate::protocol::{ParseError, Request, parse_request};
@@ -41,6 +41,19 @@ impl EnqueueError {
 /// The same session/transport serves the legacy runtime and routed devices.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
+    /// Global names for describe. Legacy backends have no actions.
+    fn actions(&self) -> Vec<ActionDescription> {
+        Vec::new()
+    }
+    fn enqueue_action(
+        &self,
+        _pending: &mut PendingRequests,
+        _id: u64,
+        _deadline: Instant,
+        _key: String,
+    ) -> Result<(), EnqueueError> {
+        Err(EnqueueError::UnknownKey)
+    }
     fn enqueue_read(
         &self,
         pending: &mut PendingRequests,
@@ -64,7 +77,7 @@ pub trait CommandBackend {
 pub(crate) fn command_error_code(error: &crate::port_worker::CommandError) -> &'static str {
     use crate::port_worker::CommandError::*;
     match error {
-        UnknownDevice | UnknownParameter => "unknown_key",
+        UnknownDevice | UnknownParameter | UnknownAction => "unknown_key",
         ReadOnly => "Parameter is read-only",
         InvalidValue => "Value does not match parameter spec",
         RuntimeTimeout => "runtime_timeout",
@@ -102,7 +115,7 @@ pub enum FinishedRequest {
             Result<crate::port_worker::DeviceObservation, crate::port_worker::CommandError>,
         >,
     },
-    RoutedSet(Completion<Result<(), crate::port_worker::CommandError>>),
+    RoutedMutation(Completion<Result<(), crate::port_worker::CommandError>>),
 }
 
 fn completion_json(completion: FinishedRequest) -> io::Result<String> {
@@ -113,7 +126,7 @@ fn completion_json(completion: FinishedRequest) -> io::Result<String> {
                 crate::observation_json(Some(id), &value.observation)
             })
         }
-        FinishedRequest::RoutedSet(completion) => routed_completion(completion, |id, ()| {
+        FinishedRequest::RoutedMutation(completion) => routed_completion(completion, |id, ()| {
             Ok(json!({ "id": id, "status": "ok" }).to_string())
         }),
         FinishedRequest::Read(Completion::Received { id, value }) => {
@@ -169,7 +182,7 @@ enum Entry {
             Result<crate::port_worker::DeviceObservation, crate::port_worker::CommandError>,
         >,
     },
-    RoutedSet {
+    RoutedMutation {
         id: u64,
         pending: Pending<Result<(), crate::port_worker::CommandError>>,
     },
@@ -189,7 +202,7 @@ impl Entry {
             Self::Read { id, .. }
             | Self::Set { id, .. }
             | Self::RoutedRead { id, .. }
-            | Self::RoutedSet { id, .. } => *id,
+            | Self::RoutedMutation { id, .. } => *id,
         }
     }
 }
@@ -282,12 +295,15 @@ impl PendingRequests {
         self.entries
             .push_back(Entry::RoutedRead { id, key, pending });
     }
-    pub(crate) fn add_routed_set(
+    /// Shared completion storage for set and invoke_action; admission must first
+    /// pass ensure_available so both consume the same per-session capacity.
+    pub(crate) fn add_routed_mutation(
         &mut self,
         id: u64,
         pending: Pending<Result<(), crate::port_worker::CommandError>>,
     ) {
-        self.entries.push_back(Entry::RoutedSet { id, pending });
+        self.entries
+            .push_back(Entry::RoutedMutation { id, pending });
     }
 
     pub fn poll(&mut self, now: Instant) -> Vec<FinishedRequest> {
@@ -307,12 +323,12 @@ impl PendingRequests {
                         finished.push(FinishedRequest::RoutedRead { key, completion })
                     }
                 },
-                Entry::RoutedSet { id, pending } => match pending.poll(now) {
-                    Poll::Waiting(pending) => {
-                        self.entries.push_back(Entry::RoutedSet { id, pending })
-                    }
+                Entry::RoutedMutation { id, pending } => match pending.poll(now) {
+                    Poll::Waiting(pending) => self
+                        .entries
+                        .push_back(Entry::RoutedMutation { id, pending }),
                     Poll::Finished(completion) => {
-                        finished.push(FinishedRequest::RoutedSet(completion))
+                        finished.push(FinishedRequest::RoutedMutation(completion))
                     }
                 },
                 Entry::Read { id, pending } => match pending.poll(now) {
@@ -625,6 +641,15 @@ impl<Input> SessionState<Input> {
         id: u64,
         catalog: &HashMap<String, ParameterDescription>,
     ) -> io::Result<()> {
+        self.describe_with_actions(id, catalog, Vec::new())
+    }
+
+    fn describe_with_actions(
+        &mut self,
+        id: u64,
+        catalog: &HashMap<String, ParameterDescription>,
+        mut actions: Vec<ActionDescription>,
+    ) -> io::Result<()> {
         if self.pending.contains_id(id) {
             return self.queue_error(id, "duplicate_id");
         }
@@ -659,11 +684,18 @@ impl<Input> SessionState<Input> {
             })
             .collect();
 
+        actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        let actions: Vec<_> = actions
+            .into_iter()
+            .map(|action| json!({ "key": action.name, "description": action.description }))
+            .collect();
+
         self.queue_response(
             &json!({
                 "id": id,
                 "status": "ok",
-                "parameters": parameters
+                "parameters": parameters,
+                "actions": actions
             })
             .to_string(),
         )
@@ -736,6 +768,7 @@ impl<Input> SessionState<Input> {
                 | Request::Ping { id }
                 | Request::Get { id, .. }
                 | Request::Set { id, .. }
+                | Request::InvokeAction { id, .. }
                 | Request::Subscribe { id, .. }
                 | Request::Unsubscribe { id, .. },
             ) => Some(*id),
@@ -768,7 +801,7 @@ impl<Input> SessionState<Input> {
             }
 
             ParsedMessage::Request(Request::Describe { id }) => {
-                self.dispatch_describe(id, catalog)?;
+                self.describe_with_actions(id, catalog, commands.actions())?;
                 Ok(())
             }
 
@@ -806,6 +839,18 @@ impl<Input> SessionState<Input> {
             ParsedMessage::Request(Request::Set { id, key, value }) => {
                 self.dispatch_set(id, key, value, commands, catalog, now)?;
                 Ok(())
+            }
+
+            ParsedMessage::Request(Request::InvokeAction { id, key }) => {
+                match commands.enqueue_action(
+                    &mut self.pending,
+                    id,
+                    now + Duration::from_secs(10),
+                    key,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => self.queue_error(id, error.code()),
+                }
             }
 
             ParsedMessage::InvalidRequest { frame, error } => {

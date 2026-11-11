@@ -31,6 +31,13 @@ pub struct ParameterDescription {
     pub default_poll_period: Option<Duration>,
 }
 
+/// A driver-local action without arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDescription {
+    pub name: String,
+    pub description: String,
+}
+
 impl Spec {
     pub fn valid(&self) -> bool {
         match self {

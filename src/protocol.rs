@@ -7,13 +7,16 @@
 //! JSON, duplicate JSON fields and invalid IDs do not consume an ID. Clients
 //! must reconnect before exhausting u64; independent connections have independent IDs.
 //!
-//! Set is validated against the catalog before queueing. Its ten-second deadline
-//! includes queue time. Starting driver.write and cancelling a queued Set are
-//! mutually exclusive: `runtime_timeout` means it did not start. Once started,
-//! a timeout, lost reply channel, or untyped driver failure produces
-//! `outcome_unknown`; clients must not assume the write failed or blindly retry.
+//! Set and invoke_action are validated against their catalogs before queueing.
+//! Their ten-second deadlines include queue time. Starting a driver mutation and
+//! cancelling the queued operation are mutually exclusive: `runtime_timeout`
+//! means it did not start. Once started, a timeout, lost reply channel, or driver
+//! failure produces `outcome_unknown`; clients must not assume the operation
+//! failed or blindly retry.
 //! An available definitive reply wins over timeout; late replies never produce
 //! another response. Driver validation remains a second line of defense.
+//! invoke_action accepts a global key and no arguments; describe adds a separate
+//! actions array of {key, description}, preserving parameters and version 1.
 //!
 //! Subscription activation is linearized against the fanout publication counter,
 //! independently for each newly subscribed key. Publications at or before that
@@ -188,6 +191,7 @@ pub enum RequestOp {
     Describe,
     Get,
     Set,
+    InvokeAction,
     Subscribe,
     Unsubscribe,
     Ping,
@@ -222,6 +226,7 @@ pub fn parse_request_header(
         Some("describe") => RequestOp::Describe,
         Some("get") => RequestOp::Get,
         Some("set") => RequestOp::Set,
+        Some("invoke_action") => RequestOp::InvokeAction,
         Some("subscribe") => RequestOp::Subscribe,
         Some("unsubscribe") => RequestOp::Unsubscribe,
         Some("ping") => RequestOp::Ping,
@@ -332,6 +337,10 @@ pub enum Request {
         key: String,
         value: crate::model::Value,
     },
+    InvokeAction {
+        id: u64,
+        key: String,
+    },
     Subscribe {
         id: u64,
         keys: Vec<String>,
@@ -361,6 +370,11 @@ pub fn parse_request(frame: &str) -> Result<Request, ParseError> {
         RequestOp::Get => {
             let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
             Ok(Request::Get { id, key })
+        }
+
+        RequestOp::InvokeAction => {
+            let key = parse_parameter_key(&object).map_err(ParseError::Request)?;
+            Ok(Request::InvokeAction { id, key })
         }
 
         RequestOp::Set => {
@@ -653,6 +667,7 @@ mod tests {
             ("describe", RequestOp::Describe),
             ("get", RequestOp::Get),
             ("set", RequestOp::Set),
+            ("invoke_action", RequestOp::InvokeAction),
             ("subscribe", RequestOp::Subscribe),
             ("unsubscribe", RequestOp::Unsubscribe),
             ("ping", RequestOp::Ping),

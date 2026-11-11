@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 
-use crate::model::{ParameterDescription, Value};
+use crate::model::{ActionDescription, ParameterDescription, Value};
 
 pub mod arduino;
 
@@ -79,6 +79,19 @@ impl<T: Read + Write> DeviceIo for BufReader<T> {
 
 pub trait Driver {
     fn parameters(&self) -> Vec<ParameterDescription>;
+
+    fn actions(&self) -> Vec<ActionDescription> {
+        Vec::new()
+    }
+
+    /// The same complete-transaction contract as write applies. An error does
+    /// not prove the action had no effect. Never retry an uncertain transaction.
+    fn invoke_action(&mut self, action: &str, _io: &mut dyn DeviceIo) -> Result<(), DriverError> {
+        Err(DriverError::new(
+            format!("unsupported action {action:?}"),
+            PortState::Synchronized,
+        ))
+    }
 
     /// Each call owns the entire transaction. Ok means a complete, correlated
     /// response has been consumed; no response tail may be left for another driver.

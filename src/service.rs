@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::command_router::{CommandRouter, RouteError};
 use crate::device_registry::{Availability, DeviceRegistry};
 use crate::fanout::{ObservationFanout, ObservationReceiver};
-use crate::model::{Observation, ParameterDescription, Value};
+use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
@@ -151,7 +151,9 @@ impl DeviceService {
 
 fn route_error(error: RouteError) -> EnqueueError {
     match error {
-        RouteError::UnknownSignal(_) | RouteError::UnknownDevice(_) => EnqueueError::UnknownKey,
+        RouteError::UnknownSignal(_)
+        | RouteError::UnknownDevice(_)
+        | RouteError::UnknownAction(_) => EnqueueError::UnknownKey,
         RouteError::Unavailable { .. } | RouteError::Stopped { .. } => {
             EnqueueError::RuntimeUnavailable
         }
@@ -162,6 +164,31 @@ fn route_error(error: RouteError) -> EnqueueError {
 }
 
 impl CommandBackend for DeviceService {
+    fn actions(&self) -> Vec<ActionDescription> {
+        self.registry()
+            .actions()
+            .map(|action| ActionDescription {
+                name: action.global_key.clone(),
+                description: action.description.description.clone(),
+            })
+            .collect()
+    }
+
+    fn enqueue_action(
+        &self,
+        requests: &mut PendingRequests,
+        id: u64,
+        deadline: Instant,
+        key: String,
+    ) -> Result<(), EnqueueError> {
+        requests.ensure_available(id)?;
+        let pending = self
+            .router
+            .invoke_action(id, &key, deadline)
+            .map_err(route_error)?;
+        requests.add_routed_mutation(id, pending);
+        Ok(())
+    }
     fn enqueue_read(
         &self,
         requests: &mut PendingRequests,
@@ -190,7 +217,7 @@ impl CommandBackend for DeviceService {
             .router
             .set(id, &key, value, deadline)
             .map_err(route_error)?;
-        requests.add_routed_set(id, pending);
+        requests.add_routed_mutation(id, pending);
         Ok(())
     }
     fn available(&self, key: &str) -> bool {

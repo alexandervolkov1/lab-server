@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::driver::{DeviceIo, Driver, DriverError, PortState};
-use crate::model::{Observation, ParameterDescription, Value};
+use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::pending::{Pending, SetExecution};
 
 mod scheduler;
@@ -22,6 +22,7 @@ pub struct DeviceInstance {
     id: String,
     driver: Box<dyn Driver + Send>,
     parameters: Vec<ParameterDescription>,
+    actions: Vec<ActionDescription>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,10 +66,21 @@ impl DeviceInstance {
             }
             validate_period(parameter.default_poll_period)?;
         }
+        let actions = driver.actions();
+        let mut names = HashSet::new();
+        for action in &actions {
+            if action.name.trim().is_empty() || !names.insert(&action.name) {
+                return Err(BuildError(format!(
+                    "device {id:?}: invalid or duplicate action {:?}",
+                    action.name
+                )));
+            }
+        }
         Ok(Self {
             id,
             driver,
             parameters,
+            actions,
         })
     }
 
@@ -80,6 +92,10 @@ impl DeviceInstance {
     /// snapshot after configuration, before starting the worker.
     pub fn parameters(&self) -> &[ParameterDescription] {
         &self.parameters
+    }
+
+    pub fn actions(&self) -> &[ActionDescription] {
+        &self.actions
     }
 
     /// Configure local polling without coupling this core to TOML or global keys.
@@ -134,6 +150,7 @@ pub enum StopReason {
 pub enum CommandError {
     UnknownDevice,
     UnknownParameter,
+    UnknownAction,
     ReadOnly,
     InvalidValue,
     RuntimeTimeout,
@@ -146,6 +163,7 @@ impl fmt::Display for CommandError {
         match self {
             Self::UnknownDevice => f.write_str("unknown_device"),
             Self::UnknownParameter => f.write_str("unknown_parameter"),
+            Self::UnknownAction => f.write_str("unknown_action"),
             Self::ReadOnly => f.write_str("Parameter is read-only"),
             Self::InvalidValue => f.write_str("Value does not match parameter spec"),
             Self::RuntimeTimeout => f.write_str("runtime_timeout"),
@@ -186,6 +204,12 @@ enum Command {
         execution: Arc<SetExecution>,
         reply: mpsc::SyncSender<Result<(), CommandError>>,
     },
+    InvokeAction {
+        device: String,
+        action: String,
+        execution: Arc<SetExecution>,
+        reply: mpsc::SyncSender<Result<(), CommandError>>,
+    },
     Wake,
 }
 
@@ -197,6 +221,9 @@ impl Command {
                 let _ = reply.try_send(Err(error));
             }
             Self::Set {
+                reply, execution, ..
+            }
+            | Self::InvokeAction {
                 reply, execution, ..
             } => execution.complete(|| {
                 let _ = reply.try_send(Err(error));
@@ -267,6 +294,26 @@ impl PortHandle {
             device: device.into(),
             parameter: parameter.into(),
             value,
+            execution: execution.clone(),
+            reply,
+        })?;
+        Ok(Pending::new(id, deadline, receiver).with_execution(execution))
+    }
+
+    /// Uses the same bounded queue and atomic timeout/start boundary as set.
+    /// Dropping Pending does not cancel the action or establish its outcome.
+    pub fn invoke_action(
+        &self,
+        id: u64,
+        device: impl Into<String>,
+        action: impl Into<String>,
+        deadline: Instant,
+    ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let execution = SetExecution::new(deadline);
+        self.submit(Command::InvokeAction {
+            device: device.into(),
+            action: action.into(),
             execution: execution.clone(),
             reply,
         })?;
@@ -574,6 +621,46 @@ impl<P: DeviceIo> PortWorker<P> {
                             self.devices[device]
                                 .driver
                                 .write(&name, &value, &mut self.io)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(DriverError::new(
+                                "driver panicked",
+                                PortState::Desynchronized,
+                            ))
+                        });
+                        result.map_err(|error| {
+                            self.record_error(&error);
+                            CommandError::OutcomeUnknown
+                        })
+                    });
+                execution.complete(|| {
+                    let _ = reply.try_send(result);
+                });
+            }
+            Command::InvokeAction {
+                device,
+                action,
+                execution,
+                reply,
+            } => {
+                let result = self
+                    .devices
+                    .iter()
+                    .position(|item| item.id == device)
+                    .ok_or(CommandError::UnknownDevice)
+                    .and_then(|device| {
+                        if !self.devices[device]
+                            .actions
+                            .iter()
+                            .any(|a| a.name == action)
+                        {
+                            return Err(CommandError::UnknownAction);
+                        }
+                        self.begin(Some(&execution))?;
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            self.devices[device]
+                                .driver
+                                .invoke_action(&action, &mut self.io)
                         }))
                         .unwrap_or_else(|_| {
                             Err(DriverError::new(
