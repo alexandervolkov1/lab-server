@@ -3,8 +3,6 @@ use crate::model::{Observation, ParameterDescription, Value};
 use crate::{connection, runtime};
 use std::sync::{Arc, mpsc};
 
-pub use crate::protocol::observation_json;
-
 pub fn queue_read(
     commands: &mpsc::SyncSender<runtime::DeviceCommand>,
     description: ParameterDescription,

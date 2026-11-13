@@ -10,7 +10,9 @@ use lab_server::config::{DeviceConfig, ServerConfig};
 use lab_server::device_registry::Availability;
 use lab_server::driver::{DeviceIo, Driver, DriverError};
 use lab_server::model::{ParameterDescription, Spec, Value};
-use lab_server::startup::{DriverSetup, StartedServer, create_driver, parse_config_path, start_with};
+use lab_server::startup::{
+    DriverSetup, StartedServer, create_driver, parse_config_path, start_with,
+};
 use lab_server::tcp::MultiDeviceTcp;
 use serde_json::{Value as Json, json};
 

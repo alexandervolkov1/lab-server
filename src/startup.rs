@@ -33,9 +33,7 @@ const IDLE_WAIT: Duration = Duration::from_millis(5);
 pub fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> io::Result<PathBuf> {
     let mut args = args.into_iter();
     match (args.next(), args.next(), args.next()) {
-        (Some(flag), Some(path), None) if flag == "--config" && !path.is_empty() => {
-            Ok(path.into())
-        }
+        (Some(flag), Some(path), None) if flag == "--config" && !path.is_empty() => Ok(path.into()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: lab-server --config <path.toml>",
