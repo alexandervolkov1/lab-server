@@ -140,7 +140,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             field: format!("devices[{index}] ({:?})", device.id),
             message,
         };
-        let setup = factory(device).map_err(&invalid)?;
+        let setup = factory(device).map_err(invalid)?;
         let mut instance = DeviceInstance::new_boxed(&device.id, setup.driver)
             .map_err(|error| invalid(error.to_string()))?;
         for (parameter, millis) in &device.poll_periods_ms {

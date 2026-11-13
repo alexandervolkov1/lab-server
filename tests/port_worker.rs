@@ -268,7 +268,7 @@ fn different_drivers_share_one_io_with_independent_state_and_local_names() {
             .iter()
             .all(|call| call.io_address == trace.calls[0].io_address)
     );
-    for pair in trace.sends.chunks_exact(2) {
+    for pair in trace.sends.as_chunks::<2>().0 {
         assert_eq!(&pair[0][..3], &pair[1][..3]);
     }
 }

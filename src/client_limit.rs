@@ -21,7 +21,7 @@ impl ClientSlots {
 
     pub fn try_acquire(&self) -> Option<ClientSlot> {
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_CLIENTS).then_some(count + 1)
             })
             .ok()?;

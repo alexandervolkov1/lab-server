@@ -709,7 +709,7 @@ impl<P: DeviceIo> PortWorker<P> {
                 // Saturate instead of wrapping and making old loss look absent.
                 let _ = self
                     .loss_epoch
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
                         Some(epoch.saturating_add(1))
                     });
                 None
