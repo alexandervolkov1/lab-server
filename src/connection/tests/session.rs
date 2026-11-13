@@ -185,6 +185,7 @@ fn session_encodes_completed_read_and_set() {
     let TestCommand::Set(command) = commands.try_recv().unwrap() else {
         panic!("expected Set command")
     };
+    assert!(command.execution.try_start());
     command.complete(Err(CommandError::InvalidValue)).unwrap();
 
     session.collect_ready(now).unwrap();
