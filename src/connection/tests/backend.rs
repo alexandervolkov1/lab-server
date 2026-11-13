@@ -4,6 +4,7 @@
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
+use super::Cell;
 use crate::model::{ParameterDescription, Value};
 use crate::pending::{Pending, SetExecution};
 use crate::port_worker::{CommandError, DeviceObservation};
@@ -41,15 +42,24 @@ pub(super) enum TestCommand {
 
 pub(super) struct TestBackend {
     commands: mpsc::SyncSender<TestCommand>,
+    /// Attempts to reach the command queue, including full/closed failures.
+    pub submit_attempts: Cell<usize>,
 }
 
 impl TestBackend {
     pub fn new(capacity: usize) -> (Self, mpsc::Receiver<TestCommand>) {
         let (commands, receiver) = mpsc::sync_channel(capacity);
-        (Self { commands }, receiver)
+        (
+            Self {
+                commands,
+                submit_attempts: Cell::new(0),
+            },
+            receiver,
+        )
     }
 
     fn submit(&self, command: TestCommand) -> Result<(), EnqueueError> {
+        self.submit_attempts.set(self.submit_attempts.get() + 1);
         self.commands
             .try_send(command)
             .map_err(|error| match error {

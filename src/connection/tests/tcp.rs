@@ -1,3 +1,4 @@
+use super::backend::{TestBackend, TestCommand};
 use super::*;
 
 #[test]
@@ -96,13 +97,20 @@ fn tcp_clean_eof_preserves_pending_response() {
     let (mut connection, mut client) = loopback_pair();
     let now = Instant::now();
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-
-    connection
-        .session
-        .pending
-        .add_set(51, now + Duration::from_secs(10), |_| Ok(reply_rx))
+    let (backend, commands) = TestBackend::new(1);
+    backend
+        .enqueue_set(
+            &mut connection.session.pending,
+            51,
+            now + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(command.execution.try_start());
 
     client.shutdown(Shutdown::Write).unwrap();
 
@@ -110,7 +118,7 @@ fn tcp_clean_eof_preserves_pending_response() {
     assert!(!connection.session.is_terminal());
     assert_eq!(connection.session.pending.len(), 1);
 
-    reply_tx.send(Ok(())).unwrap();
+    command.complete(Ok(())).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
 
@@ -177,7 +185,7 @@ fn tcp_flushes_terminal_error_before_close() {
     let (mut connection, mut client) = loopback_pair();
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     client
         .write_all(b"{\"id\":23,\"op\":\"ping\"}\n{\"id\":24")
@@ -247,15 +255,21 @@ fn tcp_sends_completed_set_without_new_input() {
     let (mut connection, client) = loopback_pair();
     let now = Instant::now();
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-
-    connection
-        .session
-        .pending
-        .add_set(13, now + Duration::from_secs(10), |_| Ok(reply_rx))
+    let (backend, commands) = TestBackend::new(1);
+    backend
+        .enqueue_set(
+            &mut connection.session.pending,
+            13,
+            now + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
-
-    reply_tx.send(Ok(())).unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(command.execution.try_start());
+    command.complete(Ok(())).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
 
@@ -292,28 +306,36 @@ fn drive_once_drains_buffer_after_pending_output_overflow() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);
 
-    let (first_tx, first_rx) = mpsc::channel();
-    let (second_tx, second_rx) = mpsc::channel();
-
-    connection
-        .session
-        .pending
-        .add_set(1, deadline, |_| Ok(first_rx))
+    command_tx
+        .enqueue_set(
+            &mut connection.session.pending,
+            1,
+            deadline,
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
-
-    connection
-        .session
-        .pending
-        .add_set(2, deadline, |_| Ok(second_rx))
+    command_tx
+        .enqueue_set(
+            &mut connection.session.pending,
+            2,
+            deadline,
+            "power".into(),
+            Value::Integer(30),
+        )
         .unwrap();
-
-    first_tx.send(Ok(())).unwrap();
-    second_tx.send(Ok(())).unwrap();
+    for _ in 0..2 {
+        let TestCommand::Set(command) = command_rx.try_recv().unwrap() else {
+            panic!("expected Set command")
+        };
+        assert!(command.execution.try_start());
+        command.complete(Ok(())).unwrap();
+    }
 
     let timeout = Instant::now() + Duration::from_secs(1);
 
@@ -354,7 +376,7 @@ fn drive_once_closes_when_response_exceeds_output_capacity() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     client.write_all(b"{\"id\":81,\"op\":\"ping\"}\n").unwrap();
 
@@ -392,7 +414,7 @@ fn tcp_accepts_next_request_while_set_is_pending() {
     let (mut connection, mut client) = loopback_pair();
     let catalog = power_catalog();
 
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     client
         .write_all(b"{\"id\":10,\"op\":\"set\",\"key\":\"power\",\"value\":25}\n")
@@ -427,9 +449,10 @@ fn tcp_accepts_next_request_while_set_is_pending() {
     );
 
     match command {
-        crate::runtime::DeviceCommand::Set(command) => {
+        TestCommand::Set(command) => {
             assert_eq!(command.value, Value::Integer(25));
-            command.reply.send(Ok(())).unwrap();
+            assert!(command.execution.try_start());
+            command.complete(Ok(())).unwrap();
         }
 
         _ => panic!("expected Set command"),
@@ -469,17 +492,20 @@ fn drive_once_waits_for_pending_after_clean_eof() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
-
-    let (reply_tx, reply_rx) = mpsc::channel();
-
-    connection
-        .session
-        .pending
-        .add_set(61, Instant::now() + Duration::from_secs(10), |_| {
-            Ok(reply_rx)
-        })
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
+    command_tx
+        .enqueue_set(
+            &mut connection.session.pending,
+            61,
+            Instant::now() + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
+    let TestCommand::Set(command) = command_rx.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(command.execution.try_start());
 
     client.shutdown(Shutdown::Write).unwrap();
 
@@ -502,7 +528,7 @@ fn drive_once_waits_for_pending_after_clean_eof() {
 
     assert_eq!(connection.session.pending.len(), 1);
 
-    reply_tx.send(Ok(())).unwrap();
+    command.complete(Ok(())).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
 
@@ -539,7 +565,7 @@ fn drive_once_drains_terminal_error_before_close() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     client
         .write_all(b"{\"id\":71,\"op\":\"ping\"}\n\n")

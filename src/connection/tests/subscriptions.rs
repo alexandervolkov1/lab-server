@@ -1,3 +1,4 @@
+use super::backend::TestBackend;
 use super::*;
 
 #[test]
@@ -148,7 +149,7 @@ fn dispatches_subscription_requests_and_responses() {
     catalog.insert(heater.id.clone(), heater);
 
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let input = concat!(
         "{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\",\"configuration\"]}\n",
