@@ -1,4 +1,6 @@
+use super::backend::{TestBackend, TestCommand};
 use super::*;
+use crate::port_worker::{CommandError, DeviceObservation};
 
 #[test]
 fn ids_are_monotonic_across_operations_and_invalid_requests() {
@@ -13,7 +15,7 @@ fn ids_are_monotonic_across_operations_and_invalid_requests() {
         r#"{"id":9,"op":"ping"}"#,
     ] {
         let mut session = ClientSession::new(2, 2048);
-        let (tx, rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+        let (tx, rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
         let catalog = power_catalog();
         let latest = Mutex::new(HashMap::new());
         for frame in [
@@ -26,10 +28,11 @@ fn ids_are_monotonic_across_operations_and_invalid_requests() {
                     .unwrap();
             }
         }
-        let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+        let TestCommand::Set(command) = rx.try_recv().unwrap() else {
             panic!()
         };
-        command.reply.send(Ok(())).unwrap();
+        assert!(command.execution.try_start());
+        command.complete(Ok(())).unwrap();
         session.collect_ready(now).unwrap();
         for event in session.receive(b"{\"id\":10,\"op\":\"ping\"}\n") {
             session
@@ -57,7 +60,7 @@ fn ids_are_monotonic_across_operations_and_invalid_requests() {
 
 #[test]
 fn request_ids_are_independent_between_clients() {
-    let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (tx, _rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
     for _ in 0..2 {
         let mut session = ClientSession::new(1, 128);
         session
@@ -151,24 +154,38 @@ fn session_encodes_completed_read_and_set() {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);
 
-    let (read_tx, read_rx) = mpsc::channel();
-    let (set_tx, set_rx) = mpsc::channel();
-
-    session
-        .pending
-        .add_read(7, deadline, || Ok(read_rx))
+    let (backend, commands) = TestBackend::new(2);
+    let mut description = get_catalog()["configuration"].clone();
+    description.id = "sensor/sample_temperature".into();
+    backend
+        .enqueue_read(&mut session.pending, 7, deadline, description)
         .unwrap();
-
-    session
-        .pending
-        .add_set(8, deadline, |_| Ok(set_rx))
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            8,
+            deadline,
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
 
     session.collect_ready(now).unwrap();
     assert!(session.outbound.is_empty());
 
-    read_tx.send(observation()).unwrap();
-    set_tx.send(Err("invalid_value".to_owned())).unwrap();
+    let TestCommand::Read { reply, .. } = commands.try_recv().unwrap() else {
+        panic!("expected Read command")
+    };
+    reply
+        .send(Ok(DeviceObservation {
+            device_id: "sensor".into(),
+            observation: observation(),
+        }))
+        .unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    command.complete(Err(CommandError::InvalidValue)).unwrap();
 
     session.collect_ready(now).unwrap();
 
@@ -185,13 +202,19 @@ fn session_encodes_completed_read_and_set() {
 
     assert_eq!(responses[0]["id"], 7);
     assert_eq!(responses[0]["status"], "ok");
+    assert_eq!(responses[0]["key"], "sensor/sample_temperature");
     assert_eq!(responses[0]["value"], 20.0);
 
     assert_eq!(responses[1]["id"], 8);
     assert_eq!(responses[1]["status"], "error");
-    assert_eq!(responses[1]["error"], "invalid_value");
+    assert_eq!(responses[1]["error"], "Value does not match parameter spec");
 
     assert!(session.pending.is_empty());
+    session.collect_ready(deadline).unwrap();
+    assert!(
+        session.outbound.is_empty(),
+        "completed requests must not reply twice"
+    );
 }
 
 #[test]
@@ -199,17 +222,25 @@ fn session_encodes_timeout_and_disconnection() {
     let mut session = ClientSession::new(2, 1024);
     let now = Instant::now();
 
-    let (read_tx, read_rx) = mpsc::channel();
-    drop(read_tx);
-
-    let (_set_tx, set_rx) = mpsc::channel();
-
-    session
-        .pending
-        .add_read(1, now + Duration::from_secs(10), || Ok(read_rx))
+    let (backend, commands) = TestBackend::new(2);
+    backend
+        .enqueue_read(
+            &mut session.pending,
+            1,
+            now + Duration::from_secs(10),
+            get_catalog()["configuration"].clone(),
+        )
         .unwrap();
-
-    session.pending.add_set(2, now, |_| Ok(set_rx)).unwrap();
+    drop(commands.try_recv().unwrap());
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            2,
+            now,
+            "power".into(),
+            Value::Integer(20),
+        )
+        .unwrap();
 
     session.collect_ready(now).unwrap();
 
@@ -229,6 +260,15 @@ fn session_encodes_timeout_and_disconnection() {
 
     assert_eq!(responses[1]["id"], 2);
     assert_eq!(responses[1]["error"], "runtime_timeout");
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(!command.execution.try_start());
+    assert!(session.pending.is_empty());
+    session
+        .collect_ready(now + Duration::from_secs(11))
+        .unwrap();
+    assert!(session.outbound.is_empty());
 }
 
 #[test]
@@ -236,14 +276,21 @@ fn output_overflow_makes_session_terminal() {
     let mut session = ClientSession::new(1, 2);
     let now = Instant::now();
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-
-    session
-        .pending
-        .add_set(1, now + Duration::from_secs(10), |_| Ok(reply_rx))
+    let (backend, commands) = TestBackend::new(1);
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            1,
+            now + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
-
-    reply_tx.send(Ok(())).unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(command.execution.try_start());
+    command.complete(Ok(())).unwrap();
 
     assert!(session.collect_ready(now).is_err());
     assert!(session.is_terminal());
@@ -311,7 +358,7 @@ fn validates_set_spec_before_queueing() {
         let description = catalog.get_mut("power").unwrap();
         description.writable = writable;
         description.spec = spec;
-        let (tx, rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+        let (tx, rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
         let mut session = ClientSession::new(1, 1024);
         session
             .dispatch_set(1, "power".into(), value, &tx, &catalog, Instant::now())
@@ -326,10 +373,7 @@ fn validates_set_spec_before_queueing() {
                 expected
             );
         } else {
-            assert!(matches!(
-                rx.try_recv(),
-                Ok(crate::runtime::DeviceCommand::Set(_))
-            ));
+            assert!(matches!(rx.try_recv(), Ok(TestCommand::Set(_))));
             assert!(rx.try_recv().is_err());
             assert_eq!(session.pending.len(), 1);
         }
@@ -342,7 +386,7 @@ fn dispatch_set_rejects_requests_before_device_queue() {
     let catalog = power_catalog();
 
     let mut session = ClientSession::new(1, 512);
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     session
         .dispatch_set(
@@ -410,10 +454,11 @@ fn dispatch_set_rejects_requests_before_device_queue() {
     assert_eq!(responses[2]["error"], "unknown_key");
 
     match first_command {
-        crate::runtime::DeviceCommand::Set(command) => {
+        TestCommand::Set(command) => {
             assert_eq!(command.parameter, "power");
             assert_eq!(command.value, Value::Integer(25));
-            command.reply.send(Ok(())).unwrap();
+            assert!(command.execution.try_start());
+            command.complete(Ok(())).unwrap();
         }
 
         _ => panic!("expected Set command"),
@@ -429,7 +474,7 @@ fn dispatch_get_uses_latest_for_polled_signal() {
     let mut session = ClientSession::new(1, 512);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let now = Instant::now();
 
@@ -491,7 +536,7 @@ fn dispatch_get_queues_on_demand_read() {
     let mut session = ClientSession::new(1, 512);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let now = Instant::now();
 
@@ -512,16 +557,19 @@ fn dispatch_get_queues_on_demand_read() {
     let command = command_rx.try_recv().unwrap();
 
     match command {
-        crate::runtime::DeviceCommand::Read { description, reply } => {
+        TestCommand::Read { description, reply } => {
             assert_eq!(description.id, "configuration");
 
             reply
-                .send(Observation {
-                    source: "configuration".to_owned(),
-                    unit: "".to_owned(),
-                    completed_at: UNIX_EPOCH,
-                    reading: Ok(Value::Integer(30)),
-                })
+                .send(Ok(DeviceObservation {
+                    device_id: "test-device".into(),
+                    observation: Observation {
+                        source: "configuration".to_owned(),
+                        unit: "".to_owned(),
+                        completed_at: UNIX_EPOCH,
+                        reading: Ok(Value::Integer(30)),
+                    },
+                }))
                 .unwrap();
         }
 
@@ -547,7 +595,7 @@ fn cached_get_works_while_pending_queue_is_full() {
     let mut session = ClientSession::new(1, 512);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let now = Instant::now();
 
@@ -614,7 +662,7 @@ fn dispatch_incoming_routes_ping_get_and_set() {
     catalog.extend(power_catalog());
 
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let input = concat!(
         "{\"id\":1,\"op\":\"ping\"}\n",
@@ -637,7 +685,7 @@ fn dispatch_incoming_routes_ping_get_and_set() {
     assert_eq!(session.pending.len(), 1);
 
     match command_rx.try_recv().unwrap() {
-        crate::runtime::DeviceCommand::Set(command) => {
+        TestCommand::Set(command) => {
             assert_eq!(command.parameter, "power");
             assert_eq!(command.value, Value::Integer(25));
         }
@@ -672,7 +720,7 @@ fn dispatch_incoming_handles_subscribe_and_invalid_request() {
     let mut session = ClientSession::new(2, 512);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let input = concat!(
         "{\"id\":4,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n",
@@ -728,14 +776,17 @@ fn hello_responds_immediately_and_rejects_pending_id() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
-    let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
-
-    session
-        .pending
-        .add_read(7, now + Duration::from_secs(10), || Ok(pending_rx))
+    command_tx
+        .enqueue_read(
+            &mut session.pending,
+            7,
+            now + Duration::from_secs(10),
+            get_catalog()["configuration"].clone(),
+        )
         .unwrap();
+    let _pending_command = command_rx.try_recv().unwrap();
 
     let input = concat!(
         "{\"id\":1,\"op\":\"hello\"}\n",
@@ -789,14 +840,17 @@ fn describe_serializes_catalog_without_device_commands() {
     catalog.extend(power_catalog());
 
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
-    let (_pending_tx, pending_rx) = mpsc::channel::<Observation>();
-
-    session
-        .pending
-        .add_read(7, now + Duration::from_secs(10), || Ok(pending_rx))
+    command_tx
+        .enqueue_read(
+            &mut session.pending,
+            7,
+            now + Duration::from_secs(10),
+            get_catalog()["configuration"].clone(),
+        )
         .unwrap();
+    let _pending_command = command_rx.try_recv().unwrap();
 
     let input = concat!(
         "{\"id\":42,\"op\":\"describe\"}\n",
@@ -862,7 +916,7 @@ fn invalid_requests_return_codes_without_ambiguous_ids() {
     let mut session = ClientSession::new(2, 4096);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let input = concat!(
         "{\"id\":10,\"op\":\"unknown\"}\n",
@@ -871,11 +925,12 @@ fn invalid_requests_return_codes_without_ambiguous_ids() {
         "not-json\n",
         "[]\n",
         "{\"op\":\"ping\"}\n",
-        "{\"id\":13,\"op\":\"ping\"}\n"
+        "{\"id\":13,\"op\":\"set\",\"key\":\"power\",\"value\":null}\n",
+        "{\"id\":14,\"op\":\"ping\"}\n"
     );
 
     let incoming = session.receive(input.as_bytes());
-    assert_eq!(incoming.len(), 7);
+    assert_eq!(incoming.len(), 8);
 
     for event in incoming {
         assert!(
@@ -895,7 +950,7 @@ fn invalid_requests_return_codes_without_ambiguous_ids() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
 
-    assert_eq!(responses.len(), 7);
+    assert_eq!(responses.len(), 8);
 
     assert_eq!(responses[0]["id"], 10);
     assert_eq!(responses[0]["error"], "unsupported_op");
@@ -916,7 +971,9 @@ fn invalid_requests_return_codes_without_ambiguous_ids() {
     assert!(responses[5].get("id").is_none());
 
     assert_eq!(responses[6]["id"], 13);
-    assert_eq!(responses[6]["status"], "ok");
+    assert_eq!(responses[6]["error"], "invalid_value");
+    assert_eq!(responses[7]["id"], 14);
+    assert_eq!(responses[7]["status"], "ok");
 
     assert!(!session.is_terminal());
     assert!(session.pending.is_empty());
@@ -928,7 +985,7 @@ fn framing_error_preserves_valid_reply_before_terminal_error() {
     let mut session = ClientSession::new(2, 512);
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, command_rx) = TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
     let incoming = session.receive(b"{\"id\":1,\"op\":\"ping\"}\n\n");
 
@@ -981,12 +1038,20 @@ fn terminal_session_does_not_append_pending_responses() {
     let mut session = ClientSession::new(1, 256);
     let now = Instant::now();
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-
-    session
-        .pending
-        .add_set(7, now + Duration::from_secs(10), |_| Ok(reply_rx))
+    let (command_tx, command_rx) = TestBackend::new(1);
+    command_tx
+        .enqueue_set(
+            &mut session.pending,
+            7,
+            now + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
         .unwrap();
+    let TestCommand::Set(command) = command_rx.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+    assert!(command.execution.try_start());
 
     let incoming = session.receive(b"\n");
 
@@ -997,7 +1062,6 @@ fn terminal_session_does_not_append_pending_responses() {
 
     let catalog = HashMap::new();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
 
     for event in incoming {
         assert!(
@@ -1008,7 +1072,7 @@ fn terminal_session_does_not_append_pending_responses() {
         );
     }
 
-    reply_tx.send(Ok(())).unwrap();
+    command.complete(Ok(())).unwrap();
     session.collect_ready(now).unwrap();
 
     let mut output = Vec::new();
@@ -1046,7 +1110,8 @@ fn framing_errors_are_reported_without_request_id() {
         let mut session = ClientSession::new(1, 256);
         let catalog = HashMap::new();
         let latest = Mutex::new(HashMap::new());
-        let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+        let (command_tx, _command_rx) =
+            TestBackend::new(crate::port_worker::COMMAND_QUEUE_CAPACITY);
 
         let incoming = session.receive(&bytes);
 
@@ -1076,7 +1141,7 @@ fn framing_errors_are_reported_without_request_id() {
 
 #[test]
 fn runtime_queue_overflow_releases_pending_capacity() {
-    let (tx, _rx) = mpsc::sync_channel(1);
+    let (tx, rx) = TestBackend::new(1);
     let catalog = power_catalog();
     let mut session = ClientSession::new(4, 1024);
     let now = Instant::now();
@@ -1107,4 +1172,214 @@ fn runtime_queue_overflow_releases_pending_capacity() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["error"], "runtime_busy");
     assert_eq!(messages[1]["error"], "runtime_busy");
+
+    // Failed admission must leave capacity for a later request of the same ID.
+    let _first = rx.try_recv().unwrap();
+    session
+        .dispatch_set(2, "power".into(), Value::Integer(2), &tx, &catalog, now)
+        .unwrap();
+    assert_eq!(session.pending.len(), 2);
+    assert!(session.outbound.is_empty());
+    assert!(matches!(rx.try_recv(), Ok(TestCommand::Set(_))));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn queued_mutation_timeout_cancels_execution_and_releases_capacity() {
+    let (backend, commands) = TestBackend::new(1);
+    let mut session = ClientSession::new(1, 1024);
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            1,
+            deadline,
+            "power".into(),
+            Value::Integer(20),
+        )
+        .unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected Set command")
+    };
+
+    session.collect_ready(deadline).unwrap();
+    assert!(
+        !command.execution.try_start(),
+        "timeout must prevent execution"
+    );
+    assert!(session.pending.is_empty());
+    assert_eq!(
+        session.next_message().unwrap(),
+        Some(json!({"id":1,"status":"error","error":"runtime_timeout"}).to_string())
+    );
+    session
+        .collect_ready(deadline + Duration::from_secs(1))
+        .unwrap();
+    assert!(session.outbound.is_empty());
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            2,
+            deadline,
+            "power".into(),
+            Value::Integer(30),
+        )
+        .unwrap();
+    assert_eq!(session.pending.len(), 1);
+}
+
+#[test]
+fn started_mutation_timeout_has_unknown_outcome_and_no_second_reply() {
+    for value in [
+        Value::Integer(20),
+        Value::Boolean(true),
+        Value::Boolean(false),
+    ] {
+        let (backend, commands) = TestBackend::new(1);
+        let mut session = ClientSession::new(1, 1024);
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        backend
+            .enqueue_set(&mut session.pending, 1, deadline, "value".into(), value)
+            .unwrap();
+        let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+            panic!("expected Set command")
+        };
+        assert!(command.execution.try_start());
+        session.collect_ready(deadline).unwrap();
+        assert_eq!(
+            session.next_message().unwrap(),
+            Some(json!({"id":1,"status":"error","error":"outcome_unknown"}).to_string())
+        );
+        assert!(session.pending.is_empty());
+        assert!(matches!(
+            command.complete(Ok(())),
+            Err(mpsc::TrySendError::Disconnected(_))
+        ));
+        session
+            .collect_ready(deadline + Duration::from_secs(1))
+            .unwrap();
+        assert!(session.outbound.is_empty());
+        assert!(
+            commands.try_recv().is_err(),
+            "timeout must not enqueue a retry"
+        );
+    }
+}
+
+#[test]
+fn mutation_reply_disconnect_distinguishes_queued_and_started() {
+    for started in [false, true] {
+        let (backend, commands) = TestBackend::new(1);
+        let mut session = ClientSession::new(1, 1024);
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(3600);
+        backend
+            .enqueue_set(
+                &mut session.pending,
+                1,
+                deadline,
+                "power".into(),
+                Value::Integer(20),
+            )
+            .unwrap();
+        let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+            panic!("expected Set command")
+        };
+        let execution = command.execution.clone();
+        if started {
+            assert!(execution.try_start());
+        }
+        drop(command);
+        session.collect_ready(now).unwrap();
+        let error = if started {
+            "outcome_unknown"
+        } else {
+            "runtime_unavailable"
+        };
+        assert_eq!(
+            session.next_message().unwrap(),
+            Some(json!({"id":1,"status":"error","error":error}).to_string())
+        );
+        assert!(session.pending.is_empty());
+        assert!(!execution.try_start());
+        session.collect_ready(deadline).unwrap();
+        assert!(session.outbound.is_empty());
+        assert!(commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn available_mutation_result_wins_over_timeout_and_is_delivered_once() {
+    for result in [Ok(()), Err(CommandError::OutcomeUnknown)] {
+        let (backend, commands) = TestBackend::new(1);
+        let mut session = ClientSession::new(1, 1024);
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        backend
+            .enqueue_set(
+                &mut session.pending,
+                1,
+                deadline,
+                "power".into(),
+                Value::Integer(20),
+            )
+            .unwrap();
+        let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+            panic!("expected Set command")
+        };
+        assert!(command.execution.try_start());
+        let expected = if result.is_ok() {
+            json!({"id":1,"status":"ok"})
+        } else {
+            json!({"id":1,"status":"error","error":"outcome_unknown"})
+        };
+        command.complete(result).unwrap();
+        session.collect_ready(deadline).unwrap();
+        assert_eq!(session.next_message().unwrap(), Some(expected.to_string()));
+        assert!(session.pending.is_empty());
+        session
+            .collect_ready(deadline + Duration::from_secs(1))
+            .unwrap();
+        assert!(session.outbound.is_empty());
+        assert!(commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn closed_backend_rejects_reads_and_sets_without_consuming_pending_capacity() {
+    let (backend, commands) = TestBackend::new(1);
+    drop(commands);
+    let mut session = ClientSession::new(1, 1024);
+    let now = Instant::now();
+    let catalog = power_catalog();
+    session
+        .dispatch_set(
+            1,
+            "power".into(),
+            Value::Integer(20),
+            &backend,
+            &catalog,
+            now,
+        )
+        .unwrap();
+    session
+        .dispatch_get(
+            2,
+            "power".into(),
+            &backend,
+            &catalog,
+            &Mutex::new(HashMap::new()),
+            now,
+        )
+        .unwrap();
+    assert!(session.pending.is_empty());
+    for id in [1, 2] {
+        assert_eq!(
+            session.next_message().unwrap(),
+            Some(json!({"id":id,"status":"error","error":"runtime_unavailable"}).to_string())
+        );
+    }
+    session
+        .collect_ready(now + Duration::from_secs(11))
+        .unwrap();
+    assert!(session.outbound.is_empty());
 }
