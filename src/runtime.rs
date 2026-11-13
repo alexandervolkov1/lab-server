@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::driver::{DeviceIo, Driver};
 use crate::model::{Observation, ParameterDescription, Value};
 
-pub const COMMAND_QUEUE_CAPACITY: usize = 128;
-pub const OBSERVATION_QUEUE_CAPACITY: usize = 128;
+// Test transport fixtures still exercise this old worker. Production queue
+// capacities belong to the configured PortWorker, not this legacy runtime.
+pub use crate::port_worker::{COMMAND_QUEUE_CAPACITY, OBSERVATION_QUEUE_CAPACITY};
 
 pub struct ObservationOutput {
     sender: SyncSender<Observation>,

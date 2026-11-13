@@ -10,7 +10,7 @@ use lab_server::config::{DeviceConfig, ServerConfig};
 use lab_server::device_registry::Availability;
 use lab_server::driver::{DeviceIo, Driver, DriverError};
 use lab_server::model::{ParameterDescription, Spec, Value};
-use lab_server::startup::{DriverSetup, LaunchMode, StartedServer, create_driver, start_with};
+use lab_server::startup::{DriverSetup, StartedServer, create_driver, parse_config_path, start_with};
 use lab_server::tcp::MultiDeviceTcp;
 use serde_json::{Value as Json, json};
 
@@ -523,128 +523,22 @@ fn real_arduino_factory_uses_one_reset_delay_and_global_keys() {
 }
 
 #[test]
-fn cli_preserves_no_argument_legacy_mode_and_rejects_ambiguous_arguments() {
-    assert_eq!(LaunchMode::parse([]).unwrap(), LaunchMode::Legacy);
+fn cli_requires_config_and_rejects_ambiguous_arguments() {
     assert_eq!(
-        LaunchMode::parse(["--config".into(), "путь с пробелами.toml".into()]).unwrap(),
-        LaunchMode::Config("путь с пробелами.toml".into())
+        parse_config_path(["--config".into(), "путь с пробелами.toml".into()]).unwrap(),
+        std::path::PathBuf::from("путь с пробелами.toml")
     );
     for args in [
+        vec![],
         vec!["--config"],
         vec!["--other"],
         vec!["--config", ""],
         vec!["--config", "a", "b"],
     ] {
-        assert!(LaunchMode::parse(args.into_iter().map(Into::into)).is_err());
+        let error = parse_config_path(args.into_iter().map(Into::into)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "usage: lab-server --config <path.toml>");
     }
-}
-
-#[test]
-fn legacy_runtime_and_tcp_keep_local_arduino_catalog_and_commands() {
-    use std::collections::HashMap;
-    use std::sync::mpsc;
-
-    use lab_server::connection::TcpConnection;
-    use lab_server::driver::arduino::Arduino;
-    use lab_server::fanout::ObservationFanout;
-    use lab_server::runtime::{self, ObservationOutput, PollTask};
-
-    assert_eq!(LaunchMode::parse([]).unwrap(), LaunchMode::Legacy);
-    let driver = Arduino::new();
-    let parameters = driver.parameters();
-    let catalog: HashMap<_, _> = parameters
-        .iter()
-        .map(|p| (p.id.clone(), p.clone()))
-        .collect();
-    let tasks = parameters
-        .into_iter()
-        .filter_map(|description| {
-            Some(PollTask {
-                source: description.id.clone(),
-                period: description.default_poll_period?,
-                description,
-            })
-        })
-        .collect();
-    let probe = Arc::new(PortProbe::default());
-    let io = FakeIo {
-        input: Cursor::new(vec![]),
-        probe: probe.clone(),
-    };
-    let (observations, receiver) = mpsc::sync_channel(runtime::OBSERVATION_QUEUE_CAPACITY);
-    let (commands, command_rx) = mpsc::sync_channel(runtime::COMMAND_QUEUE_CAPACITY);
-    let fanout = Arc::new(ObservationFanout::new(128));
-    let output = ObservationOutput::new(observations, fanout.loss_epoch());
-    let worker = thread::spawn(move || runtime::run_polling(driver, io, tasks, output, command_rx));
-    let first = receiver.recv_timeout(WAIT).unwrap();
-    let first_key = first.source.clone();
-    let latest = Arc::new(Mutex::new(HashMap::from([(first_key.clone(), first)])));
-    let stop = Arc::new(AtomicBool::new(false));
-    let pump_stop = stop.clone();
-    let pump_latest = latest.clone();
-    let pump_fanout = fanout.clone();
-    let pump = thread::spawn(move || {
-        while !pump_stop.load(Ordering::Acquire) {
-            match receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(observation) => {
-                    pump_latest
-                        .lock()
-                        .unwrap()
-                        .insert(observation.source.clone(), observation.clone());
-                    pump_fanout.publish(&observation).unwrap();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    });
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut client = Client::new(listener.local_addr().unwrap());
-    let (socket, _) = listener.accept().unwrap();
-    let shutdown = socket.try_clone().unwrap();
-    let tcp = thread::spawn(move || {
-        let receiver = fanout.register().unwrap();
-        TcpConnection::new(socket, 64, 64 * 1024)
-            .unwrap()
-            .run(&commands, &catalog, &latest, &receiver)
-            .unwrap();
-    });
-    assert_eq!(client.request(json!({"op":"hello"}))["version"], 1);
-    let description = client.request(json!({"op":"describe"}));
-    let catalog = description["parameters"].as_array().unwrap();
-    assert_eq!(catalog.len(), 23);
-    assert_eq!(
-        catalog
-            .iter()
-            .filter(|p| p["poll_period_ns"].is_number())
-            .count(),
-        4
-    );
-    assert!(catalog.iter().all(|p| {
-        let key = p["key"].as_str().unwrap();
-        !key.contains('/') || key.starts_with("designer/")
-    }));
-    // Legacy runtime supports read/write, but universal actions use --config.
-    assert_eq!(description["actions"], json!([]));
-    assert_eq!(
-        client.request(json!({"op":"get", "key":first_key}))["value"],
-        17.0
-    );
-    assert_eq!(
-        client.request(json!({"op":"set", "key":"power", "value":20}))["status"],
-        "ok"
-    );
-    assert_eq!(
-        client.request(json!({"op":"subscribe", "key":"power"}))["status"],
-        "ok"
-    );
-    assert_eq!(client.event("power")["value"], 17);
-    shutdown.shutdown(std::net::Shutdown::Both).unwrap();
-    tcp.join().unwrap();
-    stop.store(true, Ordering::Release);
-    pump.join().unwrap();
-    worker.join().unwrap();
-    assert!(probe.dropped.load(Ordering::Acquire));
 }
 
 #[path = "startup/recording.rs"]

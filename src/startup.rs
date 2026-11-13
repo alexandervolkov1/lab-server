@@ -17,35 +17,29 @@ use crate::config::{ConfigError, DeviceConfig, FlowControl, Parity, PortConfig, 
 use crate::device_registry::DeviceRegistry;
 use crate::driver::{DeviceIo, Driver, arduino::Arduino};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
-use crate::port_worker::{DeviceInstance, DeviceObservation, PortHandle, PortWorker, StopReason};
+use crate::port_worker::{
+    COMMAND_QUEUE_CAPACITY, DeviceInstance, DeviceObservation, OBSERVATION_QUEUE_CAPACITY,
+    PortHandle, PortWorker, StopReason,
+};
 use crate::recorder::{
     DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
 };
-use crate::runtime::{COMMAND_QUEUE_CAPACITY, OBSERVATION_QUEUE_CAPACITY};
 use crate::tcp::MultiDeviceTcp;
 
 type StartupResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const IDLE_WAIT: Duration = Duration::from_millis(5);
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum LaunchMode {
-    Legacy,
-    Config(PathBuf),
-}
-
-impl LaunchMode {
-    pub fn parse(args: impl IntoIterator<Item = OsString>) -> io::Result<Self> {
-        let mut args = args.into_iter();
-        match (args.next(), args.next(), args.next()) {
-            (None, None, None) => Ok(Self::Legacy),
-            (Some(flag), Some(path), None) if flag == "--config" && !path.is_empty() => {
-                Ok(Self::Config(path.into()))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "usage: lab-server [--config <path.toml>]",
-            )),
+/// Configuration is mandatory; the former implicit COM3/TCP-only startup is gone.
+pub fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> io::Result<PathBuf> {
+    let mut args = args.into_iter();
+    match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--config" && !path.is_empty() => {
+            Ok(path.into())
         }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: lab-server --config <path.toml>",
+        )),
     }
 }
 

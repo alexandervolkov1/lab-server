@@ -9,7 +9,7 @@ use std::net::TcpStream;
 pub use crate::service::DeviceService as MultiDeviceTcp;
 
 impl DeviceService {
-    /// Run the same transport as the legacy server for one accepted socket.
+    /// Run the configured server's TCP transport for one accepted socket.
     /// The listener owner must retain a ClientSlots permit for this connection.
     pub fn serve_connection(&self, stream: TcpStream) -> io::Result<()> {
         let mut connection = TcpConnection::new(stream, 64, 64 * 1024)?;

@@ -18,6 +18,9 @@ use crate::pending::{Pending, SetExecution};
 mod scheduler;
 use scheduler::{Scheduler, Task};
 
+pub const COMMAND_QUEUE_CAPACITY: usize = 128;
+pub const OBSERVATION_QUEUE_CAPACITY: usize = 128;
+
 pub struct DeviceInstance {
     id: String,
     driver: Box<dyn Driver + Send>,

@@ -1,5 +1,5 @@
-//! Shared models, drivers and TCP components for legacy and routed backends.
-//! The executable supports legacy Arduino and configured multi-port startup.
+//! Models, drivers, transport sessions and configured multi-port server startup.
+//! The legacy polling worker remains temporarily as a transport test fixture.
 
 pub mod command_router;
 pub mod config;
@@ -23,4 +23,5 @@ pub mod session;
 pub mod tcp;
 mod tcp_legacy;
 pub mod websocket;
-pub use tcp_legacy::{observation_json, queue_read, queue_set};
+pub use protocol::observation_json;
+pub use tcp_legacy::{queue_read, queue_set};
