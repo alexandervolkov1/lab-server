@@ -1,3 +1,4 @@
+; For examples/arduino.toml: device furnace1, TCP 127.0.0.1:7240.
 (require-builtin steel/hash)
 (require "../../lib/collections.scm")
 (require "../../lib/lab-client.scm")
@@ -26,15 +27,15 @@
 (let ((client (lab-connect "127.0.0.1:7240")))
 
   (show-response
-   (lab-get client 1 "sample_temperature"))
+   (lab-get client 1 "furnace1/sample_temperature"))
 
   (show-response
-   (lab-get client 2 "heater_temperature"))
+   (lab-get client 2 "furnace1/heater_temperature"))
 
   (show-response
-   (lab-get client 3 "room_temperature"))
+   (lab-get client 3 "furnace1/room_temperature"))
 
   (show-response
-   (lab-get client 4 "power"))
+   (lab-get client 4 "furnace1/power"))
 
   (lab-close client))

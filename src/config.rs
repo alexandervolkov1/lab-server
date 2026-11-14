@@ -81,7 +81,7 @@ pub enum FlowControl {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceConfig {
-    /// Local device ID; `/` is reserved for future device/signal keys.
+    /// Device ID; `/` separates it from the local parameter in global keys.
     pub id: String,
     pub driver: String,
     /// Reference to a PortConfig.id. Multiple devices may share this reference.

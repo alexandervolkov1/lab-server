@@ -1,3 +1,4 @@
+; For examples/arduino.toml: device furnace1, TCP 127.0.0.1:7240.
 (require "../../lib/collections.scm")
 (require "../../lib/lab-client.scm")
 
@@ -33,7 +34,7 @@
 (let ((client (lab-connect "127.0.0.1:7240")))
 
   (let ((response
-         (lab-subscribe client 1 "sample_temperature")))
+         (lab-subscribe client 1 "furnace1/sample_temperature")))
 
     (display "Subscription: ")
     (display (hash-> response status))

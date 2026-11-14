@@ -1,4 +1,4 @@
-//! TCP contract (NDJSON on 127.0.0.1:7240, protocol version 1).
+//! Shared TCP/WS application contract, protocol version 1.
 //!
 //! Request IDs are positive u64 values, strictly increasing within a connection.
 //! A valid ID is consumed even when the operation or its contents are rejected.
@@ -27,10 +27,10 @@
 //! stream and may return an earlier measurement.
 //!
 //! At most 32 clients have workers; excess connections are closed. Device commands
-//! and upstream observations each have capacity 128. Command admission never
+//! and upstream observations each have capacity 128 per physical port. Command admission never
 //! waits: a full queue returns `runtime_busy`, a closed queue `runtime_unavailable`.
 //! Upstream observation overflow continues device polling but invalidates clients
-//! with active subscriptions with terminal `observation_data_lost` (without request
+//! subscribed to that port with terminal `observation_data_lost` (without request
 //! ID). Per-client fanout overflow reports the same explicit loss of data after
 //! the queued prefix. Reconnection creates a new stream. Clients without subscriptions
 //! keep their TCP connection and pending commands; loss during that inactive period

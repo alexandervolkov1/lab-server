@@ -1,3 +1,4 @@
+; For examples/arduino.toml: device furnace1, TCP 127.0.0.1:7240.
 (require-builtin steel/time)
 
 (require "../../lib/lab-client.scm")
@@ -10,10 +11,10 @@
    ".csv"))
 
 (define parameters
-  '("sample_temperature"
-    "heater_temperature"
-    "room_temperature"
-    "power"))
+  '("furnace1/sample_temperature"
+    "furnace1/heater_temperature"
+    "furnace1/room_temperature"
+    "furnace1/power"))
 
 (let ((client (lab-connect "127.0.0.1:7240")))
 
