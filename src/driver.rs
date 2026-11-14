@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use crate::model::{ActionDescription, ParameterDescription, Value};
 
 pub mod arduino;
+pub mod metakon;
 
 /// Whether another transaction may safely start on the shared physical stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

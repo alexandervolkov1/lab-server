@@ -1,0 +1,37 @@
+# Hardware template for METAKON 513/523/533, initially READ ONLY.
+# Set the actual COM name, instrument address, existing zero-based channel,
+# decimal scale and engineering unit BEFORE running; see docs/metakon-hardware-test.md.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[recording]
+enabled = false
+
+[[ports]]
+id = "metakon_bus"
+name = "REPLACE_WITH_ACTUAL_COM_PORT"
+# The manufacturer specifies 8N1 and supports 9600; the actual configured baud is unknown.
+baud = 9600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 1000
+
+[[devices]]
+id = "metakon1"
+driver = "metakon"
+port = "metakon_bus"
+
+[devices.options]
+address = 1 # EXAMPLE ONLY: confirm the instrument's configured network address (0..255).
+channel = 0 # Zero-based: 513 has 0; 523 has 0..1; 533 has 0..2.
+# UNVERIFIED for your sensor/display settings. 1.0 exposes raw integer counts;
+# for confirmed tenths use 0.1 (float). Do not assume that raw counts mean degrees C.
+process_value_scale = 1.0
+process_value_unit = "" # Set e.g. "degC" only after confirming sensor/units/decimal point.
+write_enabled = false
+
+[devices.poll_periods_ms]
+measurement = 1000
+output_power = 1000
