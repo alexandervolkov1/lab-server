@@ -1,12 +1,136 @@
+use super::backend::{TestBackend, TestCommand};
 use super::*;
+use crate::fanout::test_support::{StreamWorker, routed_fanout};
+
+fn streams(capacity: usize) -> (crate::fanout::ObservationFanout, Vec<StreamWorker>) {
+    let mut parameters = super::get_catalog();
+    parameters.extend(super::power_catalog());
+    routed_fanout(
+        capacity,
+        parameters.into_values().collect(),
+        &[("a", "furnace1"), ("b", "furnace2")],
+    )
+}
+
+fn global_catalog(
+    local: HashMap<String, ParameterDescription>,
+) -> HashMap<String, ParameterDescription> {
+    local
+        .into_values()
+        .map(|mut description| {
+            description.id = format!("furnace1/{}", description.id);
+            (description.id.clone(), description)
+        })
+        .collect()
+}
+fn get_catalog() -> HashMap<String, ParameterDescription> {
+    global_catalog(super::get_catalog())
+}
+fn power_catalog() -> HashMap<String, ParameterDescription> {
+    global_catalog(super::power_catalog())
+}
+fn observation() -> Observation {
+    let mut result = super::observation();
+    result.source = "furnace1/sample_temperature".into();
+    result
+}
+
+#[test]
+fn other_port_publications_and_loss_do_not_overflow_subscribed_client() {
+    let (fanout, _workers) = streams(1);
+    let observations = fanout.register().unwrap();
+    let (backend, _commands) = TestBackend::new(1);
+    let (mut connection, mut client) = loopback_pair();
+    connection.session.outbound = OutboundBuffer::new(4096);
+    let mut catalog = get_catalog();
+    let mut description = catalog["furnace1/sample_temperature"].clone();
+    description.id = "furnace2/sample_temperature".into();
+    catalog.insert(description.id.clone(), description);
+    let latest = Mutex::new(HashMap::new());
+    connection.session.bind_observations(&observations);
+    connection
+        .session
+        .dispatch_subscription(
+            1,
+            SubscriptionChange::Subscribe,
+            vec!["furnace2/sample_temperature".into()],
+            &catalog,
+        )
+        .unwrap();
+    for _ in 0..10 {
+        fanout.publish(&observation()).unwrap();
+    }
+    fanout.report_loss("a", 1).unwrap();
+    let mut expected = observation();
+    expected.source = "furnace2/sample_temperature".into();
+    fanout.publish(&expected).unwrap();
+    assert!(
+        !connection
+            .drive_once_with_observations(&backend, &catalog, &latest, &observations)
+            .unwrap()
+    );
+    drop(connection);
+    let mut wire = String::new();
+    client.read_to_string(&mut wire).unwrap();
+    let messages: Vec<serde_json::Value> = wire
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["id"], 1);
+    assert_eq!(messages[1]["key"], "furnace2/sample_temperature");
+    assert_eq!(messages[1]["value"], 20.0);
+}
+
+#[test]
+fn orderly_port_eof_drains_queued_observation_without_reporting_loss() {
+    let (fanout, _workers) = streams(2);
+    let observations = fanout.register().unwrap();
+    let (backend, _commands) = TestBackend::new(1);
+    let (mut connection, mut client) = loopback_pair();
+    connection.session.outbound = OutboundBuffer::new(4096);
+    let catalog = get_catalog();
+    let latest = Mutex::new(HashMap::new());
+    connection.session.bind_observations(&observations);
+    connection
+        .session
+        .dispatch_subscription(
+            1,
+            SubscriptionChange::Subscribe,
+            vec!["furnace1/sample_temperature".into()],
+            &catalog,
+        )
+        .unwrap();
+    fanout.publish(&observation()).unwrap();
+    fanout.close_port("a").unwrap();
+    assert!(
+        connection
+            .drive_once_with_observations(&backend, &catalog, &latest, &observations)
+            .unwrap()
+    );
+    drop(connection);
+    let mut wire = String::new();
+    client.read_to_string(&mut wire).unwrap();
+    let messages: Vec<serde_json::Value> = wire
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["id"], 1);
+    assert_eq!(messages[1]["event"], "measurement");
+    assert_eq!(
+        messages[2],
+        json!({"status":"error","error":"observation_stream_closed"})
+    );
+}
 
 #[test]
 fn subscribe_excludes_old_publications_and_orders_ack_first() {
     let (mut connection, mut client) = loopback_pair();
     connection.session.outbound = OutboundBuffer::new(4096);
-    let fanout = crate::fanout::ObservationFanout::new(8);
+    let (fanout, _workers) = streams(8);
     let observations = fanout.register().unwrap();
-    let (tx, _rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (tx, _rx) = TestBackend::new(8);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
     connection
@@ -18,7 +142,7 @@ fn subscribe_excludes_old_publications_and_orders_ack_first() {
         .dispatch_subscription(
             1,
             SubscriptionChange::Subscribe,
-            vec!["sample_temperature".into()],
+            vec!["furnace1/sample_temperature".into()],
             &catalog,
         )
         .unwrap();
@@ -55,8 +179,8 @@ fn tcp_disconnect_releases_slot_for_reconnection() {
         let (mut connection, client) = loopback_pair();
         let worker = std::thread::spawn(move || {
             let _slot = slot;
-            let (tx, _rx) = mpsc::sync_channel(1);
-            let fanout = crate::fanout::ObservationFanout::new(1);
+            let (tx, _rx) = TestBackend::new(1);
+            let (fanout, _workers) = streams(1);
             let observations = fanout.register().unwrap();
             connection
                 .run(
@@ -76,9 +200,9 @@ fn tcp_disconnect_releases_slot_for_reconnection() {
 #[test]
 fn tcp_reports_upstream_data_loss() {
     let (mut connection, mut client) = loopback_pair();
-    let fanout = crate::fanout::ObservationFanout::new(2);
+    let (fanout, _workers) = streams(2);
     let observations = fanout.register().unwrap();
-    let (tx, _rx) = mpsc::sync_channel(1);
+    let (tx, _rx) = TestBackend::new(1);
     connection
         .drive_once_with_observations(
             &tx,
@@ -92,13 +216,11 @@ fn tcp_reports_upstream_data_loss() {
         .dispatch_subscription(
             1,
             SubscriptionChange::Subscribe,
-            vec!["sample_temperature".into()],
+            vec!["furnace1/sample_temperature".into()],
             &get_catalog(),
         )
         .unwrap();
-    fanout
-        .loss_epoch()
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fanout.report_loss("a", 1).unwrap();
     assert!(
         connection
             .drive_once_with_observations(
@@ -120,9 +242,7 @@ fn tcp_reports_upstream_data_loss() {
 
 fn inject_observation_loss(fanout: &crate::fanout::ObservationFanout, upstream: bool) {
     if upstream {
-        fanout
-            .loss_epoch()
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fanout.report_loss("a", 1).unwrap();
     } else {
         fanout.publish(&observation()).unwrap();
         fanout.publish(&observation()).unwrap();
@@ -132,15 +252,15 @@ fn inject_observation_loss(fanout: &crate::fanout::ObservationFanout, upstream: 
 fn resubscribe_does_not_hide_active_loss(upstream: bool) {
     let (mut connection, mut client) = loopback_pair();
     connection.session.outbound = OutboundBuffer::new(4096);
-    let fanout = crate::fanout::ObservationFanout::new(1);
+    let (fanout, _workers) = streams(1);
     let observations = fanout.register().unwrap();
-    let (tx, _rx) = mpsc::sync_channel(1);
+    let (tx, _rx) = TestBackend::new(1);
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
     connection
         .drive_once_with_observations(&tx, &catalog, &latest, &observations)
         .unwrap();
-    let keys = vec!["sample_temperature".into()];
+    let keys = vec!["furnace1/sample_temperature".into()];
     connection
         .session
         .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
@@ -197,23 +317,23 @@ fn personal_loss_survives_unsubscribe_and_resubscribe_before_notification() {
 fn observation_loss_preserves_command_only_client_and_pending_set() {
     for upstream in [true, false] {
         let (mut connection, mut client) = loopback_pair();
-        let fanout = crate::fanout::ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
         let observations = fanout.register().unwrap();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = TestBackend::new(1);
         let catalog = power_catalog();
         let latest = Mutex::new(HashMap::new());
         connection
             .session
             .dispatch_set(
                 1,
-                "power".into(),
+                "furnace1/power".into(),
                 Value::Integer(20),
                 &tx,
                 &catalog,
                 Instant::now(),
             )
             .unwrap();
-        let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+        let TestCommand::Set(command) = rx.try_recv().unwrap() else {
             panic!()
         };
         assert!(command.execution.try_start());
@@ -235,9 +355,7 @@ fn observation_loss_preserves_command_only_client_and_pending_set() {
                 Instant::now(),
             )
             .unwrap();
-        command
-            .execution
-            .complete(|| command.reply.send(Ok(())).unwrap());
+        command.complete(Ok(())).unwrap();
         for _ in 0..2 {
             assert!(
                 !connection
@@ -264,15 +382,15 @@ fn loss_while_unsubscribed_does_not_poison_later_subscription() {
     for upstream in [true, false] {
         let (mut connection, mut client) = loopback_pair();
         connection.session.outbound = OutboundBuffer::new(4096);
-        let fanout = crate::fanout::ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
         let observations = fanout.register().unwrap();
-        let (tx, _rx) = mpsc::sync_channel(1);
+        let (tx, _rx) = TestBackend::new(1);
         let catalog = get_catalog();
         let latest = Mutex::new(HashMap::new());
         connection
             .drive_once_with_observations(&tx, &catalog, &latest, &observations)
             .unwrap();
-        let keys = vec!["sample_temperature".into()];
+        let keys = vec!["furnace1/sample_temperature".into()];
         connection
             .session
             .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
@@ -319,9 +437,9 @@ fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
     for upstream in [true, false] {
         let (mut connection, mut client) = loopback_pair();
         connection.session.outbound = OutboundBuffer::new(4096);
-        let fanout = crate::fanout::ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
         let observations = fanout.register().unwrap();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = TestBackend::new(1);
         let mut catalog = get_catalog();
         catalog.extend(power_catalog());
         let latest = Mutex::new(HashMap::new());
@@ -333,7 +451,7 @@ fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
             .dispatch_subscription(
                 1,
                 SubscriptionChange::Subscribe,
-                vec!["sample_temperature".into()],
+                vec!["furnace1/sample_temperature".into()],
                 &catalog,
             )
             .unwrap();
@@ -341,14 +459,14 @@ fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
             .session
             .dispatch_set(
                 2,
-                "power".into(),
+                "furnace1/power".into(),
                 Value::Integer(20),
                 &tx,
                 &catalog,
                 Instant::now(),
             )
             .unwrap();
-        let crate::runtime::DeviceCommand::Set(command) = rx.try_recv().unwrap() else {
+        let TestCommand::Set(command) = rx.try_recv().unwrap() else {
             panic!()
         };
         assert!(command.execution.try_start());
@@ -358,9 +476,7 @@ fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
                 .drive_once_with_observations(&tx, &catalog, &latest, &observations)
                 .unwrap()
         );
-        command
-            .execution
-            .complete(|| command.reply.send(Ok(())).unwrap());
+        command.complete(Ok(())).unwrap();
         connection.session.collect_ready(Instant::now()).unwrap();
         assert!(connection.session.outbound.is_empty());
         drop(connection);
@@ -380,9 +496,9 @@ fn subscribed_client_loss_does_not_fabricate_pending_set_result() {
 
 #[test]
 fn subscription_boundaries_are_per_key_and_per_client() {
-    let fanout = crate::fanout::ObservationFanout::new(16);
+    let (fanout, _workers) = streams(16);
     let catalog = get_catalog();
-    let (tx, _rx) = mpsc::sync_channel(1);
+    let (tx, _rx) = TestBackend::new(1);
     let latest = Mutex::new(HashMap::new());
     let (mut first, mut first_client) = loopback_pair();
     let (mut second, mut second_client) = loopback_pair();
@@ -396,7 +512,7 @@ fn subscription_boundaries_are_per_key_and_per_client() {
     second
         .drive_once_with_observations(&tx, &catalog, &latest, &second_rx)
         .unwrap();
-    let keys = vec!["sample_temperature".into()];
+    let keys = vec!["furnace1/sample_temperature".into()];
     first
         .session
         .dispatch_subscription(1, SubscriptionChange::Subscribe, keys.clone(), &catalog)
@@ -453,12 +569,12 @@ fn tcp_streams_only_subscribed_observations() {
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
 
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
-    let source_tx = crate::fanout::ObservationFanout::new(8);
+    let (command_tx, command_rx) = TestBackend::new(8);
+    let (source_tx, _workers) = streams(8);
     let source_rx = source_tx.register().unwrap();
 
     client
-        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"furnace1/sample_temperature\"]}\n")
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -466,7 +582,7 @@ fn tcp_streams_only_subscribed_observations() {
     while !connection
         .session
         .subscriptions
-        .contains("sample_temperature")
+        .contains("furnace1/sample_temperature")
     {
         assert!(
             !connection
@@ -479,7 +595,7 @@ fn tcp_streams_only_subscribed_observations() {
     }
 
     let mut ignored = observation();
-    ignored.source = "configuration".to_owned();
+    ignored.source = "furnace1/configuration".to_owned();
 
     source_tx.publish(&ignored).unwrap();
     source_tx.publish(&observation()).unwrap();
@@ -509,12 +625,12 @@ fn tcp_streams_only_subscribed_observations() {
         serde_json::json!({
             "id": 1,
             "status": "ok",
-            "keys": ["sample_temperature"]
+            "keys": ["furnace1/sample_temperature"]
         })
     );
 
     assert_eq!(responses[1]["event"], "measurement");
-    assert_eq!(responses[1]["key"], "sample_temperature");
+    assert_eq!(responses[1]["key"], "furnace1/sample_temperature");
     assert_eq!(responses[1]["value"], 20.0);
     assert!(responses[1].get("id").is_none());
 
@@ -528,12 +644,12 @@ fn tcp_unsubscribe_stops_measurements_after_ack() {
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
 
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
-    let observation_tx = crate::fanout::ObservationFanout::new(8);
+    let (command_tx, _command_rx) = TestBackend::new(8);
+    let (observation_tx, _workers) = streams(8);
     let observation_rx = observation_tx.register().unwrap();
 
     client
-        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"furnace1/sample_temperature\"]}\n")
         .unwrap();
 
     let mut deadline = Instant::now() + Duration::from_secs(1);
@@ -541,7 +657,7 @@ fn tcp_unsubscribe_stops_measurements_after_ack() {
     while !connection
         .session
         .subscriptions
-        .contains("sample_temperature")
+        .contains("furnace1/sample_temperature")
     {
         assert!(
             !connection
@@ -564,7 +680,9 @@ fn tcp_unsubscribe_stops_measurements_after_ack() {
     assert!(connection.session.outbound.is_empty());
 
     client
-        .write_all(b"{\"id\":2,\"op\":\"unsubscribe\",\"keys\":[\"sample_temperature\"]}\n")
+        .write_all(
+            b"{\"id\":2,\"op\":\"unsubscribe\",\"keys\":[\"furnace1/sample_temperature\"]}\n",
+        )
         .unwrap();
 
     deadline = Instant::now() + Duration::from_secs(1);
@@ -572,7 +690,7 @@ fn tcp_unsubscribe_stops_measurements_after_ack() {
     while connection
         .session
         .subscriptions
-        .contains("sample_temperature")
+        .contains("furnace1/sample_temperature")
     {
         assert!(
             !connection
@@ -612,12 +730,12 @@ fn tcp_unsubscribe_stops_measurements_after_ack() {
         serde_json::json!({
             "id": 1,
             "status": "ok",
-            "keys": ["sample_temperature"]
+            "keys": ["furnace1/sample_temperature"]
         })
     );
 
     assert_eq!(responses[1]["event"], "measurement");
-    assert_eq!(responses[1]["key"], "sample_temperature");
+    assert_eq!(responses[1]["key"], "furnace1/sample_temperature");
     assert!(responses[1].get("id").is_none());
 
     assert_eq!(
@@ -636,13 +754,13 @@ fn tcp_closes_after_observation_channel_overflow() {
 
     let catalog = get_catalog();
     let latest = Mutex::new(HashMap::new());
-    let (command_tx, _command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
+    let (command_tx, _command_rx) = TestBackend::new(8);
 
-    let fanout = crate::fanout::ObservationFanout::new(1);
+    let (fanout, _workers) = streams(1);
     let observations = fanout.register().unwrap();
 
     client
-        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"furnace1/sample_temperature\"]}\n")
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -650,7 +768,7 @@ fn tcp_closes_after_observation_channel_overflow() {
     while !connection
         .session
         .subscriptions
-        .contains("sample_temperature")
+        .contains("furnace1/sample_temperature")
     {
         assert!(
             !connection
@@ -718,8 +836,8 @@ fn tcp_closes_after_observation_channel_overflow() {
 fn tcp_run_combines_commands_and_observation_stream() {
     let (mut connection, mut client) = loopback_pair();
 
-    let (command_tx, command_rx) = mpsc::sync_channel(crate::runtime::COMMAND_QUEUE_CAPACITY);
-    let observation_tx = crate::fanout::ObservationFanout::new(2);
+    let (command_tx, command_rx) = TestBackend::new(8);
+    let (observation_tx, _workers) = streams(2);
     let observation_rx = observation_tx.register().unwrap();
 
     let worker = std::thread::spawn(move || {
@@ -737,7 +855,7 @@ fn tcp_run_combines_commands_and_observation_stream() {
     let mut line = String::new();
 
     client
-        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"sample_temperature\"]}\n")
+        .write_all(b"{\"id\":1,\"op\":\"subscribe\",\"keys\":[\"furnace1/sample_temperature\"]}\n")
         .unwrap();
 
     reader.read_line(&mut line).unwrap();
@@ -755,7 +873,7 @@ fn tcp_run_combines_commands_and_observation_stream() {
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
 
     assert_eq!(event["event"], "measurement");
-    assert_eq!(event["key"], "sample_temperature");
+    assert_eq!(event["key"], "furnace1/sample_temperature");
     assert_eq!(event["value"], 20.0);
 
     client.write_all(b"{\"id\":2,\"op\":\"ping\"}\n").unwrap();

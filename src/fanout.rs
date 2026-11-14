@@ -8,6 +8,9 @@ use crate::device_registry::DeviceRegistry;
 use crate::model::Observation;
 use crate::port_worker::PortHandle;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub struct PublishedObservation {
     pub sequence: u64,
     pub observation: Observation,
