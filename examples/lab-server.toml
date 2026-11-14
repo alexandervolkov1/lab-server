@@ -1,6 +1,6 @@
-# Architecture example only: metakon and custom_ascii are NOT implemented.
+# Architecture example only: custom_ascii is NOT implemented.
 # Startup with this file fails with an unknown-driver configuration error.
-# Use examples/arduino.toml for a runnable configuration.
+# Use examples/arduino.toml or configure examples/metakon-readonly.toml for hardware.
 
 [tcp]
 bind = "127.0.0.1:7240"
@@ -20,7 +20,7 @@ id = "shared_bus"
 name = "COM4"
 baud = 9600
 data_bits = 8
-parity = "even"
+parity = "none"
 stop_bits = 1
 flow_control = "none"
 timeout_ms = 1000
@@ -37,11 +37,14 @@ power = 2000
 
 [[devices]]
 id = "gauge1"
-driver = "metakon" # Demonstration name; no driver implementation is required.
+driver = "metakon"
 port = "shared_bus"
 
 [devices.options]
 address = 1
+channel = 0
+process_value_scale = 1.0 # Illustrative raw counts, not a verified engineering scale.
+write_enabled = false
 
 [[devices]]
 id = "controller1"
