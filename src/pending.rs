@@ -10,7 +10,6 @@ enum ExecutionState {
 }
 
 /// Shared execution boundary for state-changing operations (set and actions).
-/// Retains its original name for callers of the legacy runtime.
 pub struct SetExecution {
     deadline: Instant,
     state: Mutex<ExecutionState>,

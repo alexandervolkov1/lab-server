@@ -3,7 +3,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Mutex;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -38,10 +37,10 @@ impl EnqueueError {
     }
 }
 
-/// The same session/transport serves the legacy runtime and routed devices.
+/// Shared asynchronous command admission for transport sessions.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
-    /// Global names for describe. Legacy backends have no actions.
+    /// Global action names for describe; backends may expose no actions.
     fn actions(&self) -> Vec<ActionDescription> {
         Vec::new()
     }
@@ -107,8 +106,6 @@ fn routed_completion<T>(
 }
 
 pub enum FinishedRequest {
-    Read(Completion<Observation>),
-    Set(Completion<Result<(), String>>),
     RoutedRead {
         key: String,
         completion: Completion<
@@ -129,48 +126,6 @@ fn completion_json(completion: FinishedRequest) -> io::Result<String> {
         FinishedRequest::RoutedMutation(completion) => routed_completion(completion, |id, ()| {
             Ok(json!({ "id": id, "status": "ok" }).to_string())
         }),
-        FinishedRequest::Read(Completion::Received { id, value }) => {
-            crate::observation_json(Some(id), &value)
-        }
-
-        FinishedRequest::Set(Completion::Received { id, value }) => {
-            let response = match value {
-                Ok(()) => json!({
-                    "id": id,
-                    "status": "ok"
-                }),
-
-                Err(error) => json!({
-                    "id": id,
-                    "status": "error",
-                    "error": error
-                }),
-            };
-
-            Ok(response.to_string())
-        }
-
-        FinishedRequest::Read(Completion::OutcomeUnknown { id })
-        | FinishedRequest::Set(Completion::OutcomeUnknown { id }) => Ok(json!({
-            "id": id, "status": "error", "error": "outcome_unknown"
-        })
-        .to_string()),
-
-        FinishedRequest::Read(Completion::Timeout { id })
-        | FinishedRequest::Set(Completion::Timeout { id }) => Ok(json!({
-            "id": id,
-            "status": "error",
-            "error": "runtime_timeout"
-        })
-        .to_string()),
-
-        FinishedRequest::Read(Completion::Disconnected { id })
-        | FinishedRequest::Set(Completion::Disconnected { id }) => Ok(json!({
-            "id": id,
-            "status": "error",
-            "error": "runtime_unavailable"
-        })
-        .to_string()),
     }
 }
 
@@ -186,23 +141,12 @@ enum Entry {
         id: u64,
         pending: Pending<Result<(), crate::port_worker::CommandError>>,
     },
-    Read {
-        id: u64,
-        pending: Pending<Observation>,
-    },
-    Set {
-        id: u64,
-        pending: Pending<Result<(), String>>,
-    },
 }
 
 impl Entry {
     fn id(&self) -> u64 {
         match self {
-            Self::Read { id, .. }
-            | Self::Set { id, .. }
-            | Self::RoutedRead { id, .. }
-            | Self::RoutedMutation { id, .. } => *id,
+            Self::RoutedRead { id, .. } | Self::RoutedMutation { id, .. } => *id,
         }
     }
 }
@@ -241,45 +185,6 @@ impl PendingRequests {
         if self.entries.len() >= self.limit {
             return Err(EnqueueError::Full);
         }
-
-        Ok(())
-    }
-
-    pub fn add_read(
-        &mut self,
-        id: u64,
-        deadline: Instant,
-        enqueue: impl FnOnce() -> Result<Receiver<Observation>, EnqueueError>,
-    ) -> Result<(), EnqueueError> {
-        self.ensure_available(id)?;
-
-        let receiver = enqueue()?;
-
-        self.entries.push_back(Entry::Read {
-            id,
-            pending: Pending::new(id, deadline, receiver),
-        });
-
-        Ok(())
-    }
-
-    pub fn add_set(
-        &mut self,
-        id: u64,
-        deadline: Instant,
-        enqueue: impl FnOnce(
-            std::sync::Arc<crate::pending::SetExecution>,
-        ) -> Result<Receiver<Result<(), String>>, EnqueueError>,
-    ) -> Result<(), EnqueueError> {
-        self.ensure_available(id)?;
-
-        let execution = crate::pending::SetExecution::new(deadline);
-        let receiver = enqueue(execution.clone())?;
-
-        self.entries.push_back(Entry::Set {
-            id,
-            pending: Pending::new(id, deadline, receiver).with_execution(execution),
-        });
 
         Ok(())
     }
@@ -329,23 +234,6 @@ impl PendingRequests {
                         .push_back(Entry::RoutedMutation { id, pending }),
                     Poll::Finished(completion) => {
                         finished.push(FinishedRequest::RoutedMutation(completion))
-                    }
-                },
-                Entry::Read { id, pending } => match pending.poll(now) {
-                    Poll::Waiting(pending) => {
-                        self.entries.push_back(Entry::Read { id, pending });
-                    }
-                    Poll::Finished(result) => {
-                        finished.push(FinishedRequest::Read(result));
-                    }
-                },
-
-                Entry::Set { id, pending } => match pending.poll(now) {
-                    Poll::Waiting(pending) => {
-                        self.entries.push_back(Entry::Set { id, pending });
-                    }
-                    Poll::Finished(result) => {
-                        finished.push(FinishedRequest::Set(result));
                     }
                 },
             }

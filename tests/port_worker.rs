@@ -549,51 +549,73 @@ fn late_bytes_after_io_timeout_are_not_read_or_cleared_by_another_driver() {
 
 #[test]
 fn commands_and_overdue_polls_alternate_under_sustained_load() {
-    let trace = Arc::new(Mutex::new(Trace::default()));
-    let (gate, calls, release) = gate();
-    let mut first = FakeDriver::<1>::new(1, trace.clone());
-    first.gate = Some(gate.clone());
-    let mut second = FakeDriver::<2>::new(2, trace.clone());
-    second.gate = Some(gate);
-    let mut devices = vec![
-        DeviceInstance::new("one", first).unwrap(),
-        DeviceInstance::new("two", second).unwrap(),
-    ];
-    for device in &mut devices {
-        device
-            .set_poll_period("value", Some(Duration::from_nanos(1)))
-            .unwrap();
-    }
-    let (worker, channels) = PortWorker::new(FakeIo::new(trace.clone()), devices, 8, 32).unwrap();
-    let mut pending = Vec::new();
-    // Keep the command queue nonempty throughout 16 consecutive transactions.
-    for id in 0..8 {
-        pending.push(
-            channels
-                .commands
-                .set(id, "one", "enabled", Value::Boolean(true), deadline())
-                .unwrap(),
-        );
-    }
-    let join = thread::spawn(move || worker.run());
-    let mut polled = [0; 2];
-    for turn in 0..16 {
-        let call = calls.recv_timeout(WAIT).unwrap();
-        assert_eq!(call.write, turn % 2 == 0);
-        if !call.write {
-            polled[usize::from(call.address - 1)] += 1;
+    for reads in [false, true] {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let (gate, calls, release) = gate();
+        let mut first = FakeDriver::<1>::new(1, trace.clone());
+        first.gate = Some(gate.clone());
+        let mut second = FakeDriver::<2>::new(2, trace.clone());
+        second.gate = Some(gate.clone());
+        let mut demand = FakeDriver::<3>::new(3, trace.clone());
+        demand.gate = Some(gate);
+        let mut devices = vec![
+            DeviceInstance::new("one", first).unwrap(),
+            DeviceInstance::new("two", second).unwrap(),
+            DeviceInstance::new("demand", demand).unwrap(),
+        ];
+        for device in &mut devices[..2] {
+            device
+                .set_poll_period("value", Some(Duration::from_nanos(1)))
+                .unwrap();
         }
-        if turn == 15 {
-            channels.commands.shutdown();
+        let (worker, channels) =
+            PortWorker::new(FakeIo::new(trace.clone()), devices, 8, 32).unwrap();
+        let mut pending = Vec::new();
+        let mut pending_reads = Vec::new();
+        // Keep the command queue nonempty throughout 16 consecutive transactions.
+        for id in 0..8 {
+            if reads {
+                pending_reads.push(
+                    channels
+                        .commands
+                        .read(id, "demand", "value", deadline())
+                        .unwrap(),
+                );
+            } else {
+                pending.push(
+                    channels
+                        .commands
+                        .set(id, "one", "enabled", Value::Boolean(true), deadline())
+                        .unwrap(),
+                );
+            }
         }
-        release.send(()).unwrap();
+        let join = thread::spawn(move || worker.run());
+        let mut polled = [0; 2];
+        for turn in 0..16 {
+            let call = calls.recv_timeout(WAIT).unwrap();
+            if turn % 2 == 0 {
+                assert_eq!(call.write, !reads);
+                assert_eq!(call.address, if reads { 3 } else { 1 });
+            } else {
+                assert!(!call.write);
+                polled[usize::from(call.address - 1)] += 1;
+            }
+            if turn == 15 {
+                channels.commands.shutdown();
+            }
+            release.send(()).unwrap();
+        }
+        assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+        for pending in pending {
+            assert_eq!(received(pending), Ok(()));
+        }
+        for (index, pending) in pending_reads.into_iter().enumerate() {
+            assert_eq!(value(pending), Value::Integer(index as i64 + 1));
+        }
+        assert_eq!(polled, [4, 4]);
+        assert_eq!(channels.observations.try_iter().count(), 8);
     }
-    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
-    for pending in pending {
-        assert_eq!(received(pending), Ok(()));
-    }
-    assert_eq!(polled, [4, 4]);
-    assert_eq!(channels.observations.try_iter().count(), 8);
 }
 
 #[test]

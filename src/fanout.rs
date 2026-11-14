@@ -42,7 +42,6 @@ struct Domains {
 
 struct InterestState {
     active: bool,
-    registered_epoch: u64,
     upstream_lost: bool,
     overflowed: bool,
     stream_closed: bool,
@@ -52,40 +51,16 @@ struct InterestState {
 
 pub struct ObservationInterest {
     state: Mutex<InterestState>,
-    loss_epoch: Arc<AtomicU64>,
-    domains: Option<Arc<Domains>>,
+    domains: Arc<Domains>,
 }
 
 impl ObservationInterest {
-    /// Compatibility entry point for the single-device runtime.
-    pub fn set_active(&self, active: bool) {
-        assert!(
-            self.domains.is_none(),
-            "routed subscriptions must specify keys"
-        );
-        let mut state = self
-            .state
-            .lock()
-            .expect("observation interest lock poisoned");
-        let epoch = self.loss_epoch.load(Ordering::SeqCst);
-        if state.active && epoch != state.registered_epoch {
-            state.upstream_lost = true;
-        }
-        if active && !state.active {
-            state.registered_epoch = epoch;
-        }
-        state.active = active;
-    }
-
     /// Linearize subscription boundaries against each affected worker's
     /// publication + loss commit. All affected gates are held together in port
     /// id order. The worker never takes interest/subscriber locks, and its gate
     /// never covers driver I/O. No network calls occur under these locks.
     pub fn set_keys(&self, keys: &[String]) {
-        let Some(domains) = &self.domains else {
-            self.set_active(!keys.is_empty());
-            return;
-        };
+        let domains = &self.domains;
         let mut state = self
             .state
             .lock()
@@ -124,20 +99,16 @@ impl ObservationInterest {
     }
 
     fn refresh(&self, state: &mut InterestState) {
-        if let Some(domains) = &self.domains {
-            for (id, baseline) in &state.ports {
-                let port = &domains.ports[id];
-                let epoch = port.epoch();
-                if epoch != *baseline || epoch == u64::MAX || port.corrupted.load(Ordering::SeqCst)
-                {
-                    state.upstream_lost = true;
-                }
-                if port.closed.load(Ordering::SeqCst) {
-                    state.stream_closed = true;
-                }
+        let domains = &self.domains;
+        for (id, baseline) in &state.ports {
+            let port = &domains.ports[id];
+            let epoch = port.epoch();
+            if epoch != *baseline || epoch == u64::MAX || port.corrupted.load(Ordering::SeqCst) {
+                state.upstream_lost = true;
             }
-        } else if state.active && self.loss_epoch.load(Ordering::SeqCst) != state.registered_epoch {
-            state.upstream_lost = true;
+            if port.closed.load(Ordering::SeqCst) {
+                state.stream_closed = true;
+            }
         }
     }
 }
@@ -157,7 +128,7 @@ impl ObservationReceiver {
         }
     }
 
-    /// In routed mode an unsubscribe cannot acknowledge an already detected
+    /// Unsubscribe cannot acknowledge an already detected
     /// stream failure, even if no subscriptions remain at the next TCP turn.
     pub fn terminal_when_inactive(&self) -> bool {
         let state = self
@@ -165,8 +136,7 @@ impl ObservationReceiver {
             .state
             .lock()
             .expect("observation interest lock poisoned");
-        self.interest.domains.is_some()
-            && (state.upstream_lost || state.overflowed || state.stream_closed)
+        state.upstream_lost || state.overflowed || state.stream_closed
     }
 
     pub fn try_recv(&self) -> Result<PublishedObservation, TryRecvError> {
@@ -176,13 +146,12 @@ impl ObservationReceiver {
             .lock()
             .expect("observation interest lock poisoned");
         self.interest.refresh(&mut state);
-        let relevant = state.active || self.interest.domains.is_some();
-        if relevant && state.upstream_lost {
+        if state.upstream_lost {
             return Err(TryRecvError::Disconnected);
         }
         match self.receiver.try_recv() {
             // Preserve the queued prefix for personal overflow and orderly EOF.
-            Err(TryRecvError::Empty) if relevant && (state.overflowed || state.stream_closed) => {
+            Err(TryRecvError::Empty) if state.overflowed || state.stream_closed => {
                 Err(TryRecvError::Disconnected)
             }
             result => result,
@@ -194,25 +163,13 @@ pub struct ObservationFanout {
     queue_capacity: usize,
     subscribers: Mutex<Vec<(Weak<ObservationInterest>, SyncSender<PublishedObservation>)>>,
     clock: Arc<AtomicU64>,
-    loss_epoch: Arc<AtomicU64>,
-    domains: Option<Arc<Domains>>,
+    domains: Arc<Domains>,
 }
 
 impl ObservationFanout {
-    pub fn new(queue_capacity: usize) -> Self {
-        assert!(queue_capacity > 0);
-        Self {
-            queue_capacity,
-            clock: Arc::new(AtomicU64::new(0)),
-            loss_epoch: Arc::new(AtomicU64::new(0)),
-            subscribers: Mutex::new(Vec::new()),
-            domains: None,
-        }
-    }
-
     pub fn routed(queue_capacity: usize, registry: &DeviceRegistry) -> Self {
-        let mut fanout = Self::new(queue_capacity);
-        fanout.domains = Some(Arc::new(Domains {
+        assert!(queue_capacity > 0);
+        let domains = Arc::new(Domains {
             keys: registry
                 .parameters()
                 .map(|p| (p.global_key.clone(), p.port_id.clone()))
@@ -231,25 +188,22 @@ impl ObservationFanout {
                     )
                 })
                 .collect(),
-        }));
-        fanout
-    }
-
-    /// Legacy single-runtime counter. Routed mode reads each PortHandle counter.
-    pub fn loss_epoch(&self) -> Arc<AtomicU64> {
-        self.loss_epoch.clone()
+        });
+        Self {
+            queue_capacity,
+            clock: Arc::new(AtomicU64::new(0)),
+            subscribers: Mutex::new(Vec::new()),
+            domains,
+        }
     }
 
     fn port(&self, id: &str) -> io::Result<&PortStream> {
-        self.domains
-            .as_ref()
-            .and_then(|d| d.ports.get(id))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown stream port {id:?}"),
-                )
-            })
+        self.domains.ports.get(id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown stream port {id:?}"),
+            )
+        })
     }
     pub(crate) fn report_loss(&self, id: &str, epoch: u64) -> io::Result<()> {
         self.port(id)?
@@ -275,14 +229,12 @@ impl ObservationFanout {
         let interest = Arc::new(ObservationInterest {
             state: Mutex::new(InterestState {
                 active: false,
-                registered_epoch: self.loss_epoch.load(Ordering::SeqCst),
                 upstream_lost: false,
                 overflowed: false,
                 stream_closed: false,
                 keys: HashSet::new(),
                 ports: BTreeMap::new(),
             }),
-            loss_epoch: self.loss_epoch.clone(),
             domains: self.domains.clone(),
         });
         let mut subscribers = self
@@ -322,7 +274,7 @@ impl ObservationFanout {
                 || state.overflowed
                 || state.stream_closed
                 || state.upstream_lost
-                || (interest.domains.is_some() && !state.keys.contains(&observation.source))
+                || !state.keys.contains(&observation.source)
             {
                 return true;
             }
@@ -349,24 +301,45 @@ mod tests {
 
     use crate::model::Value;
 
+    fn streams(capacity: usize) -> (ObservationFanout, Vec<test_support::StreamWorker>) {
+        test_support::routed_fanout(
+            capacity,
+            vec![crate::model::ParameterDescription {
+                id: "sample_temperature".into(),
+                unit: "degC".into(),
+                writable: false,
+                spec: crate::model::Spec::Float {
+                    min: -100.0,
+                    max: 500.0,
+                },
+                default_poll_period: Some(std::time::Duration::from_secs(1)),
+            }],
+            &[("p", "furnace1")],
+        )
+    }
+
     fn register_active(fanout: &ObservationFanout) -> ObservationReceiver {
         let receiver = fanout.register().unwrap();
-        receiver.interest.set_active(true);
+        receiver
+            .interest
+            .set_keys(&["furnace1/sample_temperature".into()]);
         receiver
     }
 
     #[test]
     fn loss_before_first_subscription_does_not_poison_subscription() {
         for upstream in [true, false] {
-            let fanout = ObservationFanout::new(1);
+            let (fanout, _workers) = streams(1);
             let receiver = fanout.register().unwrap();
             if upstream {
-                fanout.loss_epoch().fetch_add(1, Ordering::SeqCst);
+                fanout.report_loss("p", 1).unwrap();
             } else {
                 fanout.publish(&observation(20.0)).unwrap();
                 fanout.publish(&observation(21.0)).unwrap();
             }
-            receiver.interest.set_active(true);
+            receiver
+                .interest
+                .set_keys(&["furnace1/sample_temperature".into()]);
             assert!(matches!(
                 receiver.try_recv(),
                 Err(mpsc::TryRecvError::Empty)
@@ -381,11 +354,11 @@ mod tests {
 
     #[test]
     fn upstream_loss_closes_existing_streams_and_allows_reconnect() {
-        let fanout = ObservationFanout::new(2);
+        let (fanout, _workers) = streams(2);
         let first = register_active(&fanout);
         let second = register_active(&fanout);
         fanout.publish(&observation(20.0)).unwrap();
-        fanout.loss_epoch().fetch_add(1, Ordering::SeqCst);
+        fanout.report_loss("p", 1).unwrap();
         assert!(matches!(
             first.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
@@ -405,7 +378,7 @@ mod tests {
 
     #[test]
     fn disconnected_registrations_do_not_accumulate_without_publications() {
-        let fanout = ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
         for _ in 0..1000 {
             drop(register_active(&fanout));
         }
@@ -414,7 +387,7 @@ mod tests {
 
     fn observation(value: f64) -> Observation {
         Observation {
-            source: "sample_temperature".to_owned(),
+            source: "furnace1/sample_temperature".to_owned(),
             unit: "degC".to_owned(),
             completed_at: UNIX_EPOCH,
             reading: Ok(Value::Float(value)),
@@ -423,7 +396,7 @@ mod tests {
 
     #[test]
     fn publishes_to_multiple_clients() {
-        let fanout = ObservationFanout::new(2);
+        let (fanout, _workers) = streams(2);
 
         let first = register_active(&fanout);
         let second = register_active(&fanout);
@@ -443,7 +416,7 @@ mod tests {
 
     #[test]
     fn slow_client_does_not_block_other_clients() {
-        let fanout = ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
 
         let slow = register_active(&fanout);
         let fast = register_active(&fanout);
@@ -476,11 +449,13 @@ mod tests {
 
     #[test]
     fn personal_overflow_persists_until_receiver_is_replaced() {
-        let fanout = ObservationFanout::new(1);
+        let (fanout, _workers) = streams(1);
         let receiver = register_active(&fanout);
         fanout.publish(&observation(20.0)).unwrap();
         fanout.publish(&observation(21.0)).unwrap();
-        receiver.interest.set_active(true);
+        receiver
+            .interest
+            .set_keys(&["furnace1/sample_temperature".into()]);
         assert_eq!(
             receiver.try_recv().unwrap().observation.reading,
             Ok(Value::Float(20.0))
@@ -491,9 +466,11 @@ mod tests {
         ));
         assert_eq!(receiver.closed_error(), "observation_data_lost");
 
-        receiver.interest.set_active(false);
+        receiver.interest.set_keys(&[]);
         fanout.publish(&observation(22.0)).unwrap();
-        receiver.interest.set_active(true);
+        receiver
+            .interest
+            .set_keys(&["furnace1/sample_temperature".into()]);
         assert!(matches!(
             receiver.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
