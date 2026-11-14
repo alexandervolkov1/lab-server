@@ -1097,6 +1097,39 @@ fn terminal_session_does_not_append_pending_responses() {
 }
 
 #[test]
+fn dropping_terminal_session_releases_started_mutation_reply_receiver() {
+    let now = Instant::now();
+    let mut session = ClientSession::new(1, 256);
+    let (backend, commands) = TestBackend::new(1);
+    backend
+        .enqueue_set(
+            &mut session.pending,
+            1,
+            now + Duration::from_secs(10),
+            "power".into(),
+            Value::Integer(20),
+        )
+        .unwrap();
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("set")
+    };
+    assert!(command.execution.try_start());
+    session.terminal = true;
+    session
+        .collect_ready(now + Duration::from_secs(11))
+        .unwrap();
+    assert!(
+        session.outbound.is_empty(),
+        "terminal loss must not invent a Set response"
+    );
+    drop(session);
+    assert!(matches!(
+        command.complete(Ok(())),
+        Err(mpsc::TrySendError::Disconnected(_))
+    ));
+}
+
+#[test]
 fn framing_errors_are_reported_without_request_id() {
     let cases = [
         (b"\xff\n".to_vec(), FrameError::InvalidUtf8, "invalid_utf8"),

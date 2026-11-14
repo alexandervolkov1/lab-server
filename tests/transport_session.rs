@@ -1,28 +1,34 @@
-//! Exercise the public message boundary without a socket, framing or hardware.
+//! Public shared service/session boundary, without hardware or socket timing.
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Cursor, Write};
 use std::sync::{Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use lab_server::command_router::CommandRouter;
 use lab_server::connection::ClientSession;
-use lab_server::fanout::ObservationFanout;
+use lab_server::device_registry::DeviceRegistry;
+use lab_server::driver::{DeviceIo, Driver, DriverError};
 use lab_server::model::{Observation, ParameterDescription, Spec, Value};
+use lab_server::observation_aggregator::AggregatorEvent;
 use lab_server::outbound::{OutboundBuffer, OutputError};
-use lab_server::runtime::DeviceCommand;
+use lab_server::pending::{Completion, Pending, Poll};
+use lab_server::port_worker::{
+    DeviceInstance, DeviceObservation, PortHandle, PortWorker, StopReason,
+};
+use lab_server::service::DeviceService;
 use lab_server::session::Session;
 use serde_json::{Value as Json, json};
 
-struct Context {
-    commands: mpsc::SyncSender<DeviceCommand>,
-    receiver: mpsc::Receiver<DeviceCommand>,
-    catalog: HashMap<String, ParameterDescription>,
-    latest: Mutex<HashMap<String, Observation>>,
-}
+const WAIT: Duration = Duration::from_secs(10);
 
-impl Context {
-    fn new() -> Self {
-        let (commands, receiver) = mpsc::sync_channel(8);
-        let catalog = [
+struct ControlledDriver {
+    entered: mpsc::Sender<Value>,
+    release: mpsc::Receiver<()>,
+}
+impl Driver for ControlledDriver {
+    fn parameters(&self) -> Vec<ParameterDescription> {
+        [
             ("power", Spec::Integer { min: 0, max: 100 }, true, None),
             (
                 "temperature",
@@ -31,44 +37,171 @@ impl Context {
                     max: 500.0,
                 },
                 false,
-                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(3600)),
             ),
         ]
         .into_iter()
-        .map(|(id, spec, writable, default_poll_period)| {
-            (
-                id.into(),
-                ParameterDescription {
-                    id: id.into(),
-                    spec,
-                    writable,
-                    default_poll_period,
-                    unit: "".into(),
-                },
-            )
-        })
-        .collect();
+        .map(
+            |(id, spec, writable, default_poll_period)| ParameterDescription {
+                id: id.into(),
+                spec,
+                writable,
+                default_poll_period,
+                unit: "".into(),
+            },
+        )
+        .collect()
+    }
+    fn read(&mut self, parameter: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
+        match parameter {
+            "power" => Ok(Value::Integer(30)),
+            "temperature" => Ok(Value::Float(20.0)),
+            _ => panic!("driver received a nonlocal key"),
+        }
+    }
+    fn write(
+        &mut self,
+        parameter: &str,
+        value: &Value,
+        _: &mut dyn DeviceIo,
+    ) -> Result<(), DriverError> {
+        assert_eq!(parameter, "power");
+        self.entered.send(value.clone()).unwrap();
+        self.release.recv_timeout(WAIT).unwrap();
+        Ok(())
+    }
+}
+
+struct Context {
+    service: DeviceService,
+    handle: PortHandle,
+    worker: Option<JoinHandle<StopReason>>,
+    // Keep the worker's initial poll alive; stream tests inject aggregator events explicitly.
+    _observations: mpsc::Receiver<DeviceObservation>,
+    entered: mpsc::Receiver<Value>,
+    release: mpsc::Sender<()>,
+    // Only the raw TCP framing adapter needs these explicit dispatch arguments.
+    catalog: HashMap<String, ParameterDescription>,
+    latest: Mutex<HashMap<String, Observation>>,
+}
+impl Context {
+    fn new() -> Self {
+        Self::with_capacity(8)
+    }
+    fn with_capacity(capacity: usize) -> Self {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let device = DeviceInstance::new(
+            "furnace1",
+            ControlledDriver {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        )
+        .unwrap();
+        let (worker, channels) = PortWorker::new(
+            BufReader::new(Cursor::new(Vec::<u8>::new())),
+            vec![device],
+            8,
+            8,
+        )
+        .unwrap();
+        let mut registry = DeviceRegistry::new();
+        registry
+            .register_port("p", channels.commands.clone())
+            .unwrap();
+        registry.register_device("p", &worker.devices()[0]).unwrap();
+        let catalog = registry
+            .parameters()
+            .map(|p| {
+                let mut description = p.description.clone();
+                description.id = p.global_key.clone();
+                (description.id.clone(), description)
+            })
+            .collect();
+        let service = DeviceService::new(CommandRouter::new(registry), capacity);
         Self {
-            commands,
-            receiver,
+            service,
+            handle: channels.commands,
+            worker: Some(thread::spawn(move || worker.run())),
+            _observations: channels.observations,
+            entered,
+            release,
             catalog,
             latest: Mutex::new(HashMap::new()),
         }
     }
-
     fn send(&self, session: &mut Session, text: &str, now: Instant) {
-        session
-            .receive_message(text, &self.commands, &self.catalog, &self.latest, now)
+        self.service.receive_message(session, text, now).unwrap();
+    }
+    fn started(&self) {
+        assert_eq!(self.entered.recv_timeout(WAIT).unwrap(), Value::Integer(30));
+    }
+    fn complete(&self) {
+        self.release.send(()).unwrap();
+        // The following read can finish only after the preceding Set reply was sent.
+        self.barrier();
+    }
+    fn barrier(&self) {
+        let pending = self
+            .handle
+            .read(99, "furnace1", "power", Instant::now() + WAIT)
+            .unwrap();
+        assert!(received(pending).is_ok());
+    }
+    fn publish(&self, value: f64) {
+        self.service
+            .apply_event(AggregatorEvent::Measurement {
+                port_id: "p".into(),
+                global_key: "furnace1/temperature".into(),
+                observation: Observation {
+                    source: "temperature".into(),
+                    unit: "".into(),
+                    completed_at: UNIX_EPOCH,
+                    reading: Ok(Value::Float(value)),
+                },
+            })
+            .unwrap();
+    }
+    fn lose(&self) {
+        self.service
+            .apply_event(AggregatorEvent::DataLost {
+                port_id: "p".into(),
+                loss_epoch: 1,
+            })
+            .unwrap();
+    }
+    fn close(&mut self) {
+        self.handle.shutdown();
+        let reason = self.worker.take().unwrap().join().unwrap();
+        assert_eq!(reason, StopReason::Shutdown);
+        self.service
+            .apply_event(AggregatorEvent::PortStopped {
+                port_id: "p".into(),
+                reason,
+            })
             .unwrap();
     }
 }
-
-fn observation(value: f64) -> Observation {
-    Observation {
-        source: "temperature".into(),
-        unit: "".into(),
-        completed_at: UNIX_EPOCH,
-        reading: Ok(Value::Float(value)),
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.handle.shutdown();
+        let _ = self.release.send(());
+        if let Some(worker) = self.worker.take() {
+            assert_eq!(worker.join().unwrap(), StopReason::Shutdown);
+        }
+    }
+}
+fn received<T>(mut pending: Pending<T>) -> T {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match pending.poll(Instant::now()) {
+            Poll::Waiting(next) => pending = next,
+            Poll::Finished(Completion::Received { value, .. }) => return value,
+            _ => panic!("worker failed to finish barrier"),
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
     }
 }
 
@@ -98,13 +231,13 @@ fn complete_json_text_has_no_ndjson_dependency_and_uses_the_existing_parser() {
         r#"{"id":4,"id":5,"op":"ping"}"#,
         r#"{"id":4,"op":"ping"} {}"#,
         r#"{"id":4,"op":"get","key":"температура"}"#,
-        r#"{"id":5,"op":"get","key":"temperature"}"#,
+        r#"{"id":5,"op":"get","key":"furnace1/temperature"}"#,
     ] {
         context.send(&mut session, text, now);
         for incoming in tcp.receive(format!("{text}\r\n").as_bytes()) {
             tcp.dispatch_incoming(
                 incoming,
-                &context.commands,
+                &context.service,
                 &context.catalog,
                 &context.latest,
                 now,
@@ -119,7 +252,7 @@ fn complete_json_text_has_no_ndjson_dependency_and_uses_the_existing_parser() {
     }
     context.send(&mut session, "{\n \"id\":6,\n \"op\":\"ping\"\n}", now);
     assert_eq!(messages(&mut session), [json!({"id":6,"status":"ok"})]);
-    assert!(context.receiver.try_recv().is_err());
+    assert!(context.entered.try_recv().is_err());
 }
 
 #[test]
@@ -171,7 +304,7 @@ fn tcp_compatibility_framing_keeps_valid_prefix_before_terminal_error() {
                 session
                     .dispatch_incoming(
                         event,
-                        &context.commands,
+                        &context.service,
                         &context.catalog,
                         &context.latest,
                         now,
@@ -257,7 +390,7 @@ fn output_overflow_preserves_queued_prefix_and_terminates_message_session() {
     let error = session
         .receive_message(
             r#"{"id":2,"op":"ping"}"#,
-            &context.commands,
+            &context.service,
             &context.catalog,
             &context.latest,
             Instant::now(),
@@ -277,47 +410,32 @@ fn output_overflow_preserves_queued_prefix_and_terminates_message_session() {
 #[test]
 fn concurrent_message_session_orders_subscription_ack_completion_and_measurement() {
     let context = Context::new();
-    let fanout = ObservationFanout::new(8);
-    let receiver = fanout.register().unwrap();
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     let now = Instant::now();
     context.send(
         &mut session,
-        r#"{"id":1,"op":"set","key":"power","value":30}"#,
+        r#"{"id":1,"op":"set","key":"furnace1/power","value":30}"#,
         now,
     );
-    let DeviceCommand::Set(command) = context.receiver.recv().unwrap() else {
-        panic!("expected set")
-    };
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        assert!(command.execution.try_start());
-        started_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        command
-            .execution
-            .complete(|| command.reply.send(Ok(())).unwrap());
-    });
-    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    fanout.publish(&observation(-1.0)).unwrap(); // before activation, excluded
+    context.started();
+    context.publish(-1.0); // before activation, excluded
     context.send(
         &mut session,
-        r#"{"id":2,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":2,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     context.send(&mut session, r#"{"id":3,"op":"ping"}"#, now);
-    fanout.publish(&observation(25.0)).unwrap();
-    release_tx.send(()).unwrap();
-    worker.join().unwrap(); // completion is known to be ready, no timing race
+    context.publish(25.0);
+    context.complete(); // worker barrier proves completion is ready
     session.collect_ready(now).unwrap();
     session.collect_observations(&receiver).unwrap();
     let output = messages(&mut session);
     assert_eq!(output.len(), 4);
     assert_eq!(
         output[0],
-        json!({"id":2,"status":"ok","keys":["temperature"]})
+        json!({"id":2,"status":"ok","keys":["furnace1/temperature"]})
     );
     assert_eq!(output[1], json!({"id":3,"status":"ok"}));
     assert_eq!(output[2], json!({"id":1,"status":"ok"}));
@@ -330,34 +448,33 @@ fn concurrent_message_session_orders_subscription_ack_completion_and_measurement
 #[test]
 fn unsubscribe_and_reactivation_exclude_queued_old_publications() {
     let context = Context::new();
-    let fanout = ObservationFanout::new(8);
-    let receiver = fanout.register().unwrap();
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     let now = Instant::now();
     context.send(
         &mut session,
-        r#"{"id":1,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":1,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
-    fanout.publish(&observation(1.0)).unwrap();
+    context.publish(1.0);
     context.send(
         &mut session,
-        r#"{"id":2,"op":"unsubscribe","keys":["temperature"]}"#,
+        r#"{"id":2,"op":"unsubscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     session.collect_observations(&receiver).unwrap();
-    fanout.publish(&observation(2.0)).unwrap();
+    context.publish(2.0);
     context.send(
         &mut session,
-        r#"{"id":3,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":3,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
-    fanout.publish(&observation(3.0)).unwrap();
+    context.publish(3.0);
     // Idempotent subscribe must not move the retained key's boundary past 3.0.
     context.send(
         &mut session,
-        r#"{"id":4,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":4,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     session.collect_observations(&receiver).unwrap();
@@ -373,27 +490,26 @@ fn unsubscribe_and_reactivation_exclude_queued_old_publications() {
 
 #[test]
 fn message_receiver_overflow_is_sticky_across_resubscription() {
-    let context = Context::new();
-    let fanout = ObservationFanout::new(1);
-    let receiver = fanout.register().unwrap();
+    let context = Context::with_capacity(1);
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     let now = Instant::now();
     context.send(
         &mut session,
-        r#"{"id":1,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":1,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
-    fanout.publish(&observation(1.0)).unwrap();
-    fanout.publish(&observation(2.0)).unwrap();
+    context.publish(1.0);
+    context.publish(2.0);
     context.send(
         &mut session,
-        r#"{"id":2,"op":"unsubscribe","keys":["temperature"]}"#,
+        r#"{"id":2,"op":"unsubscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     context.send(
         &mut session,
-        r#"{"id":3,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":3,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     session.collect_observations(&receiver).unwrap();
@@ -410,18 +526,17 @@ fn message_receiver_overflow_is_sticky_across_resubscription() {
 
 #[test]
 fn orderly_observation_close_drains_prefix_and_differs_from_data_loss() {
-    let context = Context::new();
-    let fanout = ObservationFanout::new(8);
-    let receiver = fanout.register().unwrap();
+    let mut context = Context::new();
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     context.send(
         &mut session,
-        r#"{"id":1,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":1,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         Instant::now(),
     );
-    fanout.publish(&observation(25.0)).unwrap();
-    drop(fanout);
+    context.publish(25.0);
+    context.close();
     session.collect_observations(&receiver).unwrap();
     let output = messages(&mut session);
     assert_eq!(output.len(), 3);
@@ -432,19 +547,18 @@ fn orderly_observation_close_drains_prefix_and_differs_from_data_loss() {
 
 #[test]
 fn observation_service_is_bounded_to_one_turn() {
-    let context = Context::new();
-    let fanout = ObservationFanout::new(64);
-    let receiver = fanout.register().unwrap();
+    let context = Context::with_capacity(64);
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 64 * 1024);
     session.bind_observations(&receiver);
     context.send(
         &mut session,
-        r#"{"id":1,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":1,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         Instant::now(),
     );
     messages(&mut session);
     for n in 0..40 {
-        fanout.publish(&observation(f64::from(n))).unwrap();
+        context.publish(f64::from(n));
     }
     session.collect_observations(&receiver).unwrap();
     let first = messages(&mut session);
@@ -464,44 +578,30 @@ fn concurrent_message_eof_preserves_queued_cancellation_and_started_outcome_unkn
     for id in 1..=2 {
         context.send(
             &mut session,
-            &json!({"id":id,"op":"set","key":"power","value":30}).to_string(),
+            &json!({"id":id,"op":"set","key":"furnace1/power","value":30}).to_string(),
             now,
         );
     }
-    let DeviceCommand::Set(queued) = context.receiver.recv().unwrap() else {
-        panic!("set")
-    };
-    let DeviceCommand::Set(started) = context.receiver.recv().unwrap() else {
-        panic!("set")
-    };
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        assert!(started.execution.try_start());
-        entered_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        started
-            .execution
-            .complete(|| assert!(started.reply.send(Ok(())).is_err()));
-    });
-    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    context.started(); // FIFO: request 1 has started; request 2 is queued.
     session.close_input();
     assert!(!session.is_finished());
     context.send(&mut session, r#"{"id":3,"op":"ping"}"#, now);
     session
         .collect_ready(now + Duration::from_secs(11))
         .unwrap();
-    assert!(!queued.execution.try_start());
     assert_eq!(
         messages(&mut session),
         [
-            json!({"id":1,"status":"error","error":"runtime_timeout"}),
-            json!({"id":2,"status":"error","error":"outcome_unknown"}),
+            json!({"id":1,"status":"error","error":"outcome_unknown"}),
+            json!({"id":2,"status":"error","error":"runtime_timeout"}),
         ]
     );
     assert!(session.is_finished());
-    release_tx.send(()).unwrap();
-    worker.join().unwrap();
+    context.complete();
+    assert!(
+        context.entered.try_recv().is_err(),
+        "cancelled request must not reach driver"
+    );
     session
         .collect_ready(now + Duration::from_secs(12))
         .unwrap();
@@ -511,31 +611,25 @@ fn concurrent_message_eof_preserves_queued_cancellation_and_started_outcome_unkn
 #[test]
 fn clean_message_eof_keeps_final_ack_and_stops_observation_admission() {
     let context = Context::new();
-    let fanout = ObservationFanout::new(8);
-    let receiver = fanout.register().unwrap();
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     let now = Instant::now();
     context.send(
         &mut session,
-        r#"{"id":1,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":1,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
     context.send(
         &mut session,
-        r#"{"id":2,"op":"set","key":"power","value":30}"#,
+        r#"{"id":2,"op":"set","key":"furnace1/power","value":30}"#,
         now,
     );
-    let DeviceCommand::Set(command) = context.receiver.recv().unwrap() else {
-        panic!("set")
-    };
-    assert!(command.execution.try_start());
+    context.started();
     session.close_input();
-    fanout.publish(&observation(25.0)).unwrap();
+    context.publish(25.0);
     session.collect_observations(&receiver).unwrap();
-    command
-        .execution
-        .complete(|| command.reply.send(Ok(())).unwrap());
+    context.complete();
     session.collect_ready(now).unwrap();
     let output = messages(&mut session);
     assert_eq!(output.len(), 2);
@@ -544,30 +638,24 @@ fn clean_message_eof_keeps_final_ack_and_stops_observation_admission() {
 }
 
 #[test]
-fn terminal_loss_does_not_fabricate_pending_ack_and_drop_releases_reply_receiver() {
-    let context = Context::new();
-    let fanout = ObservationFanout::new(1);
-    let receiver = fanout.register().unwrap();
+fn terminal_loss_does_not_fabricate_pending_ack_or_block_worker_after_drop() {
+    let context = Context::with_capacity(1);
+    let receiver = context.service.register_client().unwrap();
     let mut session = Session::new(8, 4096);
     session.bind_observations(&receiver);
     let now = Instant::now();
     context.send(
         &mut session,
-        r#"{"id":1,"op":"set","key":"power","value":30}"#,
+        r#"{"id":1,"op":"set","key":"furnace1/power","value":30}"#,
         now,
     );
-    let DeviceCommand::Set(command) = context.receiver.recv().unwrap() else {
-        panic!("set")
-    };
-    assert!(command.execution.try_start());
+    context.started();
     context.send(
         &mut session,
-        r#"{"id":2,"op":"subscribe","keys":["temperature"]}"#,
+        r#"{"id":2,"op":"subscribe","keys":["furnace1/temperature"]}"#,
         now,
     );
-    fanout
-        .loss_epoch()
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    context.lose();
     session.collect_observations(&receiver).unwrap();
     session
         .collect_ready(now + Duration::from_secs(11))
@@ -577,7 +665,5 @@ fn terminal_loss_does_not_fabricate_pending_ack_and_drop_releases_reply_receiver
     assert_eq!(output[1]["error"], "observation_data_lost");
     assert!(session.is_finished());
     drop(session);
-    command
-        .execution
-        .complete(|| assert!(command.reply.send(Ok(())).is_err()));
+    context.complete(); // abandoned reply cannot block subsequent commands
 }
