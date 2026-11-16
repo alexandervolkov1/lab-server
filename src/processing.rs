@@ -652,8 +652,10 @@ pub fn float_parameter(
 }
 
 pub mod ema;
+pub mod pid;
 pub fn builtins() -> Registry {
     let mut r = Registry::default();
     r.register(ema::EmaFactory).expect("builtin descriptor");
+    r.register(pid::PidFactory).expect("builtin descriptor");
     r
 }

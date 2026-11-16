@@ -117,3 +117,75 @@ fn schemas_reject_unknown_fields_and_wrong_types_without_revision_change() {
     c.parameters.insert("typo".into(), json!(1));
     assert!(e.create(c, 0).is_err());
 }
+
+#[test]
+fn pid_derivative_antiwindup_gap_and_loss_require_explicit_restart() {
+    let mut e = Engine::new(builtins(), engine().catalog());
+    let mut c = config("loop", "a/raw");
+    c.type_id = "pid".into();
+    c.max_age_ms = 20000;
+    c.parameters=serde_json::from_value(json!({"setpoint":10.,"kp":2.,"ki":1.,"kd":3.,"output_min":0.,"output_max":20.,"max_gap":5.})).unwrap();
+    e.create(c.clone(), 0).unwrap();
+    let start = Instant::now();
+    let sample = |t, x| Observation {
+        source: "raw".into(),
+        unit: "C".into(),
+        completed_at: SystemTime::now(),
+        metadata: Some(SourceMetadata {
+            source_instance: 1,
+            sequence: t + 1,
+            generation: 0,
+            acquired_at: start + Duration::from_secs(t),
+            elapsed: Duration::from_secs(t),
+        }),
+        reading: Ok(Value::Float(x)),
+    };
+    let values = |out: Vec<Produced>| {
+        out.into_iter()
+            .map(|p| (p.key, p.observation.reading.unwrap()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let first = values(e.process("a/raw".into(), sample(0, 0.), start));
+    assert_eq!(first["processing/loop/i"], Value::Float(0.));
+    assert_eq!(first["processing/loop/d"], Value::Float(0.));
+    let second = values(e.process(
+        "a/raw".into(),
+        sample(1, 0.),
+        start + Duration::from_secs(1),
+    ));
+    assert_eq!(second["processing/loop/i"], Value::Float(0.));
+    c.parameters.insert("setpoint".into(), json!(20.));
+    e.configure(c, 1).unwrap();
+    let third = values(e.process(
+        "a/raw".into(),
+        sample(2, 0.),
+        start + Duration::from_secs(2),
+    ));
+    assert_eq!(third["processing/loop/d"], Value::Float(0.));
+    e.process(
+        "a/raw".into(),
+        sample(10, 0.),
+        start + Duration::from_secs(10),
+    );
+    assert_eq!(e.state("loop").unwrap().0, State::Fault);
+    e.process(
+        "a/raw".into(),
+        sample(11, 0.),
+        start + Duration::from_secs(11),
+    );
+    assert_eq!(e.state("loop").unwrap().0, State::Fault);
+    e.set_state("loop", State::Shadow, 2).unwrap();
+    e.process(
+        "a/raw".into(),
+        sample(12, 2.),
+        start + Duration::from_secs(12),
+    );
+    assert_eq!(e.state("loop").unwrap().0, State::Shadow);
+    e.invalidate(&["a/raw".into()], "lost");
+    e.process(
+        "a/raw".into(),
+        sample(13, 3.),
+        start + Duration::from_secs(13),
+    );
+    assert_eq!(e.state("loop").unwrap().0, State::Fault);
+}
