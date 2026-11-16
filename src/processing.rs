@@ -325,7 +325,15 @@ impl Engine {
         self.order = order;
         Ok(())
     }
-    pub fn configure(&mut self, mut config: Configuration, expected: u64) -> Result<(), String> {
+    pub fn configure(&mut self, config: Configuration, expected: u64) -> Result<(), String> {
+        self.configure_with_changes(config, expected).map(|_| ())
+    }
+    /// Output histories invalidated by this committed rewire, including descendants.
+    pub(crate) fn configure_with_changes(
+        &mut self,
+        mut config: Configuration,
+        expected: u64,
+    ) -> Result<BTreeSet<String>, String> {
         self.check_revision(expected)?;
         let node = self.nodes.get(&config.name).ok_or("unknown_instance")?;
         if node.config.type_id != config.type_id || node.state == State::Auto {
@@ -340,6 +348,20 @@ impl Engine {
             replacement.reset();
         }
         let name = config.name.clone();
+        let changed = if rewire {
+            self.dependents(&name)
+                .iter()
+                .flat_map(|name| {
+                    self.nodes[name]
+                        .description
+                        .outputs
+                        .iter()
+                        .map(move |o| signal(name, &o.name))
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let node = self.nodes.get_mut(&name).unwrap();
         node.config = config;
         node.component = replacement;
@@ -348,7 +370,7 @@ impl Engine {
         }
         self.order = order;
         self.revision += 1;
-        Ok(())
+        Ok(changed)
     }
     fn validate_graph(
         &self,

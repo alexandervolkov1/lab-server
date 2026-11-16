@@ -149,6 +149,7 @@ impl DeviceService {
     ) -> Result<serde_json::Value, String> {
         use crate::processing::Management::*;
         let mut engine = self.processing.lock().expect("processing lock poisoned");
+        let mut discontinued = std::collections::BTreeSet::new();
         match command {
             Outputs => return Ok(self.router.authority().snapshot()),
             Bind {
@@ -197,7 +198,7 @@ impl DeviceService {
             Configure {
                 configuration,
                 expected_revision,
-            } => engine.configure(configuration, expected_revision)?,
+            } => discontinued = engine.configure_with_changes(configuration, expected_revision)?,
             Delete {
                 name,
                 cascade,
@@ -240,7 +241,8 @@ impl DeviceService {
                 )
             })
             .collect();
-        self.fanout.update_keys(engine.lineage(&physical));
+        self.fanout
+            .update_keys(engine.lineage(&physical), &discontinued);
         self.latest
             .lock()
             .expect("cache lock poisoned")

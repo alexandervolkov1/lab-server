@@ -202,7 +202,14 @@ impl ObservationFanout {
         }
     }
 
-    pub(crate) fn update_keys(&self, keys: HashMap<String, BTreeSet<String>>) {
+    pub(crate) fn update_keys(
+        &self,
+        keys: HashMap<String, BTreeSet<String>>,
+        discontinued: &BTreeSet<String>,
+    ) {
+        // Same boundary as publish: a terminal stream can drain its old prefix,
+        // but cannot receive any observation from the replacement graph.
+        let subscribers = self.subscribers.lock().expect("subscriber lock poisoned");
         let removed: HashSet<_> = {
             let mut old = self.domains.keys.write().expect("domain lock poisoned");
             let removed = old
@@ -213,11 +220,14 @@ impl ObservationFanout {
             *old = keys;
             removed
         };
-        let subscribers = self.subscribers.lock().expect("subscriber lock poisoned");
         for (interest, _) in subscribers.iter() {
             if let Some(interest) = interest.upgrade() {
                 let mut state = interest.state.lock().expect("interest lock poisoned");
-                if state.keys.iter().any(|k| removed.contains(k)) {
+                if state
+                    .keys
+                    .iter()
+                    .any(|k| removed.contains(k) || discontinued.contains(k))
+                {
                     state.stream_closed = true;
                 }
                 // Rewiring changes domain lineage too. Existing streams must resubscribe.
