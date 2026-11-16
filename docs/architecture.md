@@ -2,6 +2,8 @@
 
 [Запуск и краткий справочник](../README.md) · [Протокол](protocol.md)
 
+[Динамические компоненты и актуальная схема обработки](processing-architecture.md) · [API компонентов](processing-api.md)
+
 ## Путь команды и наблюдения
 
 TCP/WS → Session → DeviceService → CommandRouter → PortHandle → PortWorker → Driver/DeviceIo.
@@ -479,6 +481,7 @@ fn record_one(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> 
         source: "power".into(),
         unit: "%".into(),
         completed_at: SystemTime::now(),
+        metadata: None,
         reading: Ok(Value::Integer(30)),
     })?;
     let summary = recorder.shutdown()?;
@@ -520,7 +523,7 @@ Writer переносит новые снимки в событие `RecorderDat
 
 `DataLost` с `origin=port_worker` хранит исходный `loss_epoch`. `RecorderDataLost` с `origin=recorder`
 хранит отдельные накопленные счётчики и `port_worker_continuity_unknown`, если был потерян сам `DataLost`.
-JSON содержит `rejected_invalid_data` в виде десятичной строки. Схема остаётся версии 1: столбцы
+JSON содержит `rejected_invalid_data` в виде десятичной строки. В схеме v2 эти правила сохранены: столбцы
 `recorder_dropped_events` и `recorder_dropped_data_lost_events` по-прежнему относятся только к переполнению,
 а `recorder_incomplete` учитывает также `InvalidData`. В событиях ранних версий Recorder этого JSON-поля нет;
 их нулевые счётчики не доказывают отсутствие отказов `InvalidData`, которые раньше не учитывались.
@@ -536,16 +539,17 @@ JSON содержит `rejected_invalid_data` в виде десятичной �
 Паника writer при стандартном unwind также преобразуется в ошибку; аварийное завершение процесса,
 `panic=abort`, сбой диска или питания не дают гарантий для очереди в памяти.
 
-### Схема версии 1
+### Схема версии 2
 
-Файл имеет `PRAGMA application_id = 0x4c414252` (`LABR`) и `PRAGMA user_version = 1`.
-Чужие базы и неизвестные версии отклоняются, миграций пока нет. Повторное открытие добавляет сеанс,
+Файл имеет `PRAGMA application_id = 0x4c414252` (`LABR`) и `PRAGMA user_version = 2`.
+Собственная v1 транзакционно мигрирует в v2; чужие базы и неизвестные версии отклоняются. Повторное открытие добавляет сеанс,
 не удаляя старые строки. Таблицы `STRICT` и `CHECK` не позволяют смешивать колонки разных типов значения.
 
 | Таблица | Содержимое |
 | --- | --- |
 | `sessions` | `id`, `started_at_ns`, `ended_at_ns`; `recorder_incomplete` и два накопленных счётчика потерь Recorder |
-| `measurements` | `session_id`, `port_id`, `global_key`, исходный `local_source`, `completed_at_ns`, `unit`, `value_type`, отдельные `integer_value`, `real_value`, `boolean_value`, `read_error` |
+| `measurements` | `session_id`, `port_id`, `global_key`, исходный `local_source`, `completed_at_ns`, `unit`, `value_type`, отдельные `integer_value`, `real_value`, `boolean_value`, `read_error`, nullable JSON `source_metadata` |
+| `record_order` | Общий порядок новых принятых событий: id, session_id, kind (measurement/event), row_id |
 | `events` | `session_id`, `registered_at_ns`, `event_type`, `origin`, необязательный `port_id`, структурированный `details_json` |
 
 У каждой строки измерения и события есть собственный `id`. Индексы: `(session_id, global_key, completed_at_ns)`

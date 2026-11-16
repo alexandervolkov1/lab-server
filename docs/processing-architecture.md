@@ -1,8 +1,6 @@
 # Processing components
 
-Status: implementation in progress. The user approved option A: worker-originated
-source metadata, rejection of old queued generations, automatic filter reinitialization
-only from a valid new generation, and explicit operator restart for controllers.
+Status: implemented on feature/processing-components; hardware validation and merge pending review.
 Baseline: `78d150ed484aca8932bbc375bf8c6dc59c64f733`.
 
 ## Boundaries
@@ -33,7 +31,7 @@ flowchart LR
 
 A ComponentFactory supplies a stable type identifier, kind (filter/controller), typed
 parameter schema, named input/output descriptions, validation and construction. A Component
-processes samples and invalidation, resets and prepares a replacement configuration while
+processes samples, resets on coordinator invalidation and prepares a replacement configuration while
 preserving permitted state. Filters and controllers share graph/lifecycle machinery;
 controllers additionally return an optional output proposal, never a hardware command.
 The registry is the only location mentioning builtin factories. API, storage, graph,
@@ -56,8 +54,8 @@ collisions and acyclicity before publication; evaluate in deterministic topologi
 Each source event precedes all of its derived events in cache, fanout and recorder.
 Management changes share the coordinator's commit boundary with observations. Publish
 catalog registration before first value; invalidate/remove before acknowledging deletion.
-Reject deletion with dependents unless an explicit cascade is requested. Cascade first
-revokes dependent controller authority, then removes nodes in reverse topological order.
+Reject deletion with dependents unless an explicit cascade is requested. Cascade removes the transitive dependency set and revokes controller authority at
+the same service commit boundary, before acknowledging deletion.
 
 Dynamic catalog membership must reach both describe/get and fanout domains. Domain lineage
 is a set of physical source incarnations, not a fabricated physical port. Multi-input
@@ -69,13 +67,13 @@ an explicit reason; unrelated clients/ports continue. No replay is implied.
 Errors, missing inputs, stale samples, backwards/duplicate timestamps, port stop and loss
 invalidate all descendants. An independent monotonic watchdog detects silence; receiving
 no event must not leave an Auto controller active indefinitely. Finite numeric validation
-also applies to computed outputs. Wall-clock timestamps remain for display/SQLite;
+also applies to computed outputs. The graph carries the oldest contributing acquisition
+time across multi-input chains; a fresh trigger cannot hide an aged ancestor. Wall-clock timestamps remain for display/SQLite;
 elapsed-time processing and freshness require monotonic acquisition metadata.
 
 Current AggregatorEvent::DataLost is explicitly retrospective: it can arrive after an
 affected batch, and equal epoch reads do not certify continuity. Resetting a filter only
-at the notification does not establish a trustworthy recovery boundary. The implementation
-must resolve this before physical Auto is enabled; see the decision record below.
+at the notification does not establish a trustworthy recovery boundary. The worker envelope and Continuity acceptance floor resolve recovery; see the implementation record below.
 
 ## Mathematics
 
@@ -106,6 +104,7 @@ until effect metadata exists, conservatively reserve the entire device for an ac
 Do not infer effects from action names. Safe release means revoking authority and accounting
 for in-flight commands; it does not assert that a physical heater has switched off.
 A configured safe-output procedure requires a separate explicit contract and confirmation.
+Manual requests remain explicit operator actions after outcome_unknown; automatic authority stays faulted.
 
 ## API and client direction
 
@@ -116,16 +115,16 @@ incarnation. Type descriptors expose schema and ports. No EMA-only/PID-only netw
 describe/get/subscribe use the same dynamic catalog on TCP and WS. Steel wrappers should
 mirror generic operations and leave scripts/arduino-start.scm unchanged.
 
-Exact wire fields and executable examples will be documented with the implementation;
-this design is not a claim that these operations already exist.
+The implemented wire fields and executable examples are documented in processing-api.md
+and lab-plot/docs/processing.md.
 
 The inspected lab-plot baseline is `386459a` on main. Its typed Request enum, encoder,
-ResponseData parser, worker matches_request and Steel response conversion all need a
-generic management request/result family. Adding only Scheme functions would be insufficient:
-the worker rejects responses that do not match the pending typed request. Preserve existing
-variants and ACK semantics. New management data should be descriptor-driven JSON converted
-to Steel values, without a concrete algorithm switch. Plot bindings already use global
-signal keys; dynamic derived signals should follow that path. No client files were changed.
+ResponseData parser, worker matches_request and Steel response conversion now support a
+generic management request/result family. The worker validates the response against the
+pending typed request. Existing variants and ACK semantics are preserved. Descriptor-driven
+JSON converts to Steel values without a concrete algorithm switch. Plot bindings use global
+signal keys for both physical and derived signals. Client changes are isolated on
+lab-plot feature/processing-components.
 
 ## Archive reference
 
@@ -165,71 +164,50 @@ Branches: [processing-components](https://github.com/alexandervolkov1/lab-server
 [retained metakon-5x3-driver](https://github.com/alexandervolkov1/lab-server/tree/feature/metakon-5x3-driver).
 Master will not be changed again before review. No PR, tag or release was created.
 
-## Решение, необходимое перед реализацией
+## Принятый контракт и реализация
 
-Препятствие относится к общему контракту восстановления после потери данных. Это не
-невозможность реализовать фильтры: необходимо выбрать, как изменить контракт источника
-или ограничить восстановление. Ни один из вариантов ниже пока не реализован.
+Вариант A утверждён пользователем и реализован. PortWorker создаёт SourceMetadata:
+source_instance, sequence периодической попытки, generation, acquired_at (Instant),
+elapsed от начала worker. Ошибки чтения также являются попытками; пропущенная отправка
+увеличивает поколение следующего принятого образца. Агрегатор не восстанавливает метаданные.
+Continuity хранит минимально допустимое поколение и отклоняет старый префикс независимо
+от позиции DataLost. MAX означает постоянную утрату непрерывности. Старые исходные
+измерения сохраняются в recorder, но не восстанавливают граф. Контроллер после потери
+остаётся fault до явного shadow и отдельного Auto; фильтр инициализируется новым поколением.
 
-Факты в текущем коде:
+Общие интерфейсы находятся в src/processing.rs: ComponentFactory, Component, Registry,
+TypeDescription, ParameterSchema/ParameterType, Configuration, Engine и Management.
+В этой версии сигналы компонентов — конечные числовые скаляры, именованные входы и выходы;
+параметры поддерживают float/integer/boolean/choice. Kind определяет lifecycle фильтра или
+контроллера, proposal указывает выход-кандидат контроллера. Центральный код не знает
+конкретных типов EMA/PID. Для нового типа реализуйте factory и Component, зарегистрируйте
+его в builtins() (или Registry при самостоятельном использовании Engine), добавьте
+математические тесты. Транспорт, recorder и клиент менять не требуется.
 
-- `src/port_worker.rs`: канал содержит DeviceObservation без номера последовательности,
-  поколения непрерывности и монотонного времени измерения. При Full worker отдельно
-  увеличивает loss_epoch. Publication gate защищает отправку и увеличение счётчика,
-  но агрегатор не получает через этот канал позицию пропуска.
-- `src/observation_aggregator.rs`: DataLost явно документирован как уведомление,
-  не как граница пропуска. Он может быть выдан перед старым префиксом очереди.
-- Существующий тест
-  `tests/observation_aggregator.rs::overflow_is_detected_after_drain_coalesces_and_does_not_stop_commands`
-  проверяет `[DataLost(epoch=3), Measurement(value=3)]`, хотя потери относятся к более
-  поздним измерениям. Это воспроизводимое поведение, а не гипотеза о планировщике.
-- Fanout решает задачу доставки завершением затронутой клиентской сессии; серверные
-  компоненты должны жить независимо от этой сессии. Переподключение клиента не создаёт
-  границу восстановления графа.
+prepare/reconfigure возвращает новый объект до commit, а проверки конфигурации и графа
+выполняются до изменения RAM. Глобальная revision обеспечивает CAS всех управленческих
+изменений. Граф ограничен, порядок детерминирован, каталог вычисляется топологически,
+lineage связывает производный сигнал со всеми исходными физическими портами. Общий gate
+DeviceService сериализует управление и исходное событие со всеми производными событиями;
+recording callback выполняется на этой же границе. Дополнительных runtime/worker потоков
+не создано. Watchdog обслуживается существующим startup loop даже при пустом агрегаторе.
 
-Пример: очередь содержит x1, x2; x3 потерян; агрегатор выдаёт DataLost, x1, x2;
-затем поступает x4. Если сбросить EMA на DataLost и продолжить на первом успешном
-Measurement, фильтр снова накопит состояние на x1/x2 и соединит его с x4 через
-неизвестный пропуск. Контроллер также может принять старый префикс за восстановленный
-вход. Простая проверка текущего loss_epoch у x4 не позволяет установить, к какому
-из ранее полученных образцов относится пропуск. При нескольких потерях и нескольких
-сигналах одного порта ситуация сложнее. Уже опубликованные значения нельзя молча
-переинтерпретировать как исправленные.
+Output Authority принадлежит CommandRouter и разделяется его клонами. Permit передаётся
+в существующий SetExecution и проверяется непосредственно при начале команды PortWorker.
+Проверяются поколение владельца, поколения и живость исходных портов, deadline. Последний
+ограничен возрастом входа. Atomic source_alive позволяет проверить остановку без повторного
+захвата worker stop mutex. У Generic action консервативная область — все writable-выходы
+прибора. Controller держит не более одной ожидающей команды; ошибки отзывают authority.
 
-### Вариант A — расширить общий контракт источника (рекомендуется)
+Код и тесты реализации: src/continuity.rs, src/processing/, src/output.rs,
+tests/processing.rs, tests/processing_service.rs, тест processing_management в
+ tests/websocket.rs, loss_before_old_prefix в src/port_worker/subscription_races.rs.
+SQLite v2 включает транзакционную миграцию v1, исходные метаданные и общий record_order.
+В lab-plot добавлены typed request/result, Steel wrappers и проверка реального серверного
+тракта Arduino driver → EMA → TCP → PlotState с эмуляцией serial I/O в памяти.
 
-Добавить внутренний envelope наблюдения: incarnation источника, sequence каждой попытки
-периодического измерения, continuity epoch и монотонное время завершения. Метаданные
-создаёт PortWorker; приборные Driver остаются без изменений. Каждое принятое наблюдение
-несёт собственное поколение, поэтому старый префикс и данные после пропуска различимы.
-Внешний loss counter сохраняется для обнаружения последней потери даже без новых данных.
-
-Граф немедленно отзывает Auto при обнаружении потери, сохраняет порядок сырого префикса
-для записи, а переход между поколениями сбрасывает всю зависимую историю до расчёта
-нового значения. Запуск Auto после fault требует отдельного явного действия и свежего
-входа нового поколения. Watchdog использует монотонное время. Fanout сохраняет прежнюю
-семантику terminal loss; дополнительные сведения в API вводятся аддитивно. Для SQLite
-нужно явно определить хранение поколения и связей исходных/производных событий и
-версионирование схемы, не выдавая новый формат за старую схему.
-
-Это изменение общей инфраструктуры PortWorker → Aggregator → processing → recorder,
-а не специальный путь EMA/PID. Проверки должны воспроизвести старую очередь перед
-пропуском, несколько потерь, потерю без последующего измерения, переполнение счётчика,
-устаревший sample и изоляцию соседнего порта.
-
-### Вариант B — сохранить текущий канал и ограничить восстановление
-
-После DataLost все зависимые компоненты остаются invalid/fault; успешный sample сам
-по себе их не восстанавливает. Для возобновления нужна общая операция resynchronize:
-под publication gate установить границу и исключить накопленный префикс из расчёта,
-не удаляя его из потока recorder; затем ждать нового свежего входа и явно разрешать Auto.
-Полный перезапуск сервера также создаёт новую границу. При постоянно заполненной очереди
-восстановление может не состояться; без отдельной границы компоненты остаются fault.
-
-Этот вариант сохраняет форму DeviceObservation, но добавляет координацию с worker и
-ограничивает семантику восстановления. Для надёжной проверки возраста всё равно требуется
-монотонная метка источника либо отдельно согласованная, более слабая wall-clock политика.
-
-Остановка сделана по прямому условию задания «при обнаружении принципиального
-архитектурного препятствия остановиться и представить варианты решения». Никаких
-частных обходов для EMA/PID, новых сетевых команд или физического Auto пока нет.
+Точный сетевой контракт, переходы состояний, ограничения и совместимость описаны в
+[processing-api.md](processing-api.md). Примеры Steel находятся в lab-plot/docs/processing.md.
+Конфигурации пока RAM-only; data-only Configuration допускает последующий TOML loader.
+Физическое оборудование, аппаратные interlock и восстановление COM-порта не проверены.
+Автоматического повторного открытия остановившегося порта по-прежнему нет.

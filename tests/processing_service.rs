@@ -119,7 +119,7 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    struct Actuator(Arc<AtomicUsize>);
+    struct Actuator(Arc<AtomicUsize>, bool);
     impl Driver for Actuator {
         fn parameters(&self) -> Vec<ParameterDescription> {
             let mut p = Source.parameters();
@@ -143,14 +143,21 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         ) -> Result<(), DriverError> {
             assert_eq!(*value, Value::Integer(3));
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.1 {
+                Err(DriverError::new(
+                    "write failed",
+                    lab_server::driver::PortState::Synchronized,
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
-    for stop_before_start in [true, false] {
+    for (stop_before_start, fail_write) in [(true, false), (false, false), (false, true)] {
         let writes = Arc::new(AtomicUsize::new(0));
         let (worker, channels) = PortWorker::new(
             BufReader::new(Cursor::new(vec![])),
-            vec![DeviceInstance::new("a", Actuator(writes.clone())).unwrap()],
+            vec![DeviceInstance::new("a", Actuator(writes.clone(), fail_write)).unwrap()],
             8,
             8,
         )
@@ -222,6 +229,21 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
             writes.load(Ordering::SeqCst),
             usize::from(!stop_before_start)
         );
+        if fail_write {
+            let mut recorded = Vec::new();
+            service.tick_recorded(|e| recorded.push(e.clone())).unwrap();
+            assert_eq!(recorded.len(), 6);
+            assert!(recorded.iter().all(|e| matches!(e, AggregatorEvent::Measurement { observation, .. } if observation.reading.is_err())));
+            let list = manage(json!({"action":"list"})).unwrap();
+            assert_eq!(list["instances"][0]["state"], "fault");
+            let outputs = manage(json!({"action":"outputs"})).unwrap();
+            assert_eq!(outputs[0]["mode"], "manual");
+            assert_eq!(outputs[0]["outcome_unknown"], true);
+            service
+                .tick_recorded(|_| panic!("fault must only be published once"))
+                .unwrap();
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+        }
         service.stop_controls();
         channels.commands.shutdown();
         join.join().unwrap();

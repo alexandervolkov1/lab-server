@@ -169,8 +169,10 @@ pub struct Engine {
     nodes: BTreeMap<String, Instance>,
     order: Vec<String>,
     latest: HashMap<String, Observation>,
+    oldest: HashMap<String, Instant>,
     pub revision: u64,
     next_incarnation: u64,
+    catalog_budget: usize,
 }
 pub struct Produced {
     pub key: String,
@@ -178,6 +180,10 @@ pub struct Produced {
     pub proposal: Option<(String, u64, f64)>,
 }
 impl Engine {
+    pub(crate) fn with_catalog_budget(mut self, bytes: usize) -> Self {
+        self.catalog_budget = bytes.min(48 * 1024);
+        self
+    }
     pub fn touch(&mut self, expected: u64) -> Result<(), String> {
         self.check_revision(expected)?;
         self.revision += 1;
@@ -210,9 +216,8 @@ impl Engine {
             .map(|k| {
                 let o = self.latest.get(k)?;
                 o.reading.as_ref().ok()?;
-                o.metadata
-                    .as_ref()?
-                    .acquired_at
+                self.oldest
+                    .get(k)?
                     .checked_add(Duration::from_millis(n.config.max_age_ms))
             })
             .collect::<Option<Vec<_>>>()?
@@ -226,8 +231,10 @@ impl Engine {
             nodes: BTreeMap::new(),
             order: Vec::new(),
             latest: HashMap::new(),
+            oldest: HashMap::new(),
             revision: 0,
             next_incarnation: 1,
+            catalog_budget: 48 * 1024,
         }
     }
     fn check_revision(&self, expected: u64) -> Result<(), String> {
@@ -255,7 +262,27 @@ impl Engine {
         json!(self.registry.types())
     }
     pub fn list(&self) -> Json {
-        json!({"revision":self.revision, "instances":self.nodes.values().map(|n| json!({"configuration":n.config,"incarnation":n.incarnation,"state":n.state,"fault":n.fault})).collect::<Vec<_>>()})
+        self.page(0, 16).expect("default page")
+    }
+    pub fn page(&self, offset: usize, limit: usize) -> Result<Json, String> {
+        if limit == 0 || limit > 64 || offset > self.nodes.len() {
+            return Err("invalid_page".into());
+        }
+        let mut instances = Vec::new();
+        let mut bytes = 0;
+        for n in self.nodes.values().skip(offset).take(limit) {
+            let value = json!({"configuration":n.config,"incarnation":n.incarnation,"state":n.state,"fault":n.fault});
+            let size = value.to_string().len();
+            if bytes + size > 48 * 1024 {
+                break;
+            }
+            bytes += size;
+            instances.push(value);
+        }
+        let next = offset + instances.len();
+        Ok(
+            json!({"revision":self.revision,"instances":instances,"total":self.nodes.len(),"next_offset":if next<self.nodes.len(){Some(next)}else{None}}),
+        )
     }
     pub fn state(&self, name: &str) -> Option<(State, u64)> {
         self.nodes.get(name).map(|n| (n.state, n.incarnation))
@@ -377,6 +404,40 @@ impl Engine {
             }
             order.push(name);
         }
+        // Reserve the existing v1 describe frame before accepting a larger graph.
+        // 256 covers scalar bounds, poll period, field names and punctuation.
+        let cost = |key: &str, unit: &str| {
+            256 + json!(key).to_string().len() + json!(unit).to_string().len()
+        };
+        let mut bytes = self
+            .physical
+            .values()
+            .map(|p| cost(&p.id, &p.unit))
+            .sum::<usize>();
+        let mut units = self
+            .physical
+            .iter()
+            .map(|(k, p)| (k.clone(), p.unit.clone()))
+            .collect::<HashMap<_, _>>();
+        for name in &order {
+            let (c, d) = configs[name];
+            let inherited = c
+                .inputs
+                .values()
+                .next()
+                .and_then(|k| units.get(k))
+                .cloned()
+                .unwrap_or_default();
+            for o in &d.outputs {
+                let key = signal(name, &o.name);
+                let unit = o.unit.clone().unwrap_or_else(|| inherited.clone());
+                bytes = bytes.saturating_add(cost(&key, &unit));
+                units.insert(key, unit);
+            }
+        }
+        if bytes > self.catalog_budget {
+            return Err("catalog_capacity".into());
+        }
         Ok(order)
     }
     pub fn dependents(&self, name: &str) -> Vec<String> {
@@ -423,6 +484,7 @@ impl Engine {
             for o in node.description.outputs {
                 let key = signal(name, &o.name);
                 self.latest.remove(&key);
+                self.oldest.remove(&key);
                 keys.push(key);
             }
         }
@@ -445,6 +507,10 @@ impl Engine {
         node.component.reset();
         node.state = state;
         node.fault = None;
+        if state == State::Stopped {
+            self.invalidate_nodes(&[name.into()], "component_stopped");
+            self.nodes.get_mut(name).unwrap().state = State::Stopped;
+        }
         self.revision += 1;
         Ok(())
     }
@@ -511,12 +577,14 @@ impl Engine {
             n.fault = Some(reason.into());
             for o in &n.description.outputs {
                 self.latest.remove(&signal(&name, &o.name));
+                self.oldest.remove(&signal(&name, &o.name));
             }
         }
     }
     pub fn invalidate(&mut self, keys: &[String], reason: &str) {
         for key in keys {
             self.latest.remove(key);
+            self.oldest.remove(key);
         }
         let names = self
             .nodes
@@ -532,13 +600,10 @@ impl Engine {
             .iter()
             .filter(|(_, n)| {
                 n.config.inputs.values().any(|k| {
-                    self.latest
-                        .get(k)
-                        .and_then(|o| o.metadata.as_ref())
-                        .is_some_and(|m| {
-                            now.saturating_duration_since(m.acquired_at)
-                                > Duration::from_millis(n.config.max_age_ms)
-                        })
+                    self.oldest.get(k).is_some_and(|at| {
+                        now.saturating_duration_since(*at)
+                            > Duration::from_millis(n.config.max_age_ms)
+                    })
                 })
             })
             .map(|(n, _)| n.clone())
@@ -552,6 +617,11 @@ impl Engine {
         observation: Observation,
         now: Instant,
     ) -> Vec<Produced> {
+        if let Some(m) = &observation.metadata {
+            self.oldest.insert(key.clone(), m.acquired_at);
+        } else {
+            self.oldest.remove(&key);
+        }
         self.latest.insert(key.clone(), observation.clone());
         let mut changed = BTreeSet::from([key]);
         let catalog = self.catalog();
@@ -567,13 +637,25 @@ impl Engine {
                 .iter()
                 .filter_map(|(n, k)| self.latest.get(k).map(|o| (n.clone(), o.clone())))
                 .collect();
-            let valid = inputs.len() == node.config.inputs.len()
-                && inputs.values().all(|o| {
-                    o.reading.is_ok()
-                        && o.metadata.as_ref().is_some_and(|m| {
-                            now.saturating_duration_since(m.acquired_at)
-                                <= Duration::from_millis(node.config.max_age_ms)
-                        })
+            if inputs.len() != node.config.inputs.len() {
+                continue;
+            }
+            let oldest = node
+                .config
+                .inputs
+                .values()
+                .filter_map(|k| self.oldest.get(k))
+                .min()
+                .copied();
+            let valid = inputs.values().all(|o| o.reading.is_ok())
+                && node
+                    .config
+                    .inputs
+                    .values()
+                    .all(|k| self.oldest.contains_key(k))
+                && oldest.is_some_and(|at| {
+                    now.saturating_duration_since(at)
+                        <= Duration::from_millis(node.config.max_age_ms)
                 });
             let result = if !valid {
                 Err("invalid_input".into())
@@ -623,6 +705,9 @@ impl Engine {
                 } else {
                     None
                 };
+                if let Some(at) = oldest {
+                    self.oldest.insert(key.clone(), at);
+                }
                 self.latest.insert(key.clone(), sample.clone());
                 changed.insert(key.clone());
                 produced.push(Produced {
@@ -650,7 +735,12 @@ pub enum Management {
         expected_revision: u64,
     },
     Types,
-    List,
+    List {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "page_limit")]
+        limit: usize,
+    },
     Create {
         configuration: Configuration,
         expected_revision: u64,
@@ -670,6 +760,9 @@ pub enum Management {
         state: State,
         expected_revision: u64,
     },
+}
+fn page_limit() -> usize {
+    16
 }
 pub fn number(inputs: &Inputs, name: &str) -> Result<f64, String> {
     match inputs

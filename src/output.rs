@@ -53,7 +53,9 @@ impl Authority {
     pub fn release_all(&self) {
         for slot in self.slots.values() {
             let mut s = slot.lock().unwrap();
-            s.owner = None;
+            if s.owner.take().is_none() {
+                continue;
+            }
             if let Some(g) = s.generation.checked_add(1) {
                 s.generation = g;
             } else {
@@ -63,7 +65,7 @@ impl Authority {
     }
     pub fn permit(&self, keys: &[String], owner: Option<&Owner>) -> Result<Permit, &'static str> {
         let mut leases = Vec::new();
-        for key in keys {
+        for key in keys.iter().collect::<std::collections::BTreeSet<_>>() {
             let slot = self.slots.get(key).ok_or("unknown_output")?;
             let s = slot.lock().unwrap();
             if s.unknown && owner.is_some() {

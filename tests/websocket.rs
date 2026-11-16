@@ -319,6 +319,100 @@ fn tcp_receive(client: &mut BufReader<TcpStream>) -> Json {
     client.read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
 }
+
+#[test]
+fn processing_management_tcp_ws_dynamic_subscriptions_and_sqlite_share_one_graph() {
+    let database = db::Database::new();
+    let mut config = configuration();
+    for d in &mut config.devices {
+        d.poll_periods_ms.insert("sample".into(), 10);
+    }
+    // Use the same recording setup as the other startup integration cases.
+    config.recording = Some(lab_server::config::RecordingConfig {
+        enabled: true,
+        path: Some(database.0.clone()),
+        queue_capacity: Some(4096),
+    });
+    let mut server = Running::with_config(config);
+    let mut tcp = server.tcp();
+    let mut ws = server.connect();
+    let types = request(
+        &mut ws,
+        json!({"id":1,"op":"components","command":{"action":"types"}}),
+    );
+    assert!(
+        types["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["type_id"] == "ema")
+    );
+    for (id, revision, name, kind, input) in [
+        (1, 0, "smooth", "ema", "a/sample"),
+        (2, 1, "chain", "ema", "processing/smooth/value"),
+        (3, 2, "loop", "pid", "processing/chain/value"),
+    ] {
+        let reply = tcp_request(
+            &mut tcp,
+            json!({"id":id,"op":"components","command":{"action":"create","expected_revision":revision,"configuration":{"name":name,"type_id":kind,"inputs":{"input":input},"parameters":{},"max_age_ms":10000}}}),
+        );
+        assert_eq!(reply["status"], "ok");
+    }
+    let ack = request(
+        &mut ws,
+        json!({"id":2,"op":"subscribe","keys":["processing/chain/value","processing/loop/output"]}),
+    );
+    assert_eq!(ack["status"], "ok");
+    let measurement = receive(&mut ws);
+    assert_eq!(measurement["event"], "measurement");
+    assert_eq!(measurement["status"], "ok");
+    let reply = tcp_request(
+        &mut tcp,
+        json!({"id":4,"op":"components","command":{"action":"configure","expected_revision":3,"configuration":{"name":"smooth","type_id":"ema","inputs":{"input":"a/sample"},"parameters":{"tau":2.},"max_age_ms":10000}}}),
+    );
+    assert_eq!(reply["status"], "ok");
+    let conflict = tcp_request(
+        &mut tcp,
+        json!({"id":5,"op":"components","command":{"action":"delete","name":"smooth","expected_revision":3,"cascade":true}}),
+    );
+    assert_eq!(conflict["error"], "revision_conflict");
+    let reply = tcp_request(
+        &mut tcp,
+        json!({"id":6,"op":"components","command":{"action":"delete","name":"smooth","expected_revision":4,"cascade":true}}),
+    );
+    assert_eq!(reply["status"], "ok");
+    loop {
+        let event = receive(&mut ws);
+        if event["error"] == "observation_stream_closed" {
+            break;
+        }
+        assert_eq!(event["event"], "measurement");
+    }
+    assert_eq!(
+        tcp_request(
+            &mut tcp,
+            json!({"id":7,"op":"get","key":"processing/chain/value"})
+        )["error"],
+        "unknown_key"
+    );
+    drop(ws);
+    drop(tcp);
+    server.stop();
+    let c = database.connect();
+    assert!(
+        db::scalar(
+            &c,
+            "SELECT count(*) FROM measurements WHERE global_key='processing/chain/value' AND source_metadata IS NOT NULL"
+        ) > 0
+    );
+    assert_eq!(
+        db::scalar(
+            &c,
+            "SELECT count(*) FROM record_order WHERE kind='measurement'"
+        ),
+        db::scalar(&c, "SELECT count(*) FROM measurements")
+    );
+}
 fn publish(server: &Running, port: &str, key: &str, value: Value) {
     server
         .service

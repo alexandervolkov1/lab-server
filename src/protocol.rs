@@ -156,11 +156,16 @@ impl<'de> serde::Deserialize<'de> for UniqueJsonObject {
             {
                 let mut fields = serde_json::Map::new();
 
-                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                while let Some((key, value)) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
                     if fields.contains_key(&key) {
                         return Err(serde::de::Error::custom("duplicate JSON key"));
                     }
 
+                    validate_unique_nested(value.get()).map_err(serde::de::Error::custom)?;
+                    let value =
+                        serde_json::from_str(value.get()).map_err(serde::de::Error::custom)?;
                     fields.insert(key, value);
                 }
 
@@ -172,9 +177,26 @@ impl<'de> serde::Deserialize<'de> for UniqueJsonObject {
     }
 }
 
+fn validate_unique_nested(raw: &str) -> Result<(), serde_json::Error> {
+    match raw.trim_start().as_bytes().first() {
+        Some(b'{') => {
+            serde_json::from_str::<UniqueJsonObject>(raw)?;
+        }
+        Some(b'[') => {
+            for value in serde_json::from_str::<Vec<Box<serde_json::value::RawValue>>>(raw)? {
+                validate_unique_nested(value.get())?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn parse_json_object(
     frame: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, JsonError> {
+    // Validate syntax and serde's nesting limit before recursively checking raw fields.
+    serde_json::from_str::<serde_json::Value>(frame).map_err(|_| JsonError::InvalidJson)?;
     match serde_json::from_str::<UniqueJsonObject>(frame) {
         Ok(UniqueJsonObject(fields)) => Ok(fields),
         Err(_) => match serde_json::from_str::<serde_json::Value>(frame) {

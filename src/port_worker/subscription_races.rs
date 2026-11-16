@@ -20,6 +20,10 @@ fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent()
         )
         .unwrap()
     };
+    let poll = |worker: &mut PortWorker<BufReader<Cursor<Vec<u8>>>>| {
+        worker.scheduler.tasks[0].next_at = Instant::now();
+        worker.poll_one();
+    };
     let (mut worker, channels) = make();
     let (mut other, other_channels) = make();
     let mut registry = DeviceRegistry::new();
@@ -29,10 +33,25 @@ fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent()
     registry.register_device("p", &worker.devices()[0]).unwrap();
     let mut continuity = Continuity::new(channels.commands.source_instance());
     let mut independent = Continuity::new(other_channels.commands.source_instance());
+    let authority = crate::output::Authority::new(["target/power".into()].into_iter());
+    let owner = ("arbitrary_controller".into(), 1);
+    authority.acquire("target/power", owner.clone()).unwrap();
+    let execution = |handle: &PortHandle, generation| {
+        crate::pending::SetExecution::authorized(
+            Instant::now() + WAIT,
+            authority
+                .permit(&["target/power".into()], Some(&owner))
+                .unwrap()
+                .with_sources(vec![(handle.clone(), generation)]),
+        )
+    };
+    let queued_before_loss = execution(&channels.commands, 0);
     // Real worker stamps x1, x2; x3 cannot enter the capacity-two queue.
     for _ in 0..3 {
-        worker.poll_one();
+        poll(&mut worker);
     }
+    // Worker-side admission sees the loss before the aggregator reports it.
+    assert!(!queued_before_loss.try_start());
     let mut aggregator =
         ObservationAggregator::new(&registry, [("p".into(), channels.observations)]).unwrap();
     let batch = aggregator.poll(1);
@@ -61,10 +80,13 @@ fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent()
     assert_eq!(x2.metadata.as_ref().unwrap().sequence, 2);
     assert!(!continuity.accept(x2.metadata.as_ref().unwrap()));
     assert!(aggregator.poll(1).is_empty()); // silence does not recover anything
-    other.poll_one();
+    poll(&mut other);
     let sample = other_channels.observations.try_recv().unwrap();
     assert!(independent.accept(sample.observation.metadata.as_ref().unwrap()));
-    worker.poll_one(); // x4, first trustworthy sample of generation 1
+    let independent_write = execution(&other_channels.commands, 0);
+    assert!(independent_write.try_start());
+    independent_write.complete(|| {});
+    poll(&mut worker); // x4, first trustworthy sample of generation 1
     let batch = aggregator.poll(1);
     let [
         AggregatorEvent::Measurement {
@@ -78,9 +100,11 @@ fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent()
     assert_eq!((stamp.sequence, stamp.generation), (4, 1));
     assert!(continuity.accept(stamp));
     assert!(!continuity.accept(stamp)); // replay
+    let queued_before_repeat = execution(&channels.commands, 1);
     for _ in 0..4 {
-        worker.poll_one();
+        poll(&mut worker);
     } // x5/x6 queued; x7/x8 lost
+    assert!(!queued_before_repeat.try_start());
     let batch = aggregator.poll(1);
     let [
         AggregatorEvent::DataLost { loss_epoch, .. },
@@ -94,6 +118,9 @@ fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent()
     assert!(!continuity.accept(observation.metadata.as_ref().unwrap()));
     continuity.lost(u64::MAX);
     assert!(!continuity.accept(stamp));
+    let queued_before_stop = execution(&channels.commands, 3);
+    channels.commands.shutdown();
+    assert!(!queued_before_stop.try_start());
 }
 
 struct MockDriver;

@@ -42,7 +42,8 @@ impl DeviceService {
     }
     fn reconcile_controls(&self, engine: &mut crate::processing::Engine) {
         use crate::pending::{Completion, Poll};
-        for (name, c) in self.controls.lock().unwrap().iter_mut() {
+        let mut controls = self.controls.lock().unwrap();
+        for (name, c) in controls.iter_mut() {
             if let Some(pending) = c.pending.take() {
                 match pending.poll(Instant::now()) {
                     Poll::Waiting(p) => c.pending = Some(p),
@@ -59,6 +60,9 @@ impl DeviceService {
                 self.router.authority().release(&c.owner);
             }
         }
+        controls.retain(|name, c| {
+            c.pending.is_some() || engine.state(name).is_some_and(|(_, inc)| inc == c.owner.1)
+        });
     }
     fn submit_proposal(&self, name: &str, incarnation: u64, value: f64) {
         let mut engine = self.processing.lock().unwrap();
@@ -185,7 +189,7 @@ impl DeviceService {
                 );
             }
             Types => return Ok(engine.types()),
-            List => return Ok(engine.list()),
+            List { offset, limit } => return engine.page(offset, limit),
             Create {
                 configuration,
                 expected_revision,
@@ -378,9 +382,17 @@ impl DeviceService {
         let mut engine = self.processing.lock().unwrap();
         let stale = engine.tick(Instant::now());
         self.reconcile_controls(&mut engine);
+        let invalid = !engine.invalid_outputs().is_empty();
         drop(engine);
-        if !stale.is_empty() {
-            self.invalidate_cached("*", "stale_input", &mut record)?;
+        if invalid {
+            // A failed write may be the only event: do not wait for another
+            // measurement to invalidate the controller's published diagnostics.
+            let reason = if stale.is_empty() {
+                "component_unavailable"
+            } else {
+                "stale_input"
+            };
+            self.invalidate_cached("*", reason, &mut record)?;
         }
         Ok(())
     }
@@ -398,6 +410,17 @@ impl DeviceService {
             observation_capacity,
             router.registry(),
         ));
+        let actions_bytes = router
+            .registry()
+            .actions()
+            .map(|a| {
+                serde_json::json!({"key":a.global_key,"description":a.description.description})
+                    .to_string()
+                    .len()
+                    + 1
+            })
+            .sum::<usize>();
+        let catalog_budget = (64 * 1024usize).saturating_sub(actions_bytes.saturating_add(1024));
         let continuity = router
             .registry()
             .ports()
@@ -413,10 +436,10 @@ impl DeviceService {
         Self {
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
-            processing: Mutex::new(crate::processing::Engine::new(
-                crate::processing::builtins(),
-                catalog.clone(),
-            )),
+            processing: Mutex::new(
+                crate::processing::Engine::new(crate::processing::builtins(), catalog.clone())
+                    .with_catalog_budget(catalog_budget),
+            ),
             continuity: Mutex::new(continuity),
             router,
             catalog,

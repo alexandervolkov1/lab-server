@@ -189,3 +189,106 @@ fn pid_derivative_antiwindup_gap_and_loss_require_explicit_restart() {
     );
     assert_eq!(e.state("loop").unwrap().0, State::Fault);
 }
+
+#[test]
+fn multi_input_fresh_trigger_cannot_hide_old_ancestor_from_controller_watchdog() {
+    struct PairFactory;
+    impl ComponentFactory for PairFactory {
+        fn describe(&self) -> TypeDescription {
+            let mut d = Factory.describe();
+            d.type_id = "pair".into();
+            d.inputs = vec!["input".into(), "other".into()];
+            d
+        }
+        fn create(&self, p: &Parameters) -> Result<Box<dyn Component>, String> {
+            Factory.create(p)
+        }
+    }
+    let mut registry = builtins();
+    registry.register(PairFactory).unwrap();
+    let mut physical = engine().catalog();
+    let mut b = physical["a/raw"].clone();
+    b.id = "b/raw".into();
+    physical.insert("b/raw".into(), b);
+    let mut e = Engine::new(registry, physical);
+    let mut pair = config("pair", "a/raw");
+    pair.type_id = "pair".into();
+    pair.inputs.insert("other".into(), "b/raw".into());
+    pair.max_age_ms = 10000;
+    e.create(pair, 0).unwrap();
+    let mut controller = config("loop", "processing/pair/value");
+    controller.type_id = "pid".into();
+    controller.max_age_ms = 1000;
+    e.create(controller, 1).unwrap();
+    let now = Instant::now();
+    let sample = |at| Observation {
+        source: "raw".into(),
+        unit: "C".into(),
+        completed_at: SystemTime::now(),
+        metadata: Some(SourceMetadata {
+            source_instance: 1,
+            sequence: 1,
+            generation: 0,
+            acquired_at: at,
+            elapsed: Duration::ZERO,
+        }),
+        reading: Ok(Value::Float(1.)),
+    };
+    e.process("a/raw".into(), sample(now - Duration::from_secs(5)), now);
+    let out = e.process("b/raw".into(), sample(now), now);
+    assert!(out[0].observation.reading.is_ok());
+    assert!(out.last().unwrap().observation.reading.is_err());
+    assert_eq!(e.state("loop").unwrap().0, State::Fault);
+    e.set_state("loop", State::Shadow, 2).unwrap();
+    assert!(e.ready_for_auto("loop", 3).is_err());
+    // A separate fresh branch remains operational.
+    let mut fresh = config("fresh", "b/raw");
+    fresh.type_id = "ema".into();
+    e.create(fresh, 3).unwrap();
+    assert!(
+        e.process(
+            "b/raw".into(),
+            sample(now + Duration::from_millis(1)),
+            now + Duration::from_millis(1)
+        )
+        .iter()
+        .any(|p| p.key == "processing/fresh/value" && p.observation.reading.is_ok())
+    );
+}
+
+#[test]
+fn component_messages_reject_nested_duplicate_fields_and_paginate_instances() {
+    use lab_server::protocol::{JsonError, ParseError, parse_request};
+    assert!(matches!(
+        parse_request(r#"{"id":1,"op":"components","command":{"action":"list","action":"types"}}"#),
+        Err(ParseError::Json(JsonError::DuplicateKey))
+    ));
+    let mut e = engine();
+    for n in 0..20 {
+        e.create(config(&format!("n{n:02}"), "a/raw"), n).unwrap();
+    }
+    let first = e.page(0, 16).unwrap();
+    assert_eq!(first["next_offset"], 16);
+    assert_eq!(first["instances"].as_array().unwrap().len(), 16);
+    let last = e.page(16, 16).unwrap();
+    assert!(last["next_offset"].is_null());
+    assert_eq!(last["instances"].as_array().unwrap().len(), 4);
+    assert!(e.page(0, 65).is_err());
+    let mut e = Engine::new(builtins(), engine().catalog());
+    let mut rejected = false;
+    for n in 0..128 {
+        let mut c = config(&format!("loop{n}"), "a/raw");
+        c.type_id = "pid".into();
+        let before = e.list();
+        if let Err(error) = e.create(c, n) {
+            assert_eq!(error, "catalog_capacity");
+            assert_eq!(before, e.list());
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "the graph must remain describable within the v1 response budget"
+    );
+}
