@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-struct Source;
+struct Source(usize);
 impl Driver for Source {
     fn parameters(&self) -> Vec<ParameterDescription> {
         ["x", "y", "power", "backup"]
@@ -27,7 +27,11 @@ impl Driver for Source {
             .map(|name| {
                 let writable = matches!(name, "power" | "backup");
                 ParameterDescription {
-                    id: name.into(),
+                    id: if name == "backup" && self.0 > 0 {
+                        "q".repeat(self.0)
+                    } else {
+                        name.into()
+                    },
                     unit: String::new(),
                     writable,
                     spec: if writable {
@@ -59,13 +63,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_target_len(0)
+    }
+    fn with_target_len(target_len: usize) -> Self {
         let mut registry = DeviceRegistry::new();
         let mut workers = Vec::new();
         let mut channels = Vec::new();
         for id in ["a", "b"] {
             let (worker, channel) = PortWorker::new(
                 BufReader::new(Cursor::new(vec![])),
-                vec![DeviceInstance::new(id, Source).unwrap()],
+                vec![DeviceInstance::new(id, Source(target_len)).unwrap()],
                 64,
                 64,
             )
@@ -219,4 +226,91 @@ fn concurrent_rewire_and_publication_never_mix_histories() {
             Ok(Value::Float(90.))
         );
     }
+}
+
+#[test]
+fn binding_snapshots_track_revision_state_and_incarnation() {
+    let f = Fixture::new();
+    let mut c = config("loop", "a/x");
+    c["type_id"] = json!("pid");
+    c["parameters"] = json!({});
+    let first = f.manage(json!({"action":"create","configuration":c,"expected_revision":0}));
+    assert!(first["instances"][0]["binding"].is_null());
+    let binding = |target, timeout| json!({"target":target,"command_timeout_ms":timeout});
+    for (revision, target, timeout) in [(1, "a/power", 1000), (2, "b/power", 500)] {
+        let list = f.manage(json!({"action":"bind","name":"loop","target":target,"command_timeout_ms":timeout,"expected_revision":revision}));
+        assert_eq!(list["revision"], revision + 1);
+        assert_eq!(list["instances"][0]["binding"], binding(target, timeout));
+    }
+    let before = f.manage(json!({"action":"list"}));
+    assert!(f.service.manage(serde_json::from_value(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1,"expected_revision":2})).unwrap()).is_err());
+    assert_eq!(before, f.manage(json!({"action":"list"})));
+    f.publish("a/x", 1.);
+    for (revision, state) in [(3, "auto"), (4, "stopped"), (5, "shadow")] {
+        let list = f.manage(
+            json!({"action":"state","name":"loop","state":state,"expected_revision":revision}),
+        );
+        assert_eq!(list["instances"][0]["state"], state);
+        assert_eq!(list["instances"][0]["binding"], binding("b/power", 500));
+        if state == "auto" {
+            // Leave an old incarnation's physical request queued through deletion.
+            f.publish("a/x", 2.);
+        }
+    }
+    f.service
+        .apply_event(AggregatorEvent::DataLost {
+            port_id: "a".into(),
+            loss_epoch: 1,
+        })
+        .unwrap();
+    let fault = f.manage(json!({"action":"list"}));
+    assert_eq!(fault["revision"], 6);
+    assert_eq!(fault["instances"][0]["state"], "fault");
+    assert_eq!(fault["instances"][0]["binding"], binding("b/power", 500));
+    let deleted = f.manage(json!({"action":"delete","name":"loop","expected_revision":6}));
+    assert!(deleted["instances"].as_array().unwrap().is_empty());
+    let recreated = f.manage(json!({"action":"create","configuration":c,"expected_revision":7}));
+    assert!(recreated["instances"][0]["binding"].is_null());
+    assert_ne!(
+        first["instances"][0]["incarnation"],
+        recreated["instances"][0]["incarnation"]
+    );
+}
+
+#[test]
+fn binding_bytes_participate_in_pagination_before_response_is_built() {
+    let f = Fixture::with_target_len(4000);
+    let target = format!("a/{}", "q".repeat(4000));
+    for n in 0..20 {
+        let mut c = config(&format!("loop{n:02}"), "a/x");
+        c["type_id"] = json!("pid");
+        c["parameters"] = json!({});
+        f.manage(json!({"action":"create","configuration":c,"expected_revision":2*n}));
+        let page = f.manage(json!({"action":"bind","name":format!("loop{n:02}"),"target":target,"command_timeout_ms":500,"expected_revision":2*n+1}));
+        assert!(page.to_string().len() <= 48 * 1024);
+    }
+    let mut offset = 0;
+    let mut names = std::collections::BTreeSet::new();
+    loop {
+        let page = f.manage(json!({"action":"list","offset":offset,"limit":64}));
+        assert_eq!(page["revision"], 40);
+        assert!(page.to_string().len() <= 48 * 1024);
+        let instances = page["instances"].as_array().unwrap();
+        assert!(!instances.is_empty());
+        assert!(
+            instances.len() < 16,
+            "byte budget, not item limit, must split this page"
+        );
+        for i in instances {
+            assert_eq!(i["binding"]["target"], target);
+            assert!(names.insert(i["configuration"]["name"].as_str().unwrap().to_owned()));
+        }
+        if page["next_offset"].is_null() {
+            break;
+        }
+        let next = page["next_offset"].as_u64().unwrap();
+        assert!(next > offset);
+        offset = next;
+    }
+    assert_eq!(names.len(), 20);
 }

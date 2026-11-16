@@ -265,15 +265,28 @@ impl Engine {
         self.page(0, 16).expect("default page")
     }
     pub fn page(&self, offset: usize, limit: usize) -> Result<Json, String> {
+        self.page_with(offset, limit, |_, _, _| {})
+    }
+    /// The service can add management metadata before the shared byte budget is checked.
+    pub(crate) fn page_with(
+        &self,
+        offset: usize,
+        limit: usize,
+        mut decorate: impl FnMut(&str, u64, &mut Json),
+    ) -> Result<Json, String> {
         if limit == 0 || limit > 64 || offset > self.nodes.len() {
             return Err("invalid_page".into());
         }
         let mut instances = Vec::new();
-        let mut bytes = 0;
+        let mut bytes = 256; // response fields, separators and maximal u64 revision
         for n in self.nodes.values().skip(offset).take(limit) {
-            let value = json!({"configuration":n.config,"incarnation":n.incarnation,"state":n.state,"fault":n.fault});
-            let size = value.to_string().len();
+            let mut value = json!({"configuration":n.config,"incarnation":n.incarnation,"state":n.state,"fault":n.fault});
+            decorate(&n.config.name, n.incarnation, &mut value);
+            let size = value.to_string().len() + 1;
             if bytes + size > 48 * 1024 {
+                if instances.is_empty() {
+                    return Err("instance_too_large".into());
+                }
                 break;
             }
             bytes += size;

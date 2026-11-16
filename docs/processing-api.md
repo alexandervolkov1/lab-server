@@ -33,7 +33,12 @@ value_type — tagged object с type=`float`/`integer`/`boolean`/`choice`; у ч
 требует целое i64; строки и Boolean не преобразуются в числа.
 
 Элемент instances содержит configuration (с заполненными defaults), incarnation,
-state и fault (строка причины либо null). Возможные состояния в ответах: running
+state, fault (строка причины либо null) и binding. binding=null для непривязанного
+контроллера или фильтра; иначе это `{ "target": "furnace1/power", "command_timeout_ms": 1000 }`.
+Привязка видна в shadow/auto/stopped/fault, сохраняется при остановке и исчезает при
+удалении экземпляра. Повторное создание того же имени не наследует старую привязку.
+Все снимки list/create/configure/delete/bind/state имеют одинаковый формат и ревизию;
+binding входит в бюджет 48 KiB до выбора next_offset. Возможные состояния в ответах: running
 для фильтра, shadow/stopped/fault/auto для контроллера. running и fault нельзя
 установить командой оператора. Переход состояния сбрасывает математическую историю;
 переход в Auto в этой версии не обеспечивает bumpless transfer.
@@ -41,8 +46,8 @@ state и fault (строка причины либо null). Возможные �
 В outputs поле owner — null либо пара `[имя_контроллера, incarnation]`, generation —
 u64, in_flight — число начатых, ещё не завершённых операций, outcome_unknown — Boolean.
 Снимок содержит все writable-физические выходы, включая находящиеся в Manual.
-Привязка shadow-контроллера сама по себе не создаёт owner; поле target из bind пока
-не возвращается в list. Клиент, редактирующий привязку, должен хранить выбранный target.
+Привязка shadow-контроллера сама по себе не создаёт owner. Её можно прочитать из любой
+сессии через components/list; повторный bind заменяет target и timeout атомарно по CAS.
 
 В TypeDescription inputs — массив имён входов; outputs — массив `{name,unit}`.
 unit=null наследует единицу первого входа в порядке сортировки имён входов.

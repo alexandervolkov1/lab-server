@@ -1179,3 +1179,81 @@ fn actions_timeout_disconnect_and_other_port_progress_on_both_transports() {
         );
     }
 }
+
+#[test]
+fn component_binding_is_shared_by_tcp_peers_and_websocket_at_one_revision() {
+    let server = Running::new();
+    let mut first = ActionClient::new(&server, false);
+    let mut second = ActionClient::new(&server, false);
+    let mut ws = ActionClient::new(&server, true);
+    let c = json!({"name":"loop","type_id":"pid","inputs":{"input":"a/sample"},"parameters":{},"max_age_ms":10000});
+    let created=first.request(json!({"id":1,"op":"components","command":{"action":"create","configuration":c,"expected_revision":0}}));
+    assert!(created["data"]["instances"][0]["binding"].is_null());
+    for (id, revision, target) in [(2, 1, "a/count"), (3, 2, "b/level")] {
+        let bound=first.request(json!({"id":id,"op":"components","command":{"action":"bind","name":"loop","target":target,"command_timeout_ms":777,"expected_revision":revision}}));
+        assert_eq!(bound["status"], "ok");
+        for peer in [&mut second, &mut ws] {
+            let list = peer.request(json!({"id":id,"op":"components","command":{"action":"list"}}));
+            assert_eq!(list["data"], bound["data"]);
+            assert_eq!(
+                list["data"]["instances"][0]["binding"],
+                json!({"target":target,"command_timeout_ms":777})
+            );
+        }
+    }
+}
+
+#[test]
+fn same_port_rewire_closes_old_tcp_and_ws_sessions_and_new_session_receives_new_graph() {
+    for use_ws in [false, true] {
+        let server = Running::new();
+        let mut editor = ActionClient::new(&server, !use_ws);
+        let mut old = ActionClient::new(&server, use_ws);
+        let config = |input| json!({"name":"smooth","type_id":"ema","inputs":{"input":input},"parameters":{},"max_age_ms":10000});
+        assert_eq!(editor.request(json!({"id":1,"op":"components","command":{"action":"create","configuration":config("a/sample"),"expected_revision":0}}))["status"],"ok");
+        assert_eq!(
+            old.request(json!({"id":1,"op":"subscribe","keys":["processing/smooth/value"]}))["status"],
+            "ok"
+        );
+        let stamp = |sequence, source: &str, value| {
+            let handle = server
+                .service
+                .registry()
+                .port("p")
+                .unwrap()
+                .handle()
+                .unwrap();
+            server
+                .service
+                .apply_event(AggregatorEvent::Measurement {
+                    port_id: "p".into(),
+                    global_key: format!("a/{source}"),
+                    observation: Observation {
+                        source: source.into(),
+                        unit: String::new(),
+                        completed_at: SystemTime::now(),
+                        metadata: Some(lab_server::model::SourceMetadata {
+                            source_instance: handle.source_instance(),
+                            sequence,
+                            generation: 0,
+                            acquired_at: Instant::now(),
+                            elapsed: Duration::from_millis(sequence),
+                        }),
+                        reading: Ok(value),
+                    },
+                })
+                .unwrap();
+        };
+        stamp(100, "sample", Value::Integer(10));
+        assert_eq!(old.receive()["value"], 10.);
+        assert_eq!(editor.request(json!({"id":2,"op":"components","command":{"action":"configure","configuration":config("a/temperature"),"expected_revision":1}}))["status"],"ok");
+        assert_eq!(old.receive()["error"], "observation_stream_closed");
+        let mut new = ActionClient::new(&server, use_ws);
+        assert_eq!(
+            new.request(json!({"id":1,"op":"subscribe","keys":["processing/smooth/value"]}))["status"],
+            "ok"
+        );
+        stamp(101, "temperature", Value::Float(90.));
+        assert_eq!(new.receive()["value"], 90.);
+    }
+}

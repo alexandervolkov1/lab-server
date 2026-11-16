@@ -136,6 +136,26 @@ impl DeviceService {
     pub(crate) fn lock_service(&self) -> std::sync::MutexGuard<'_, ()> {
         self.gate.lock().expect("service lock poisoned")
     }
+    fn component_page(
+        &self,
+        engine: &crate::processing::Engine,
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        let controls = self.controls.lock().unwrap();
+        engine.page_with(offset, limit, |name, incarnation, instance| {
+            instance["binding"] = controls
+                .get(name)
+                .filter(|c| c.owner.1 == incarnation)
+                .map(|c| {
+                    serde_json::json!({
+                        "target": c.target,
+                        "command_timeout_ms": c.timeout.as_millis() as u64
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null);
+        })
+    }
     pub fn manage(
         &self,
         command: crate::processing::Management,
@@ -190,7 +210,7 @@ impl DeviceService {
                 );
             }
             Types => return Ok(engine.types()),
-            List { offset, limit } => return engine.page(offset, limit),
+            List { offset, limit } => return self.component_page(&engine, offset, limit),
             Create {
                 configuration,
                 expected_revision,
@@ -247,7 +267,7 @@ impl DeviceService {
             .lock()
             .expect("cache lock poisoned")
             .retain(|k, _| catalog.contains_key(k) && !invalid.contains(k));
-        Ok(engine.list())
+        self.component_page(&engine, 0, 16)
     }
     pub fn apply_event(&self, event: AggregatorEvent) -> io::Result<()> {
         self.apply_event_recorded(event, |_| {})
