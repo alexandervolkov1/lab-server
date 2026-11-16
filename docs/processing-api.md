@@ -152,9 +152,16 @@ unknown_or_non_numeric_input, dependency_cycle, signal_collision, has_dependents
 stop_before_configure, invalid_state, not_controller, restart_in_shadow_first,
 input_not_ready, output_not_bound, invalid_timeout, invalid_output_target,
 stop_in_shadow_before_bind, output_owned, output_busy, output_fault, invalid_output,
-invalid_page, catalog_capacity. Ошибки структуры имеют префикс invalid_component_request:.
+invalid_page, catalog_capacity, instance_too_large. Последняя ошибка означает, что один
+экземпляр с метаданными не помещается в страницу; пустая страница с тем же next_offset
+не возвращается. Ошибки структуры имеют префикс invalid_component_request:.
 
 ## SQLite и время
+
+У серверных портов режим Managed: физические set/action требуют Permit общей Authority
+непосредственно в worker. Прямой низкоуровневый Rust-вызов без него возвращает
+output_not_authorized и не передаёт байтов драйверу. Правила композиции и совместимость
+Rust API описаны в [managed-ports.md](managed-ports.md).
 
 Schema v2 автоматически и транзакционно мигрирует **свою** v1; другие application_id и
 версии отклоняются. measurements.source_metadata хранит JSON со строковыми u64

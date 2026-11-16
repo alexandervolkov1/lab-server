@@ -12,11 +12,13 @@ struct State {
 }
 #[derive(Default)]
 pub struct Authority {
+    issuer: Arc<()>,
     slots: BTreeMap<String, Arc<Mutex<State>>>,
 }
 impl Authority {
     pub fn new(keys: impl Iterator<Item = String>) -> Self {
         Self {
+            issuer: Arc::new(()),
             slots: keys
                 .map(|k| (k, Arc::new(Mutex::new(State::default()))))
                 .collect(),
@@ -78,6 +80,8 @@ impl Authority {
             leases.push((slot.clone(), s.generation));
         }
         Ok(Permit {
+            issuer: self.issuer.clone(),
+            keys: keys.iter().cloned().collect(),
             leases,
             started: false,
             finished: false,
@@ -85,11 +89,16 @@ impl Authority {
             manual: owner.is_none(),
         })
     }
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.slots.contains_key(key)
+    }
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!(self.slots.iter().map(|(key,slot)|{let s=slot.lock().unwrap();serde_json::json!({"key":key,"mode":if s.owner.is_some(){"auto"}else{"manual"},"owner":s.owner,"generation":s.generation,"in_flight":s.active,"outcome_unknown":s.unknown})}).collect::<Vec<_>>())
     }
 }
 pub struct Permit {
+    issuer: Arc<()>,
+    keys: std::collections::BTreeSet<String>,
     manual: bool,
     sources: Vec<(crate::port_worker::PortHandle, u64)>,
     leases: Vec<(Arc<Mutex<State>>, u64)>,
@@ -97,6 +106,10 @@ pub struct Permit {
     finished: bool,
 }
 impl Permit {
+    /// Exact immutable resource scope and issuer, independent of the current owner.
+    pub(crate) fn covers(&self, authority: &Authority, keys: &[String]) -> bool {
+        Arc::ptr_eq(&self.issuer, &authority.issuer) && self.keys == keys.iter().cloned().collect()
+    }
     pub(crate) fn with_sources(
         mut self,
         sources: Vec<(crate::port_worker::PortHandle, u64)>,

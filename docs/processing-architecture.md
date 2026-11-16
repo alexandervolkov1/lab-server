@@ -192,7 +192,9 @@ DeviceService сериализует управление и исходное с
 recording callback выполняется на этой же границе. Дополнительных runtime/worker потоков
 не создано. Watchdog обслуживается существующим startup loop даже при пустом агрегаторе.
 
-Output Authority принадлежит CommandRouter и разделяется его клонами. Permit передаётся
+Output Authority создаётся в startup и разделяется Managed workers и CommandRouter.
+Подробности режимов и проверки issuer/scope описаны в [managed-ports.md](managed-ports.md).
+Permit передаётся
 в существующий SetExecution и проверяется непосредственно при начале команды PortWorker.
 Проверяются поколение владельца, поколения и живость исходных портов, deadline. Последний
 ограничен возрастом входа. Atomic source_alive позволяет проверить остановку без повторного

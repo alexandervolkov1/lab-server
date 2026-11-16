@@ -19,7 +19,7 @@ use crate::driver::{DeviceIo, Driver, arduino::Arduino, metakon::Metakon};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::{
     COMMAND_QUEUE_CAPACITY, DeviceInstance, DeviceObservation, OBSERVATION_QUEUE_CAPACITY,
-    PortHandle, PortWorker, StopReason,
+    PortHandle, PortMode, PortWorker, StopReason,
 };
 use crate::recorder::{
     DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
@@ -157,6 +157,17 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
         *delay = (*delay).max(setup.post_open_delay);
     }
 
+    let authority = Arc::new(crate::output::Authority::new(
+        grouped
+            .values()
+            .flat_map(|(devices, _)| devices.iter())
+            .flat_map(|d| {
+                d.parameters()
+                    .iter()
+                    .filter(|p| p.writable)
+                    .map(move |p| format!("{}/{}", d.id(), p.id))
+            }),
+    ));
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;
     listener.set_nonblocking(true)?;
@@ -181,11 +192,12 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
             match open(port, delay) {
                 Ok(io) => {
-                    let (worker, channels) = PortWorker::new(
+                    let (worker, channels) = PortWorker::with_mode(
                         io,
                         devices,
                         COMMAND_QUEUE_CAPACITY,
                         OBSERVATION_QUEUE_CAPACITY,
+                        PortMode::Managed(authority.clone()),
                     )?;
                     registry.register_port(&port.id, channels.commands.clone())?;
                     for device in worker.devices() {
@@ -205,7 +217,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             }
         }
         let tcp = Arc::new(MultiDeviceTcp::new(
-            CommandRouter::new(registry),
+            CommandRouter::with_authority(registry, authority),
             OBSERVATION_QUEUE_CAPACITY,
         ));
         let mut workers = Workers::default();

@@ -153,6 +153,7 @@ pub enum StopReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
+    Unauthorized,
     UnknownDevice,
     UnknownParameter,
     UnknownAction,
@@ -166,6 +167,7 @@ pub enum CommandError {
 impl fmt::Display for CommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unauthorized => f.write_str("output_not_authorized"),
             Self::UnknownDevice => f.write_str("unknown_device"),
             Self::UnknownParameter => f.write_str("unknown_parameter"),
             Self::UnknownAction => f.write_str("unknown_action"),
@@ -403,7 +405,15 @@ pub struct PortChannels {
     pub observations: mpsc::Receiver<DeviceObservation>,
 }
 
+/// Immutable at construction. Standalone preserves the low-level driver-test API.
+/// Managed workers and their router must share the same Authority instance.
+pub enum PortMode {
+    Standalone,
+    Managed(Arc<crate::output::Authority>),
+}
+
 pub struct PortWorker<P: DeviceIo> {
+    mode: PortMode,
     io: P,
     devices: Vec<DeviceInstance>,
     commands: mpsc::Receiver<Command>,
@@ -427,6 +437,22 @@ impl<P: DeviceIo> PortWorker<P> {
         command_capacity: usize,
         observation_capacity: usize,
     ) -> Result<(Self, PortChannels), BuildError> {
+        Self::with_mode(
+            io,
+            devices,
+            command_capacity,
+            observation_capacity,
+            PortMode::Standalone,
+        )
+    }
+
+    pub fn with_mode(
+        io: P,
+        devices: Vec<DeviceInstance>,
+        command_capacity: usize,
+        observation_capacity: usize,
+        mode: PortMode,
+    ) -> Result<(Self, PortChannels), BuildError> {
         if command_capacity == 0 || observation_capacity == 0 {
             return Err(BuildError("queue capacities must be positive".into()));
         }
@@ -438,6 +464,14 @@ impl<P: DeviceIo> PortWorker<P> {
                 return Err(BuildError(format!("duplicate device id {:?}", instance.id)));
             }
             for (parameter, description) in instance.parameters.iter().enumerate() {
+                if let PortMode::Managed(authority) = &mode
+                    && description.writable
+                    && !authority.contains(&format!("{}/{}", instance.id, description.id))
+                {
+                    return Err(BuildError(
+                        "managed authority is missing a physical output".into(),
+                    ));
+                }
                 if let Some(period) = description.default_poll_period {
                     tasks.push(Task {
                         device,
@@ -468,6 +502,7 @@ impl<P: DeviceIo> PortWorker<P> {
         };
         Ok((
             Self {
+                mode,
                 io,
                 devices,
                 commands,
@@ -580,6 +615,21 @@ impl<P: DeviceIo> PortWorker<P> {
         Ok(())
     }
 
+    fn begin_mutation(
+        &self,
+        execution: &SetExecution,
+        keys: &[String],
+    ) -> Result<(), CommandError> {
+        if let PortMode::Managed(authority) = &self.mode
+            && !execution.authorized_for(authority, keys)
+        {
+            return Err(CommandError::Unauthorized);
+        }
+        // Permit identity/scope cannot change. Ownership generation, source
+        // continuity and deadline are still checked atomically at try_start.
+        self.begin(Some(execution))
+    }
+
     fn locate(&self, device: &str, parameter: &str) -> Result<(usize, usize), CommandError> {
         let device = self
             .devices
@@ -676,7 +726,10 @@ impl<P: DeviceIo> PortWorker<P> {
                             return Err(CommandError::InvalidValue);
                         }
                         let name = description.id.clone();
-                        self.begin(Some(&execution))?;
+                        self.begin_mutation(
+                            &execution,
+                            &[format!("{}/{}", self.devices[device].id, name)],
+                        )?;
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             self.devices[device]
                                 .driver
@@ -719,7 +772,13 @@ impl<P: DeviceIo> PortWorker<P> {
                         {
                             return Err(CommandError::UnknownAction);
                         }
-                        self.begin(Some(&execution))?;
+                        let keys = self.devices[device]
+                            .parameters
+                            .iter()
+                            .filter(|p| p.writable)
+                            .map(|p| format!("{}/{}", self.devices[device].id, p.id))
+                            .collect::<Vec<_>>();
+                        self.begin_mutation(&execution, &keys)?;
                         let result = catch_unwind(AssertUnwindSafe(|| {
                             self.devices[device]
                                 .driver
@@ -811,5 +870,7 @@ impl<P: DeviceIo> Drop for PortWorker<P> {
     }
 }
 
+#[cfg(test)]
+mod managed_tests;
 #[cfg(test)]
 mod subscription_races;

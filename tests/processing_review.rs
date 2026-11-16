@@ -221,10 +221,10 @@ fn concurrent_rewire_and_publication_never_mix_histories() {
         );
         assert!(matches!(old.try_recv(), Err(TryRecvError::Disconnected)));
         assert_eq!(old.closed_error(), "observation_stream_closed");
-        assert_eq!(
-            new.try_recv().unwrap().observation.reading,
-            Ok(Value::Float(90.))
-        );
+        let Value::Float(value) = new.try_recv().unwrap().observation.reading.unwrap() else {
+            panic!("numeric output required")
+        };
+        assert!((value - 90.).abs() < 1e-10);
     }
 }
 

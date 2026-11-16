@@ -37,6 +37,17 @@ impl SetExecution {
             p.unknown();
         }
     }
+    pub(crate) fn authorized_for(
+        &self,
+        authority: &crate::output::Authority,
+        keys: &[String],
+    ) -> bool {
+        self.permit
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.covers(authority, keys))
+    }
     pub fn try_start(&self) -> bool {
         let mut state = self.state.lock().expect("execution lock poisoned");
         // Read the clock inside the lock: a waiter must not use a stale timestamp.

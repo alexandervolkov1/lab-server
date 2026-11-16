@@ -9,6 +9,7 @@ use std::time::Instant;
 fn command_error_code(error: &crate::port_worker::CommandError) -> &'static str {
     use crate::port_worker::CommandError::*;
     match error {
+        Unauthorized => "output_not_authorized",
         UnknownDevice | UnknownParameter | UnknownAction => "unknown_key",
         ReadOnly => "Parameter is read-only",
         InvalidValue => "Value does not match parameter spec",

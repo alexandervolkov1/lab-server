@@ -86,13 +86,22 @@ pub struct CommandRouter {
 
 impl CommandRouter {
     pub fn new(registry: DeviceRegistry) -> Self {
+        let authority = Arc::new(crate::output::Authority::new(
+            registry
+                .parameters()
+                .filter(|p| p.description.writable)
+                .map(|p| p.global_key.clone()),
+        ));
+        Self::with_authority(registry, authority)
+    }
+
+    /// Compose with the same Authority passed to every Managed worker.
+    pub fn with_authority(
+        registry: DeviceRegistry,
+        authority: Arc<crate::output::Authority>,
+    ) -> Self {
         Self {
-            authority: Arc::new(crate::output::Authority::new(
-                registry
-                    .parameters()
-                    .filter(|p| p.description.writable)
-                    .map(|p| p.global_key.clone()),
-            )),
+            authority,
             registry: Arc::new(registry),
         }
     }
