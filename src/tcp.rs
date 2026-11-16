@@ -14,7 +14,12 @@ impl DeviceService {
     pub fn serve_connection(&self, stream: TcpStream) -> io::Result<()> {
         let mut connection = TcpConnection::new(stream, 64, 64 * 1024)?;
         let observations = self.register_client()?;
-        connection.run(self, &self.catalog, &self.latest, &observations)
+        loop {
+            if self.drive_connection(&mut connection, &observations)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     pub fn drive_connection(
@@ -22,6 +27,7 @@ impl DeviceService {
         connection: &mut TcpConnection,
         observations: &ObservationReceiver,
     ) -> io::Result<bool> {
+        let _gate = self.lock_service();
         connection.drive_once_with_observations(self, &self.catalog, &self.latest, observations)
     }
 }

@@ -44,6 +44,9 @@ impl EnqueueError {
 /// Shared asynchronous command admission for transport sessions.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
+    fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
+        None
+    }
     /// Global action names for describe; backends may expose no actions.
     fn actions(&self) -> Vec<ActionDescription> {
         Vec::new()
@@ -413,6 +416,8 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
+        let snapshot = commands.catalog_snapshot();
+        let catalog = snapshot.as_ref().unwrap_or(catalog);
         let id = match &incoming {
             ParsedMessage::Request(
                 Request::Hello { id }

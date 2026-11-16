@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::device_registry::DeviceRegistry;
 use crate::model::Observation;
@@ -36,7 +36,7 @@ impl PortStream {
     }
 }
 struct Domains {
-    keys: HashMap<String, String>,
+    keys: RwLock<HashMap<String, BTreeSet<String>>>,
     ports: BTreeMap<String, PortStream>,
 }
 
@@ -65,9 +65,12 @@ impl ObservationInterest {
             .state
             .lock()
             .expect("observation interest lock poisoned");
+        let mapping = domains.keys.read().expect("domain lock poisoned");
         let next_ports: BTreeSet<_> = keys
             .iter()
-            .filter_map(|key| domains.keys.get(key).cloned())
+            .filter_map(|key| mapping.get(key))
+            .flatten()
+            .cloned()
             .collect();
         let affected: BTreeSet<_> = state
             .ports
@@ -170,10 +173,12 @@ impl ObservationFanout {
     pub fn routed(queue_capacity: usize, registry: &DeviceRegistry) -> Self {
         assert!(queue_capacity > 0);
         let domains = Arc::new(Domains {
-            keys: registry
-                .parameters()
-                .map(|p| (p.global_key.clone(), p.port_id.clone()))
-                .collect(),
+            keys: RwLock::new(
+                registry
+                    .parameters()
+                    .map(|p| (p.global_key.clone(), BTreeSet::from([p.port_id.clone()])))
+                    .collect(),
+            ),
             ports: registry
                 .ports()
                 .map(|p| {
@@ -194,6 +199,40 @@ impl ObservationFanout {
             clock: Arc::new(AtomicU64::new(0)),
             subscribers: Mutex::new(Vec::new()),
             domains,
+        }
+    }
+
+    pub(crate) fn update_keys(&self, keys: HashMap<String, BTreeSet<String>>) {
+        let removed: HashSet<_> = {
+            let mut old = self.domains.keys.write().expect("domain lock poisoned");
+            let removed = old
+                .keys()
+                .filter(|k| !keys.contains_key(*k))
+                .cloned()
+                .collect();
+            *old = keys;
+            removed
+        };
+        let subscribers = self.subscribers.lock().expect("subscriber lock poisoned");
+        for (interest, _) in subscribers.iter() {
+            if let Some(interest) = interest.upgrade() {
+                let mut state = interest.state.lock().expect("interest lock poisoned");
+                if state.keys.iter().any(|k| removed.contains(k)) {
+                    state.stream_closed = true;
+                }
+                // Rewiring changes domain lineage too. Existing streams must resubscribe.
+                let mapping = self.domains.keys.read().expect("domain lock poisoned");
+                let ports: BTreeSet<_> = state
+                    .keys
+                    .iter()
+                    .filter_map(|k| mapping.get(k))
+                    .flatten()
+                    .cloned()
+                    .collect();
+                if ports != state.ports.keys().cloned().collect() {
+                    state.stream_closed = true;
+                }
+            }
         }
     }
 

@@ -198,6 +198,18 @@ impl Engine {
         }
         Ok(())
     }
+    pub fn invalid_outputs(&self) -> BTreeSet<String> {
+        self.nodes
+            .iter()
+            .filter(|(_, n)| n.fault.is_some())
+            .flat_map(|(name, n)| {
+                n.description
+                    .outputs
+                    .iter()
+                    .map(move |o| signal(name, &o.name))
+            })
+            .collect()
+    }
     pub fn types(&self) -> Json {
         json!(self.registry.types())
     }
@@ -585,6 +597,32 @@ impl Engine {
 pub fn signal(instance: &str, output: &str) -> String {
     format!("processing/{instance}/{output}")
 }
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Management {
+    Types,
+    List,
+    Create {
+        configuration: Configuration,
+        expected_revision: u64,
+    },
+    Configure {
+        configuration: Configuration,
+        expected_revision: u64,
+    },
+    Delete {
+        name: String,
+        #[serde(default)]
+        cascade: bool,
+        expected_revision: u64,
+    },
+    State {
+        name: String,
+        state: State,
+        expected_revision: u64,
+    },
+}
 pub fn number(inputs: &Inputs, name: &str) -> Result<f64, String> {
     match inputs
         .get(name)
@@ -611,4 +649,11 @@ pub fn float_parameter(
         value_type: ParameterType::Float { min, max },
         default: json!(default),
     }
+}
+
+pub mod ema;
+pub fn builtins() -> Registry {
+    let mut r = Registry::default();
+    r.register(ema::EmaFactory).expect("builtin descriptor");
+    r
 }

@@ -458,10 +458,12 @@ fn dispatch(
     let count = events.len();
     let mut first_error = None;
     for event in events {
-        recording.record(&event);
-        if let Err(error) = tcp.apply_event(event) {
+        if let Err(error) = tcp.apply_event_recorded(event, |event| recording.record(event)) {
             first_error.get_or_insert(error);
         }
+    }
+    if let Err(error) = tcp.tick_recorded(|event| recording.record(event)) {
+        first_error.get_or_insert(error);
     }
     recording.check_state();
     first_error.map_or(Ok(count), Err)

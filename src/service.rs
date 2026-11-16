@@ -14,6 +14,9 @@ use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
 pub struct DeviceService {
+    gate: Mutex<()>,
+    processing: Mutex<crate::processing::Engine>,
+    continuity: Mutex<HashMap<String, crate::continuity::Continuity>>,
     router: CommandRouter,
     pub(crate) catalog: HashMap<String, ParameterDescription>,
     pub(crate) latest: Mutex<HashMap<String, Observation>>,
@@ -21,8 +24,205 @@ pub struct DeviceService {
 }
 
 impl DeviceService {
+    pub(crate) fn lock_service(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gate.lock().expect("service lock poisoned")
+    }
+    pub fn manage(
+        &self,
+        command: crate::processing::Management,
+    ) -> Result<serde_json::Value, String> {
+        let _gate = self.lock_service();
+        self.manage_inner(command)
+    }
+    pub(crate) fn manage_inner(
+        &self,
+        command: crate::processing::Management,
+    ) -> Result<serde_json::Value, String> {
+        use crate::processing::Management::*;
+        let mut engine = self.processing.lock().expect("processing lock poisoned");
+        match command {
+            Types => return Ok(engine.types()),
+            List => return Ok(engine.list()),
+            Create {
+                configuration,
+                expected_revision,
+            } => engine.create(configuration, expected_revision)?,
+            Configure {
+                configuration,
+                expected_revision,
+            } => engine.configure(configuration, expected_revision)?,
+            Delete {
+                name,
+                cascade,
+                expected_revision,
+            } => {
+                engine.remove(&name, cascade, expected_revision)?;
+            }
+            State {
+                name,
+                state,
+                expected_revision,
+            } => {
+                if state == crate::processing::State::Auto {
+                    return Err("output_not_bound".into());
+                }
+                engine.set_state(&name, state, expected_revision)?;
+            }
+        }
+        let catalog = engine.catalog();
+        let physical = self
+            .registry()
+            .parameters()
+            .map(|p| {
+                (
+                    p.global_key.clone(),
+                    std::collections::BTreeSet::from([p.port_id.clone()]),
+                )
+            })
+            .collect();
+        self.fanout.update_keys(engine.lineage(&physical));
+        self.latest
+            .lock()
+            .expect("cache lock poisoned")
+            .retain(|k, _| catalog.contains_key(k));
+        Ok(engine.list())
+    }
+    pub fn apply_event(&self, event: AggregatorEvent) -> io::Result<()> {
+        self.apply_event_recorded(event, |_| {})
+    }
+    /// One serialized commit boundary for original + derived events and recording.
+    pub fn apply_event_recorded(
+        &self,
+        event: AggregatorEvent,
+        mut record: impl FnMut(&AggregatorEvent),
+    ) -> io::Result<()> {
+        let _gate = self.lock_service();
+        record(&event);
+        let mut produced = Vec::new();
+        match &event {
+            AggregatorEvent::Measurement {
+                port_id,
+                global_key,
+                observation,
+            } => {
+                let bound = self.registry().parameter(global_key).is_some_and(|p| {
+                    p.port_id == *port_id && p.description.id == observation.source
+                });
+                let accepted = bound
+                    && observation.metadata.as_ref().is_some_and(|m| {
+                        self.continuity
+                            .lock()
+                            .unwrap()
+                            .get_mut(port_id)
+                            .is_some_and(|c| c.accept(m))
+                    });
+                if accepted {
+                    produced = self.processing.lock().unwrap().process(
+                        global_key.clone(),
+                        observation.clone(),
+                        Instant::now(),
+                    );
+                }
+            }
+            _ => {
+                let (port, reason) = match &event {
+                    AggregatorEvent::DataLost {
+                        port_id,
+                        loss_epoch,
+                    } => {
+                        if let Some(c) = self.continuity.lock().unwrap().get_mut(port_id) {
+                            c.lost(*loss_epoch);
+                        }
+                        (port_id, "source_data_lost")
+                    }
+                    AggregatorEvent::PortStopped { port_id, .. }
+                    | AggregatorEvent::SourceClosedWithoutStop { port_id }
+                    | AggregatorEvent::InvalidObservation { port_id, .. } => {
+                        if let Some(c) = self.continuity.lock().unwrap().get_mut(port_id) {
+                            c.stop();
+                        }
+                        (port_id, "source_unavailable")
+                    }
+                    _ => unreachable!(),
+                };
+                let keys = self
+                    .registry()
+                    .parameters()
+                    .filter(|p| p.port_id == *port)
+                    .map(|p| p.global_key.clone())
+                    .collect::<Vec<_>>();
+                self.processing.lock().unwrap().invalidate(&keys, reason);
+                self.invalidate_cached(port, reason, &mut record)?;
+            }
+        }
+        self.apply_physical_event(event)?;
+        for item in produced {
+            let event = AggregatorEvent::Measurement {
+                port_id: "processing".into(),
+                global_key: item.key.clone(),
+                observation: item.observation.clone(),
+            };
+            record(&event);
+            let mut observation = item.observation;
+            observation.source = item.key.clone();
+            self.latest
+                .lock()
+                .unwrap()
+                .insert(item.key, observation.clone());
+            self.fanout.publish(&observation)?;
+        }
+        Ok(())
+    }
+    fn invalidate_cached(
+        &self,
+        port: &str,
+        reason: &str,
+        record: &mut impl FnMut(&AggregatorEvent),
+    ) -> io::Result<()> {
+        let physical = self
+            .registry()
+            .parameters()
+            .map(|p| {
+                (
+                    p.global_key.clone(),
+                    std::collections::BTreeSet::from([p.port_id.clone()]),
+                )
+            })
+            .collect();
+        let engine = self.processing.lock().unwrap();
+        let domains = engine.lineage(&physical);
+        let invalid = engine.invalid_outputs();
+        drop(engine);
+        let mut latest = self.latest.lock().unwrap();
+        for (key, observation) in latest.iter_mut() {
+            if !self.catalog.contains_key(key)
+                && ((port == "*" && invalid.contains(key))
+                    || domains.get(key).is_some_and(|d| d.contains(port)))
+                && observation.reading.is_ok()
+            {
+                observation.reading = Err(reason.into());
+                observation.completed_at = std::time::SystemTime::now();
+                observation.metadata = None;
+                record(&AggregatorEvent::Measurement {
+                    port_id: "processing".into(),
+                    global_key: key.clone(),
+                    observation: observation.clone(),
+                });
+                self.fanout.publish(observation)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn tick_recorded(&self, mut record: impl FnMut(&AggregatorEvent)) -> io::Result<()> {
+        let _gate = self.lock_service();
+        let stale = self.processing.lock().unwrap().tick(Instant::now());
+        if !stale.is_empty() {
+            self.invalidate_cached("*", "stale_input", &mut record)?;
+        }
+        Ok(())
+    }
     pub fn new(router: CommandRouter, observation_capacity: usize) -> Self {
-        let catalog = router
+        let catalog: HashMap<String, ParameterDescription> = router
             .registry()
             .parameters()
             .map(|p| {
@@ -35,7 +235,25 @@ impl DeviceService {
             observation_capacity,
             router.registry(),
         ));
+        let continuity = router
+            .registry()
+            .ports()
+            .filter_map(|p| {
+                p.handle().map(|h| {
+                    (
+                        p.id().to_owned(),
+                        crate::continuity::Continuity::new(h.source_instance()),
+                    )
+                })
+            })
+            .collect();
         Self {
+            gate: Mutex::new(()),
+            processing: Mutex::new(crate::processing::Engine::new(
+                crate::processing::builtins(),
+                catalog.clone(),
+            )),
+            continuity: Mutex::new(continuity),
             router,
             catalog,
             latest: Mutex::new(HashMap::new()),
@@ -58,6 +276,7 @@ impl DeviceService {
         text: &str,
         now: Instant,
     ) -> io::Result<()> {
+        let _gate = self.gate.lock().expect("service lock poisoned");
         session.receive_message(text, self, &self.catalog, &self.latest, now)
     }
 
@@ -82,12 +301,12 @@ impl DeviceService {
             .retain(|key, _| {
                 self.registry()
                     .parameter(key)
-                    .is_some_and(|p| p.port_id != port_id)
+                    .is_none_or(|p| p.port_id != port_id)
             });
     }
 
     /// Preserve FIFO by applying the aggregator's returned events in order.
-    pub fn apply_event(&self, event: AggregatorEvent) -> io::Result<()> {
+    fn apply_physical_event(&self, event: AggregatorEvent) -> io::Result<()> {
         match event {
             AggregatorEvent::Measurement {
                 port_id,
@@ -164,6 +383,14 @@ fn route_error(error: RouteError) -> EnqueueError {
 }
 
 impl CommandBackend for DeviceService {
+    fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
+        Some(
+            self.processing
+                .lock()
+                .expect("processing lock poisoned")
+                .catalog(),
+        )
+    }
     fn actions(&self) -> Vec<ActionDescription> {
         self.registry()
             .actions()
@@ -221,6 +448,14 @@ impl CommandBackend for DeviceService {
         Ok(())
     }
     fn available(&self, key: &str) -> bool {
+        if !self.catalog.contains_key(key) {
+            return self
+                .processing
+                .lock()
+                .expect("processing lock poisoned")
+                .catalog()
+                .contains_key(key);
+        }
         self.registry().parameter(key).is_some_and(|p| {
             self.fanout.port_usable(&p.port_id)
                 && self.router.availability(&p.device_id) == Ok(Availability::Available)
