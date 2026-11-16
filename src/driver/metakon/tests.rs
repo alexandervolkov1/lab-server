@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
+use std::time::Instant;
 
 use super::protocol::crc;
 use super::*;
@@ -12,6 +13,7 @@ struct Script {
     end: Option<io::ErrorKind>,
     send_error: Option<io::ErrorKind>,
     sent: Vec<Vec<u8>>,
+    last_consumed_at: Option<Instant>,
 }
 impl Script {
     fn new(replies: Vec<Vec<u8>>) -> Self {
@@ -23,6 +25,7 @@ impl Script {
             end: None,
             send_error: None,
             sent: vec![],
+            last_consumed_at: None,
         }
     }
 }
@@ -46,6 +49,9 @@ impl BufRead for Script {
     }
     fn consume(&mut self, count: usize) {
         self.offset += count;
+        if self.offset == self.input.len() {
+            self.last_consumed_at = Some(Instant::now());
+        }
     }
 }
 impl DeviceIo for Script {
@@ -76,6 +82,68 @@ fn reply(register: u8, flags: u8, data: &[u8]) -> Vec<u8> {
     let mut bytes = vec![15, 0, register, 0, flags];
     bytes.extend_from_slice(data);
     checked(bytes)
+}
+
+#[test]
+fn interframe_pause_covers_two_8n1_characters_at_every_supported_baud() {
+    for baud in [2400u128, 4800, 9600, 19200] {
+        // Compare integer nanoseconds without rounding the required time down.
+        assert!(super::protocol::INTERFRAME_PAUSE.as_nanos() * baud >= 20_000_000_000);
+    }
+}
+
+#[test]
+fn interframe_fragmented_reads_wait_after_the_final_byte_before_returning() {
+    let mut d = driver(1.0, false);
+    let mut io = Script::new(vec![
+        reply(0, 0x41, &[3]),
+        reply(1, 0x44, &[123, 0]),
+        reply(6, 0xc2, &[25]),
+    ]);
+    io.chunk = 1;
+    for (key, value) in [
+        ("channel_type", 3),
+        ("measurement", 123),
+        ("output_power", 25),
+    ] {
+        assert_eq!(d.read(key, &mut io).unwrap(), Value::Integer(value));
+        // Only a lower bound: scheduler oversleep is allowed on every platform.
+        assert!(io.last_consumed_at.unwrap().elapsed() >= Duration::from_millis(9));
+    }
+    assert_eq!(
+        io.sent,
+        [
+            read_request(15, 0, 0),
+            read_request(15, 0, 1),
+            read_request(15, 0, 6)
+        ]
+    );
+}
+
+#[test]
+fn interframe_complete_error_replies_wait_without_changing_classification() {
+    let mut bad_crc = reply(1, 0x44, &[0, 0]);
+    *bad_crc.last_mut().unwrap() ^= 1;
+    for (response, state, message) in [
+        (bad_crc, PortState::Desynchronized, "CRC mismatch"),
+        (
+            reply(1, 0x44, &[0, 0x80]),
+            PortState::Synchronized,
+            "sensor fault",
+        ),
+        (
+            reply(1, 0x44, &10000i16.to_le_bytes()),
+            PortState::Synchronized,
+            "outside register range",
+        ),
+    ] {
+        let mut io = Script::new(vec![response]);
+        let error = driver(1.0, false).read("measurement", &mut io).unwrap_err();
+        assert_eq!(error.port_state, state);
+        assert!(error.message.contains(message));
+        assert!(io.last_consumed_at.unwrap().elapsed() >= Duration::from_millis(9));
+        assert_eq!(io.sent, [read_request(15, 0, 1)]);
+    }
 }
 
 #[test]

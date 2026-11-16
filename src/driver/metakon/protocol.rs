@@ -1,7 +1,14 @@
 use std::io;
+use std::thread;
+use std::time::Duration;
 
 use crate::driver::{DeviceIo, DriverError, PortState};
 use crate::model::Value;
+
+// Two 8N1 characters at the slowest supported baud (2400) take 8.334 ms.
+// Keep ownership of the worker's stream until this interval has elapsed, even
+// when the next exchange belongs to another device or is a write's readback.
+pub(super) const INTERFRAME_PAUSE: Duration = Duration::from_millis(9);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -118,5 +125,10 @@ pub(super) fn exchange(
         frame.extend_from_slice(available);
         io.consume(count);
     }
+    // Start after consuming the final byte, not after sending the request.
+    // This also covers complete replies later rejected by validation. Incomplete
+    // exchanges stop the PortWorker instead; they must not trigger another send.
+    // This is a transmit guard, not detection of late bytes or unsolicited frames.
+    thread::sleep(INTERFRAME_PAUSE);
     Ok(frame)
 }

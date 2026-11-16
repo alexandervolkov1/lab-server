@@ -43,6 +43,7 @@ enum Fault {
     AckDisconnect,
     AckCrc,
     ReadbackTimeout,
+    ReadbackCrc,
     ReadbackMismatch,
     PartialRead,
     BadReadCrc,
@@ -55,6 +56,8 @@ struct Gate {
 #[derive(Default)]
 struct State {
     sent: Vec<Vec<u8>>,
+    sent_at: Vec<Instant>,
+    consumed_at: Vec<Instant>,
     registers: HashMap<[u8; 3], Vec<u8>>,
     fault: Option<Fault>,
     sensor_fault: bool,
@@ -101,10 +104,14 @@ impl BufRead for Serial {
     }
     fn consume(&mut self, size: usize) {
         self.input.consume(size);
+        if size != 0 && self.input.position() as usize == self.input.get_ref().len() {
+            self.state.lock().unwrap().consumed_at.push(Instant::now());
+        }
     }
 }
 impl DeviceIo for Serial {
     fn send(&mut self, request: &[u8]) -> io::Result<()> {
+        let sent_at = Instant::now();
         assert_eq!(
             self.input.position() as usize,
             self.input.get_ref().len(),
@@ -116,6 +123,7 @@ impl DeviceIo for Serial {
         );
         let mut state = self.state.lock().unwrap();
         state.sent.push(request.to_vec());
+        state.sent_at.push(sent_at);
         let register = request[2];
         let address = [request[0], request[1], register];
         let flags = [
@@ -155,7 +163,9 @@ impl DeviceIo for Serial {
                 response.clear();
                 self.error = Some(io::ErrorKind::BrokenPipe);
             }
-            (1, _, Some(Fault::AckCrc)) | (0, 0, Some(Fault::BadReadCrc)) => {
+            (1, _, Some(Fault::AckCrc))
+            | (0, 0, Some(Fault::BadReadCrc))
+            | (0, 2, Some(Fault::ReadbackCrc)) => {
                 *response.last_mut().unwrap() ^= 1;
             }
             (1, _, Some(Fault::ReadbackMismatch)) => {
@@ -217,6 +227,195 @@ fn received<T>(mut pending: Pending<T>) -> T {
         thread::yield_now();
     }
 }
+
+fn assert_interframe_gaps(state: &State) {
+    assert_eq!(state.sent_at.len(), state.sent.len());
+    assert!(state.consumed_at.len() >= state.sent.len() - 1);
+    for (sent, consumed) in state.sent_at.iter().skip(1).zip(&state.consumed_at) {
+        // Measure from the final consumed byte to the next send, not between
+        // request starts. No upper bound or assumed scheduler/USB latency.
+        assert!(sent.duration_since(*consumed) >= Duration::from_millis(9));
+    }
+}
+
+#[test]
+fn interframe_sequential_register_reads_and_devices_share_one_port() {
+    let state = Shared::default();
+    let (worker, channels) = build_worker(
+        &state,
+        vec![
+            instance("a", 1, 0),
+            instance("b", 2, 1),
+            instance("c", 1, 2),
+        ],
+    );
+    let requests = [
+        ("a", "channel_type", [1, 0, 0, 0]),
+        ("a", "setpoint", [1, 0, 2, 0]),
+        ("b", "channel_type", [2, 1, 0, 0]),
+        ("c", "setpoint", [1, 2, 2, 0]),
+        ("a", "channel_type", [1, 0, 0, 0]),
+    ];
+    // Queue everything before starting the worker so client round trips cannot
+    // accidentally supply the required interval.
+    let pending: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .map(|(id, (device, key, _))| {
+            channels
+                .commands
+                .read(id as u64, *device, *key, Instant::now() + WAIT)
+                .unwrap()
+        })
+        .collect();
+    let join = thread::spawn(move || worker.run());
+    for request in pending {
+        assert!(received(request).unwrap().observation.reading.is_ok());
+    }
+    channels.commands.shutdown();
+    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+    let state = state.lock().unwrap();
+    assert_eq!(state.sent.len(), requests.len());
+    assert_eq!(state.consumed_at.len(), requests.len());
+    for (sent, (_, _, header)) in state.sent.iter().zip(requests) {
+        assert_eq!(*sent, frame(header.to_vec()));
+    }
+    assert_interframe_gaps(&state);
+}
+
+#[test]
+fn interframe_scheduled_polls_of_different_devices_keep_the_port_gap() {
+    let state = Shared::default();
+    let devices = [("a", 1, 0), ("b", 2, 1)].map(|(id, address, channel)| {
+        let mut device = instance(id, address, channel);
+        device
+            .set_poll_period("channel_type", Some(Duration::from_millis(1)))
+            .unwrap();
+        device
+    });
+    let (worker, channels) = build_worker(&state, Vec::from(devices));
+    let join = thread::spawn(move || worker.run());
+    let mut counts = [0, 0];
+    let deadline = Instant::now() + WAIT;
+    while counts.iter().any(|count| *count < 2) {
+        let observation = channels
+            .observations
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        assert_eq!(observation.observation.source, "channel_type");
+        assert_eq!(observation.observation.reading.unwrap(), Value::Integer(3));
+        counts[match observation.device_id.as_str() {
+            "a" => 0,
+            "b" => 1,
+            _ => panic!("unexpected device"),
+        }] += 1;
+    }
+    channels.commands.shutdown();
+    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+    let state = state.lock().unwrap();
+    assert_eq!(state.consumed_at.len(), state.sent.len());
+    assert!(
+        state
+            .sent
+            .iter()
+            .all(|sent| sent == &frame(vec![1, 0, 0, 0]) || sent == &frame(vec![2, 1, 0, 0]))
+    );
+    assert_interframe_gaps(&state);
+}
+
+#[test]
+fn interframe_write_ack_readback_and_next_device_never_repeat_the_write() {
+    for mismatch in [false, true] {
+        let state = Shared::default();
+        if mismatch {
+            state.lock().unwrap().fault = Some(Fault::ReadbackMismatch);
+        }
+        let (worker, channels) =
+            build_worker(&state, vec![instance("a", 1, 0), instance("b", 2, 1)]);
+        let write = channels
+            .commands
+            .set(
+                1,
+                "a",
+                "setpoint",
+                Value::Float(12.3),
+                Instant::now() + WAIT,
+            )
+            .unwrap();
+        let read = channels
+            .commands
+            .read(2, "b", "channel_type", Instant::now() + WAIT)
+            .unwrap();
+        let join = thread::spawn(move || worker.run());
+        assert_eq!(
+            received(write),
+            if mismatch {
+                Err(CommandError::OutcomeUnknown)
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(
+            received(read).unwrap().observation.reading.unwrap(),
+            Value::Integer(3)
+        );
+        channels.commands.shutdown();
+        assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.sent,
+            [
+                frame(vec![1, 0, 2, 1, 4, 123, 0]),
+                frame(vec![1, 0, 2, 0]),
+                frame(vec![2, 1, 0, 0]),
+            ]
+        );
+        assert_eq!(state.consumed_at.len(), 3);
+        assert_interframe_gaps(&state);
+    }
+}
+
+#[test]
+fn interframe_timeout_or_corruption_keeps_outcome_unknown_and_stops_the_port() {
+    for (fault, count, port_state) in [
+        (Fault::AckTimeout, 1, PortState::Desynchronized),
+        (Fault::AckDisconnect, 1, PortState::Disconnected),
+        (Fault::AckCrc, 1, PortState::Desynchronized),
+        (Fault::ReadbackTimeout, 2, PortState::Desynchronized),
+        (Fault::ReadbackCrc, 2, PortState::Desynchronized),
+    ] {
+        let state = Shared::default();
+        state.lock().unwrap().fault = Some(fault);
+        let (worker, channels) =
+            build_worker(&state, vec![instance("a", 1, 0), instance("b", 2, 1)]);
+        let write = channels
+            .commands
+            .set(
+                1,
+                "a",
+                "setpoint",
+                Value::Float(12.3),
+                Instant::now() + WAIT,
+            )
+            .unwrap();
+        let read = channels
+            .commands
+            .read(2, "b", "channel_type", Instant::now() + WAIT)
+            .unwrap();
+        let reason = worker.run();
+        assert!(matches!(&reason, StopReason::Driver(error) if error.port_state == port_state));
+        assert_eq!(received(write), Err(CommandError::OutcomeUnknown));
+        assert_eq!(
+            received(read).unwrap_err(),
+            CommandError::PortStopped(reason)
+        );
+        let state = state.lock().unwrap();
+        let expected = [frame(vec![1, 0, 2, 1, 4, 123, 0]), frame(vec![1, 0, 2, 0])];
+        assert_eq!(state.sent, expected[..count]);
+        assert_interframe_gaps(&state);
+    }
+}
+
 fn config(enabled: bool) -> ServerConfig {
     let mut config =
         ServerConfig::from_toml(include_str!("../examples/metakon-readonly.toml")).unwrap();
