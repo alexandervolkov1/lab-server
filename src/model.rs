@@ -1,4 +1,14 @@
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Created only at acquisition; Instant is never reconstructed from wall time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMetadata {
+    pub source_instance: u64,
+    pub sequence: u64,
+    pub generation: u64,
+    pub acquired_at: Instant,
+    pub elapsed: Duration,
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -12,6 +22,7 @@ pub struct Observation {
     pub source: String,
     pub unit: String,
     pub completed_at: SystemTime,
+    pub metadata: Option<SourceMetadata>,
     pub reading: Result<Value, String>,
 }
 

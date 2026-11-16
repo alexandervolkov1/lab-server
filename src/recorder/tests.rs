@@ -9,6 +9,56 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const WAIT: Duration = Duration::from_secs(10);
+
+#[test]
+fn v1_migration_preserves_history_and_v2_records_metadata_and_order() {
+    let db = Database::new();
+    let c = db.connect();
+    c.execute_batch(include_str!("schema.sql")).unwrap();
+    c.pragma_update(None, "application_id", 0x4c414252).unwrap();
+    c.pragma_update(None, "user_version", 1).unwrap();
+    c.execute("INSERT INTO sessions(started_at_ns) VALUES (1)", [])
+        .unwrap();
+    drop(c);
+    let recorder = Recorder::open(&db.0, 8).unwrap();
+    let mut sample = observation(7);
+    sample.metadata = Some(crate::model::SourceMetadata {
+        source_instance: u64::MAX,
+        sequence: 4,
+        generation: 1,
+        acquired_at: Instant::now(),
+        elapsed: Duration::from_millis(23),
+    });
+    recorder
+        .handle()
+        .try_record(AggregatorEvent::DataLost {
+            port_id: "bus".into(),
+            loss_epoch: 1,
+        })
+        .unwrap();
+    recorder
+        .handle()
+        .try_observation("bus", "a/value", sample)
+        .unwrap();
+    recorder.shutdown().unwrap();
+    let c = db.connect();
+    assert_eq!(scalar(&c, "PRAGMA user_version"), 2);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 2);
+    let metadata: String = c
+        .query_row("SELECT source_metadata FROM measurements", [], |r| r.get(0))
+        .unwrap();
+    let metadata: Json = serde_json::from_str(&metadata).unwrap();
+    assert_eq!(metadata["sequence"], "4");
+    assert_eq!(metadata["source_instance"], u64::MAX.to_string());
+    let order: String = c
+        .query_row(
+            "SELECT group_concat(kind, ',') FROM (SELECT kind FROM record_order ORDER BY id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(order, "event,measurement");
+}
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
 struct Database(PathBuf);
@@ -55,6 +105,7 @@ fn observation(value: i64) -> Observation {
     Observation {
         source: "value".into(),
         unit: "unit".into(),
+        metadata: None,
         completed_at: SystemTime::UNIX_EPOCH + Duration::from_nanos(123_456_700),
         reading: Ok(Value::Integer(value)),
     }
@@ -1054,7 +1105,10 @@ fn concurrent_invalid_and_overflow_keep_distinct_counts_after_reopen() {
     second.handle().try_record(event(3)).unwrap();
     second.shutdown().unwrap();
     let connection = db.connect();
-    assert_eq!(scalar(&connection, "PRAGMA user_version"), 1);
+    assert_eq!(
+        scalar(&connection, "PRAGMA user_version"),
+        i64::from(SCHEMA_VERSION)
+    );
     assert_eq!(
         scalar(
             &connection,

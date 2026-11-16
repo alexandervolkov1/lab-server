@@ -7,6 +7,95 @@ use std::thread;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+#[test]
+fn loss_before_old_prefix_never_restarts_history_and_other_port_is_independent() {
+    use crate::continuity::Continuity;
+    use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
+    let make = || {
+        PortWorker::new(
+            BufReader::new(Cursor::new(vec![])),
+            vec![DeviceInstance::new("a", MockDriver).unwrap()],
+            2,
+            2,
+        )
+        .unwrap()
+    };
+    let (mut worker, channels) = make();
+    let (mut other, other_channels) = make();
+    let mut registry = DeviceRegistry::new();
+    registry
+        .register_port("p", channels.commands.clone())
+        .unwrap();
+    registry.register_device("p", &worker.devices()[0]).unwrap();
+    let mut continuity = Continuity::new(channels.commands.source_instance());
+    let mut independent = Continuity::new(other_channels.commands.source_instance());
+    // Real worker stamps x1, x2; x3 cannot enter the capacity-two queue.
+    for _ in 0..3 {
+        worker.poll_one();
+    }
+    let mut aggregator =
+        ObservationAggregator::new(&registry, [("p".into(), channels.observations)]).unwrap();
+    let batch = aggregator.poll(1);
+    let [
+        AggregatorEvent::DataLost { loss_epoch, .. },
+        AggregatorEvent::Measurement {
+            observation: x1, ..
+        },
+    ] = batch.as_slice()
+    else {
+        panic!("{batch:?}")
+    };
+    assert_eq!(*loss_epoch, 1);
+    continuity.lost(*loss_epoch);
+    assert_eq!(x1.metadata.as_ref().unwrap().sequence, 1);
+    assert!(!continuity.accept(x1.metadata.as_ref().unwrap()));
+    let batch = aggregator.poll(1);
+    let [
+        AggregatorEvent::Measurement {
+            observation: x2, ..
+        },
+    ] = batch.as_slice()
+    else {
+        panic!()
+    };
+    assert_eq!(x2.metadata.as_ref().unwrap().sequence, 2);
+    assert!(!continuity.accept(x2.metadata.as_ref().unwrap()));
+    assert!(aggregator.poll(1).is_empty()); // silence does not recover anything
+    other.poll_one();
+    let sample = other_channels.observations.try_recv().unwrap();
+    assert!(independent.accept(sample.observation.metadata.as_ref().unwrap()));
+    worker.poll_one(); // x4, first trustworthy sample of generation 1
+    let batch = aggregator.poll(1);
+    let [
+        AggregatorEvent::Measurement {
+            observation: x4, ..
+        },
+    ] = batch.as_slice()
+    else {
+        panic!()
+    };
+    let stamp = x4.metadata.as_ref().unwrap();
+    assert_eq!((stamp.sequence, stamp.generation), (4, 1));
+    assert!(continuity.accept(stamp));
+    assert!(!continuity.accept(stamp)); // replay
+    for _ in 0..4 {
+        worker.poll_one();
+    } // x5/x6 queued; x7/x8 lost
+    let batch = aggregator.poll(1);
+    let [
+        AggregatorEvent::DataLost { loss_epoch, .. },
+        AggregatorEvent::Measurement { observation, .. },
+    ] = batch.as_slice()
+    else {
+        panic!()
+    };
+    assert_eq!(*loss_epoch, 3);
+    continuity.lost(*loss_epoch);
+    assert!(!continuity.accept(observation.metadata.as_ref().unwrap()));
+    continuity.lost(u64::MAX);
+    assert!(!continuity.accept(stamp));
+}
+
 struct MockDriver;
 impl Driver for MockDriver {
     fn parameters(&self) -> Vec<ParameterDescription> {
@@ -158,6 +247,7 @@ fn concurrent_loss_after_unsubscribe_does_not_poison_resubscribe_or_hold_io() {
             observation: Observation {
                 source: "value".into(),
                 unit: "".into(),
+                metadata: None,
                 completed_at: SystemTime::UNIX_EPOCH,
                 reading: Ok(Value::Boolean(false)),
             },

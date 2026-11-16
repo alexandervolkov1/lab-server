@@ -61,6 +61,7 @@ fn event(value: Value) -> AggregatorEvent {
         observation: Observation {
             source: "value".into(),
             unit: "unit".into(),
+            metadata: None,
             completed_at: SystemTime::now(),
             reading: Ok(value),
         },

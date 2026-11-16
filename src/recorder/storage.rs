@@ -114,7 +114,7 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
     let (application_id, version, has_objects) =
         inspect().map_err(|error| RecorderError::sqlite("inspect schema", error))?;
     let fresh = application_id == 0 && version == 0 && !has_objects;
-    if !fresh && (application_id != APPLICATION_ID || version != SCHEMA_VERSION) {
+    if !fresh && (application_id != APPLICATION_ID || version != SCHEMA_VERSION && version != 1) {
         return Err(RecorderError::UnsupportedSchema {
             application_id,
             version,
@@ -139,6 +139,9 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
             .execute_batch(include_str!("schema.sql"))
             .map_err(|error| RecorderError::sqlite("create schema", error))?;
         transaction
+            .execute_batch(include_str!("schema-v2.sql"))
+            .map_err(|error| RecorderError::sqlite("create schema v2", error))?;
+        transaction
             .pragma_update(None, "application_id", APPLICATION_ID)
             .map_err(|error| RecorderError::sqlite("identify schema", error))?;
         transaction
@@ -148,9 +151,22 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
             .commit()
             .map_err(|error| RecorderError::sqlite("commit schema", error))?;
     }
+    if !fresh && version == 1 {
+        let tx = connection
+            .transaction()
+            .map_err(|e| RecorderError::sqlite("begin migration", e))?;
+        tx.execute_batch(include_str!("schema-v2.sql"))
+            .map_err(|e| RecorderError::sqlite("migrate v1 to v2", e))?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| RecorderError::sqlite("version migration", e))?;
+        tx.commit()
+            .map_err(|e| RecorderError::sqlite("commit migration", e))?;
+    }
     // Fail during construction for missing/incompatible required columns, even
     // when a damaged file still advertises our application id and version.
     for sql in [
+        "SELECT source_metadata FROM measurements LIMIT 0",
+        "SELECT session_id, kind, row_id FROM record_order LIMIT 0",
         "SELECT id, started_at_ns, ended_at_ns, recorder_incomplete, recorder_dropped_events, recorder_dropped_data_lost_events FROM sessions LIMIT 0",
         "SELECT session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error FROM measurements LIMIT 0",
         "SELECT session_id, registered_at_ns, event_type, origin, port_id, details_json FROM events LIMIT 0",
@@ -177,8 +193,12 @@ fn insert_entry(tx: &Transaction<'_>, session: i64, entry: &Entry) -> rusqlite::
             };
             // Admission checked this before accepting the immutable event.
             let time = unix_ns(observation.completed_at).expect("validated timestamp");
-            tx.prepare_cached("INSERT INTO measurements(session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
-                .execute(params![session, port_id, global_key, observation.source, time, observation.unit, kind, integer, real, boolean, error])?;
+            tx.prepare_cached("INSERT INTO measurements(session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error, source_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+                .execute(params![session, port_id, global_key, observation.source, time, observation.unit, kind, integer, real, boolean, error, observation.metadata.as_ref().map(|m| json!({"source_instance":m.source_instance.to_string(), "sequence":m.sequence.to_string(), "generation":m.generation.to_string(), "elapsed_ns":m.elapsed.as_nanos().to_string()}).to_string())])?;
+            tx.execute(
+                "INSERT INTO record_order(session_id, kind, row_id) VALUES (?, 'measurement', ?)",
+                params![session, tx.last_insert_rowid()],
+            )?;
             return Ok(());
         }
         AggregatorEvent::DataLost {
@@ -239,6 +259,10 @@ fn insert_event(
 ) -> rusqlite::Result<()> {
     tx.prepare_cached("INSERT INTO events(session_id, registered_at_ns, event_type, origin, port_id, details_json) VALUES (?, ?, ?, ?, ?, ?)")?
         .execute(params![session, time, kind, origin, port, details.to_string()])?;
+    tx.execute(
+        "INSERT INTO record_order(session_id, kind, row_id) VALUES (?, 'event', ?)",
+        params![session, tx.last_insert_rowid()],
+    )?;
     Ok(())
 }
 

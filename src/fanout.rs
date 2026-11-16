@@ -389,6 +389,7 @@ mod tests {
         Observation {
             source: "furnace1/sample_temperature".to_owned(),
             unit: "degC".to_owned(),
+            metadata: None,
             completed_at: UNIX_EPOCH,
             reading: Ok(Value::Float(value)),
         }

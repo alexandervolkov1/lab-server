@@ -334,6 +334,7 @@ fn publish(server: &MultiDeviceTcp, port: &str, key: &str, reading: Result<Value
             observation: Observation {
                 source: key.split_once('/').unwrap().1.into(),
                 unit: "count".into(),
+                metadata: None,
                 completed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1234),
                 reading,
             },
@@ -862,6 +863,7 @@ fn invalid_observation_and_unexplained_eof_fail_only_affected_streams() {
                         observation: Observation {
                             source: "sample".into(),
                             unit: "count".into(),
+                            metadata: None,
                             completed_at: SystemTime::UNIX_EPOCH,
                             reading: Ok(Value::Integer(1)),
                         },

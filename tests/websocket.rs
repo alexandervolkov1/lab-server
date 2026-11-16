@@ -333,6 +333,7 @@ fn publish(server: &Running, port: &str, key: &str, value: Value) {
                     _ => "count",
                 }
                 .into(),
+                metadata: None,
                 completed_at: SystemTime::UNIX_EPOCH + Duration::from_nanos(1_234_567_890),
                 reading: Ok(value),
             },

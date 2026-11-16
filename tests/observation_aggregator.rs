@@ -231,6 +231,7 @@ fn injected(device: &str, source: &str, reading: Result<Value, String>) -> Devic
         observation: Observation {
             source: source.into(),
             unit: "original-unit".into(),
+            metadata: None,
             completed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(123_456),
             reading,
         },

@@ -7,6 +7,7 @@ fn serializes_observation_as_json() {
     let mut observation = Observation {
         source: "sample_temperature".to_string(),
         unit: "degC".to_string(),
+        metadata: None,
         completed_at: UNIX_EPOCH + Duration::from_millis(1234),
         reading: Ok(Value::Float(20.0)),
     };

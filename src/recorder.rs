@@ -17,7 +17,7 @@ use crate::observation_aggregator::AggregatorEvent;
 mod storage;
 use storage::Storage;
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataError {

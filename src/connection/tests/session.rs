@@ -567,6 +567,7 @@ fn dispatch_get_queues_on_demand_read() {
                     observation: Observation {
                         source: "configuration".to_owned(),
                         unit: "".to_owned(),
+                        metadata: None,
                         completed_at: UNIX_EPOCH,
                         reading: Ok(Value::Integer(30)),
                     },

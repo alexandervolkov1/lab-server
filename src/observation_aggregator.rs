@@ -251,6 +251,7 @@ mod tests {
                 observation: Observation {
                     source: "value".into(),
                     unit: "unit".into(),
+                    metadata: None,
                     completed_at: std::time::SystemTime::UNIX_EPOCH,
                     reading: Ok(crate::model::Value::Integer(1)),
                 },

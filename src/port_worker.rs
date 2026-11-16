@@ -18,6 +18,8 @@ use crate::pending::{Pending, SetExecution};
 mod scheduler;
 use scheduler::{Scheduler, Task};
 
+static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1);
+
 pub const COMMAND_QUEUE_CAPACITY: usize = 128;
 pub const OBSERVATION_QUEUE_CAPACITY: usize = 128;
 
@@ -238,6 +240,7 @@ impl Command {
 
 #[derive(Clone)]
 pub struct PortHandle {
+    source_instance: u64,
     sender: mpsc::SyncSender<Command>,
     // Admission and closing share a lock: after close the drain has a finite end.
     stopped: Arc<Mutex<Option<StopReason>>>,
@@ -246,6 +249,9 @@ pub struct PortHandle {
 }
 
 impl PortHandle {
+    pub fn source_instance(&self) -> u64 {
+        self.source_instance
+    }
     // Subscription transitions share this boundary with try_send + loss commit.
     // Never held during driver I/O, network I/O, or waiting for queue capacity.
     pub(crate) fn observation_boundary(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -372,6 +378,9 @@ pub struct PortWorker<P: DeviceIo> {
     loss_epoch: Arc<AtomicU64>,
     observation_boundary: Arc<Mutex<()>>,
     scheduler: Scheduler,
+    source_instance: u64,
+    sequence: u64,
+    started_at: Instant,
     #[cfg(test)]
     before_loss_commit: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -410,7 +419,11 @@ impl<P: DeviceIo> PortWorker<P> {
         let stopped = Arc::new(Mutex::new(None));
         let loss_epoch = Arc::new(AtomicU64::new(0));
         let observation_boundary = Arc::new(Mutex::new(()));
+        let source_instance = NEXT_SOURCE
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+            .map_err(|_| BuildError("source identity exhausted".into()))?;
         let handle = PortHandle {
+            source_instance,
             sender,
             stopped: stopped.clone(),
             loss_epoch: loss_epoch.clone(),
@@ -426,6 +439,9 @@ impl<P: DeviceIo> PortWorker<P> {
                 loss_epoch,
                 observation_boundary,
                 scheduler,
+                source_instance,
+                sequence: 0,
+                started_at: start,
                 #[cfg(test)]
                 before_loss_commit: None,
             },
@@ -576,6 +592,7 @@ impl<P: DeviceIo> PortWorker<P> {
             observation: Observation {
                 source: name,
                 unit: description.unit.clone(),
+                metadata: None,
                 completed_at: SystemTime::now(),
                 reading,
             },
@@ -692,7 +709,19 @@ impl<P: DeviceIo> PortWorker<P> {
             return;
         }
         let task = &self.scheduler.tasks[index];
-        let observation = self.read(task.device, task.parameter);
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.finish(StopReason::ScheduleOverflow);
+            return;
+        };
+        self.sequence = sequence;
+        let mut observation = self.read(task.device, task.parameter);
+        observation.observation.metadata = Some(crate::model::SourceMetadata {
+            source_instance: self.source_instance,
+            sequence: self.sequence,
+            generation: self.loss_epoch.load(Ordering::SeqCst),
+            acquired_at: Instant::now(),
+            elapsed: self.started_at.elapsed(),
+        });
         let boundary = self
             .observation_boundary
             .lock()

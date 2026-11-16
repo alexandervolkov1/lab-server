@@ -1,7 +1,8 @@
 # Processing components
 
-Status: design; implementation stopped for the recovery-contract decision below, as
-requested for a fundamental architecture obstacle. Stages 2–6 have not been implemented.
+Status: implementation in progress. The user approved option A: worker-originated
+source metadata, rejection of old queued generations, automatic filter reinitialization
+only from a valid new generation, and explicit operator restart for controllers.
 Baseline: `78d150ed484aca8932bbc375bf8c6dc59c64f733`.
 
 ## Boundaries

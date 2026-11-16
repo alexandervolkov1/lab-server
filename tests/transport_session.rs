@@ -157,6 +157,7 @@ impl Context {
                 observation: Observation {
                     source: "temperature".into(),
                     unit: "".into(),
+                    metadata: None,
                     completed_at: UNIX_EPOCH,
                     reading: Ok(Value::Float(value)),
                 },
