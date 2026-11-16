@@ -1,5 +1,9 @@
 # Отчёт: processing-components
 
+Это отчёт первоначальной реализации на ac1c265. Последующие исправления review,
+актуальные проверки и устранение ограничения видимости binding описаны в
+[processing-review.md](processing-review.md).
+
 Работа подготовлена к отдельному review в ветках
 [lab-server](https://github.com/alexandervolkov1/lab-server/tree/feature/processing-components) и
 [lab-plot](https://github.com/alexandervolkov1/lab-plot/tree/feature/processing-components).
