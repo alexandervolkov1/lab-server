@@ -23,3 +23,4 @@ pub mod websocket;
 pub use protocol::observation_json;
 
 pub mod continuity;
+pub mod processing;
