@@ -206,6 +206,8 @@ struct Entry {
     event: AggregatorEvent,
     registered_at_ns: i64,
 }
+// Keep the bounded queue allocation-free per event; metadata makes Entry > 200 bytes.
+#[allow(clippy::large_enum_variant)]
 enum Message {
     Event(Entry),
     Wake,

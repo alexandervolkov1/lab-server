@@ -412,6 +412,7 @@ impl StartedServer {
         // No more accepts. WS closing is bounded but may take seconds. Keep
         // draining the SAME aggregator while clients finish, so this wait cannot
         // cause upstream overflow. Workers are stopped only after clients end.
+        tcp.stop_controls();
         clients.request_close();
         let mut drain_error = None;
         while !clients.is_finished() {

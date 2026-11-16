@@ -13,7 +13,15 @@ use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
+struct Control {
+    owner: crate::output::Owner,
+    target: String,
+    timeout: std::time::Duration,
+    pending: Option<crate::pending::Pending<Result<(), crate::port_worker::CommandError>>>,
+}
+
 pub struct DeviceService {
+    controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
     processing: Mutex<crate::processing::Engine>,
     continuity: Mutex<HashMap<String, crate::continuity::Continuity>>,
@@ -24,6 +32,103 @@ pub struct DeviceService {
 }
 
 impl DeviceService {
+    pub fn stop_controls(&self) {
+        let _gate = self.lock_service();
+        self.router.authority().release_all();
+        let mut engine = self.processing.lock().unwrap();
+        for name in self.controls.lock().unwrap().keys() {
+            engine.fault(name, "shutdown");
+        }
+    }
+    fn reconcile_controls(&self, engine: &mut crate::processing::Engine) {
+        use crate::pending::{Completion, Poll};
+        for (name, c) in self.controls.lock().unwrap().iter_mut() {
+            if let Some(pending) = c.pending.take() {
+                match pending.poll(Instant::now()) {
+                    Poll::Waiting(p) => c.pending = Some(p),
+                    Poll::Finished(Completion::Received { value: Ok(()), .. }) => {}
+                    Poll::Finished(_) => {
+                        if engine.state(name).is_some_and(|(_, inc)| inc == c.owner.1) {
+                            engine.fault(name, "output_failed");
+                        }
+                        self.router.authority().release(&c.owner);
+                    }
+                }
+            }
+            if engine.state(name) != Some((crate::processing::State::Auto, c.owner.1)) {
+                self.router.authority().release(&c.owner);
+            }
+        }
+    }
+    fn submit_proposal(&self, name: &str, incarnation: u64, value: f64) {
+        let mut engine = self.processing.lock().unwrap();
+        if engine.state(name) != Some((crate::processing::State::Auto, incarnation)) {
+            return;
+        }
+        let mut controls = self.controls.lock().unwrap();
+        let Some(c) = controls.get_mut(name) else {
+            return;
+        };
+        if c.owner.1 != incarnation || c.pending.is_some() {
+            return;
+        }
+        let result = (|| {
+            let deadline = engine
+                .proposal_deadline(name)
+                .ok_or("input_not_ready".to_owned())?
+                .min(Instant::now() + c.timeout);
+            let description = self
+                .router
+                .description(&c.target)
+                .map_err(|e| e.to_string())?;
+            let value = crate::output::convert(&description.description.spec, value)
+                .map_err(str::to_owned)?;
+            let physical = self
+                .registry()
+                .parameters()
+                .map(|p| {
+                    (
+                        p.global_key.clone(),
+                        std::collections::BTreeSet::from([p.port_id.clone()]),
+                    )
+                })
+                .collect();
+            let lineage = engine.lineage(&physical);
+            let prefix = format!("processing/{name}/");
+            let ports = lineage
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .flat_map(|(_, p)| p.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
+            let continuity = self.continuity.lock().unwrap();
+            let sources = ports
+                .iter()
+                .filter_map(|p| {
+                    self.registry()
+                        .port(p)?
+                        .handle()
+                        .map(|h| (h.clone(), continuity[p].generation()))
+                })
+                .collect();
+            self.router
+                .set_control(
+                    incarnation,
+                    &c.target,
+                    value,
+                    deadline,
+                    Some(&c.owner),
+                    sources,
+                )
+                .map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(p) => c.pending = Some(p),
+            Err(reason) => {
+                engine.fault(name, &reason);
+                self.router.authority().release(&c.owner);
+            }
+        }
+    }
     pub(crate) fn lock_service(&self) -> std::sync::MutexGuard<'_, ()> {
         self.gate.lock().expect("service lock poisoned")
     }
@@ -41,6 +146,44 @@ impl DeviceService {
         use crate::processing::Management::*;
         let mut engine = self.processing.lock().expect("processing lock poisoned");
         match command {
+            Outputs => return Ok(self.router.authority().snapshot()),
+            Bind {
+                name,
+                target,
+                command_timeout_ms,
+                expected_revision,
+            } => {
+                if command_timeout_ms == 0 || command_timeout_ms > 10000 {
+                    return Err("invalid_timeout".into());
+                }
+                let (state, incarnation) = engine.state(&name).ok_or("unknown_instance")?;
+                if state != crate::processing::State::Shadow {
+                    return Err("stop_in_shadow_before_bind".into());
+                }
+                let p = self
+                    .router
+                    .description(&target)
+                    .map_err(|e| e.to_string())?;
+                if !p.description.writable
+                    || matches!(p.description.spec, crate::model::Spec::Boolean)
+                {
+                    return Err("invalid_output_target".into());
+                }
+                let mut controls = self.controls.lock().unwrap();
+                if controls.get(&name).is_some_and(|c| c.pending.is_some()) {
+                    return Err("output_busy".into());
+                }
+                engine.touch(expected_revision)?;
+                controls.insert(
+                    name.clone(),
+                    Control {
+                        owner: (name, incarnation),
+                        target,
+                        timeout: std::time::Duration::from_millis(command_timeout_ms),
+                        pending: None,
+                    },
+                );
+            }
             Types => return Ok(engine.types()),
             List => return Ok(engine.list()),
             Create {
@@ -64,11 +207,24 @@ impl DeviceService {
                 expected_revision,
             } => {
                 if state == crate::processing::State::Auto {
-                    return Err("output_not_bound".into());
+                    let incarnation = engine.ready_for_auto(&name, expected_revision)?;
+                    let controls = self.controls.lock().unwrap();
+                    let c = controls
+                        .get(&name)
+                        .filter(|c| c.owner.1 == incarnation)
+                        .ok_or("output_not_bound")?;
+                    if c.pending.is_some() {
+                        return Err("output_busy".into());
+                    }
+                    self.router
+                        .authority()
+                        .acquire(&c.target, c.owner.clone())?;
                 }
                 engine.set_state(&name, state, expected_revision)?;
             }
         }
+        self.reconcile_controls(&mut engine);
+        let invalid = engine.invalid_outputs();
         let catalog = engine.catalog();
         let physical = self
             .registry()
@@ -84,7 +240,7 @@ impl DeviceService {
         self.latest
             .lock()
             .expect("cache lock poisoned")
-            .retain(|k, _| catalog.contains_key(k));
+            .retain(|k, _| catalog.contains_key(k) && !invalid.contains(k));
         Ok(engine.list())
     }
     pub fn apply_event(&self, event: AggregatorEvent) -> io::Result<()> {
@@ -155,8 +311,12 @@ impl DeviceService {
                 self.invalidate_cached(port, reason, &mut record)?;
             }
         }
+        self.reconcile_controls(&mut self.processing.lock().unwrap());
         self.apply_physical_event(event)?;
         for item in produced {
+            if let Some((name, incarnation, value)) = &item.proposal {
+                self.submit_proposal(name, *incarnation, *value);
+            }
             let event = AggregatorEvent::Measurement {
                 port_id: "processing".into(),
                 global_key: item.key.clone(),
@@ -215,7 +375,10 @@ impl DeviceService {
     }
     pub fn tick_recorded(&self, mut record: impl FnMut(&AggregatorEvent)) -> io::Result<()> {
         let _gate = self.lock_service();
-        let stale = self.processing.lock().unwrap().tick(Instant::now());
+        let mut engine = self.processing.lock().unwrap();
+        let stale = engine.tick(Instant::now());
+        self.reconcile_controls(&mut engine);
+        drop(engine);
         if !stale.is_empty() {
             self.invalidate_cached("*", "stale_input", &mut record)?;
         }
@@ -248,6 +411,7 @@ impl DeviceService {
             })
             .collect();
         Self {
+            controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
             processing: Mutex::new(crate::processing::Engine::new(
                 crate::processing::builtins(),
@@ -370,6 +534,7 @@ impl DeviceService {
 
 fn route_error(error: RouteError) -> EnqueueError {
     match error {
+        RouteError::Authority(reason) => EnqueueError::Authority(reason),
         RouteError::UnknownSignal(_)
         | RouteError::UnknownDevice(_)
         | RouteError::UnknownAction(_) => EnqueueError::UnknownKey,
@@ -383,6 +548,12 @@ fn route_error(error: RouteError) -> EnqueueError {
 }
 
 impl CommandBackend for DeviceService {
+    fn components(&self, command: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.manage_inner(
+            serde_json::from_value(command)
+                .map_err(|e| format!("invalid_component_request:{e}"))?,
+        )
+    }
     fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
         Some(
             self.processing

@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -244,11 +244,15 @@ pub struct PortHandle {
     sender: mpsc::SyncSender<Command>,
     // Admission and closing share a lock: after close the drain has a finite end.
     stopped: Arc<Mutex<Option<StopReason>>>,
+    source_alive: Arc<AtomicBool>,
     loss_epoch: Arc<AtomicU64>,
     observation_boundary: Arc<Mutex<()>>,
 }
 
 impl PortHandle {
+    pub fn source_alive(&self) -> bool {
+        self.source_alive.load(Ordering::SeqCst)
+    }
     pub fn source_instance(&self) -> u64 {
         self.source_instance
     }
@@ -297,8 +301,23 @@ impl PortHandle {
         value: Value,
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
+        self.set_guarded(id, device, parameter, value, (deadline, None))
+    }
+
+    pub(crate) fn set_guarded(
+        &self,
+        id: u64,
+        device: impl Into<String>,
+        parameter: impl Into<String>,
+        value: Value,
+        authorization: (Instant, Option<crate::output::Permit>),
+    ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
+        let (deadline, permit) = authorization;
         let (reply, receiver) = mpsc::sync_channel(1);
-        let execution = SetExecution::new(deadline);
+        let execution = match permit {
+            Some(p) => SetExecution::authorized(deadline, p),
+            None => SetExecution::new(deadline),
+        };
         self.submit(Command::Set {
             device: device.into(),
             parameter: parameter.into(),
@@ -318,8 +337,22 @@ impl PortHandle {
         action: impl Into<String>,
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
+        self.action_guarded(id, device, action, deadline, None)
+    }
+
+    pub(crate) fn action_guarded(
+        &self,
+        id: u64,
+        device: impl Into<String>,
+        action: impl Into<String>,
+        deadline: Instant,
+        permit: Option<crate::output::Permit>,
+    ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
         let (reply, receiver) = mpsc::sync_channel(1);
-        let execution = SetExecution::new(deadline);
+        let execution = match permit {
+            Some(p) => SetExecution::authorized(deadline, p),
+            None => SetExecution::new(deadline),
+        };
         self.submit(Command::InvokeAction {
             device: device.into(),
             action: action.into(),
@@ -332,6 +365,7 @@ impl PortHandle {
     /// Bypasses command capacity. A full queue already wakes the worker; otherwise
     /// Wake releases recv even when there are no polling tasks.
     pub fn shutdown(&self) {
+        self.source_alive.store(false, Ordering::SeqCst);
         let mut stopped = self.stopped.lock().expect("port control lock poisoned");
         if stopped.is_none() {
             *stopped = Some(StopReason::Shutdown);
@@ -375,6 +409,7 @@ pub struct PortWorker<P: DeviceIo> {
     commands: mpsc::Receiver<Command>,
     output: mpsc::SyncSender<DeviceObservation>,
     stopped: Arc<Mutex<Option<StopReason>>>,
+    source_alive: Arc<AtomicBool>,
     loss_epoch: Arc<AtomicU64>,
     observation_boundary: Arc<Mutex<()>>,
     scheduler: Scheduler,
@@ -417,6 +452,7 @@ impl<P: DeviceIo> PortWorker<P> {
         let (sender, commands) = mpsc::sync_channel(command_capacity);
         let (output, observations) = mpsc::sync_channel(observation_capacity);
         let stopped = Arc::new(Mutex::new(None));
+        let source_alive = Arc::new(AtomicBool::new(true));
         let loss_epoch = Arc::new(AtomicU64::new(0));
         let observation_boundary = Arc::new(Mutex::new(()));
         let source_instance = NEXT_SOURCE
@@ -426,6 +462,7 @@ impl<P: DeviceIo> PortWorker<P> {
             source_instance,
             sender,
             stopped: stopped.clone(),
+            source_alive: source_alive.clone(),
             loss_epoch: loss_epoch.clone(),
             observation_boundary: observation_boundary.clone(),
         };
@@ -436,6 +473,7 @@ impl<P: DeviceIo> PortWorker<P> {
                 commands,
                 output,
                 stopped,
+                source_alive,
                 loss_epoch,
                 observation_boundary,
                 scheduler,
@@ -520,6 +558,7 @@ impl<P: DeviceIo> PortWorker<P> {
     }
 
     fn finish(&mut self, reason: StopReason) -> StopReason {
+        self.source_alive.store(false, Ordering::SeqCst);
         let reason = {
             let mut stopped = self.stopped.lock().expect("port control lock poisoned");
             stopped.get_or_insert(reason).clone()
@@ -557,6 +596,7 @@ impl<P: DeviceIo> PortWorker<P> {
 
     fn record_error(&self, error: &DriverError) {
         if error.port_state != PortState::Synchronized {
+            self.source_alive.store(false, Ordering::SeqCst);
             // A physical failure discovered during an in-flight call takes
             // precedence over a concurrently requested orderly shutdown.
             *self.stopped.lock().expect("port control lock poisoned") =
@@ -653,6 +693,9 @@ impl<P: DeviceIo> PortWorker<P> {
                             CommandError::OutcomeUnknown
                         })
                     });
+                if matches!(result, Err(CommandError::OutcomeUnknown)) {
+                    execution.mark_unknown();
+                }
                 execution.complete(|| {
                     let _ = reply.try_send(result);
                 });
@@ -693,6 +736,9 @@ impl<P: DeviceIo> PortWorker<P> {
                             CommandError::OutcomeUnknown
                         })
                     });
+                if matches!(result, Err(CommandError::OutcomeUnknown)) {
+                    execution.mark_unknown();
+                }
                 execution.complete(|| {
                     let _ = reply.try_send(result);
                 });

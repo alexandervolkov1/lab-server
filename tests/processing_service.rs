@@ -112,3 +112,118 @@ fn ema_chain_retune_loss_old_queue_and_dynamic_catalog() {
         .unwrap();
     assert_eq!(get(1)["error"], "unknown_key");
 }
+
+#[test]
+fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Actuator(Arc<AtomicUsize>);
+    impl Driver for Actuator {
+        fn parameters(&self) -> Vec<ParameterDescription> {
+            let mut p = Source.parameters();
+            p.push(ParameterDescription {
+                id: "power".into(),
+                unit: "%".into(),
+                spec: Spec::Integer { min: 0, max: 100 },
+                writable: true,
+                default_poll_period: None,
+            });
+            p
+        }
+        fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
+            Ok(Value::Float(1.))
+        }
+        fn write(
+            &mut self,
+            _: &str,
+            value: &Value,
+            _: &mut dyn DeviceIo,
+        ) -> Result<(), DriverError> {
+            assert_eq!(*value, Value::Integer(3));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for stop_before_start in [true, false] {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (worker, channels) = PortWorker::new(
+            BufReader::new(Cursor::new(vec![])),
+            vec![DeviceInstance::new("a", Actuator(writes.clone())).unwrap()],
+            8,
+            8,
+        )
+        .unwrap();
+        let instance = channels.commands.source_instance();
+        let mut registry = DeviceRegistry::new();
+        registry
+            .register_port("p", channels.commands.clone())
+            .unwrap();
+        registry.register_device("p", &worker.devices()[0]).unwrap();
+        let router = CommandRouter::new(registry);
+        let service = DeviceService::new(router.clone(), 32);
+        let manage = |command| service.manage(serde_json::from_value(command).unwrap());
+        manage(json!({"action":"create","expected_revision":0,"configuration":{"name":"loop","type_id":"pid","inputs":{"input":"a/raw"},"parameters":{"setpoint":3.5},"max_age_ms":10000}})).unwrap();
+        manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1000,"expected_revision":1})).unwrap();
+        let event = |seq| AggregatorEvent::Measurement {
+            port_id: "p".into(),
+            global_key: "a/raw".into(),
+            observation: Observation {
+                source: "raw".into(),
+                unit: "C".into(),
+                completed_at: SystemTime::now(),
+                metadata: Some(SourceMetadata {
+                    source_instance: instance,
+                    sequence: seq,
+                    generation: 0,
+                    acquired_at: Instant::now(),
+                    elapsed: Duration::from_millis(seq),
+                }),
+                reading: Ok(Value::Float(1.)),
+            },
+        };
+        service.apply_event(event(1)).unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        manage(json!({"action":"state","name":"loop","state":"auto","expected_revision":2}))
+            .unwrap();
+        assert!(
+            router
+                .set(
+                    1,
+                    "a/power",
+                    Value::Integer(2),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+        );
+        service.apply_event(event(2)).unwrap();
+        if stop_before_start {
+            manage(json!({"action":"state","name":"loop","state":"stopped","expected_revision":3}))
+                .unwrap();
+        }
+        let join = std::thread::spawn(move || worker.run());
+        let end = Instant::now() + Duration::from_secs(3);
+        // A read queued behind the mutation proves the worker crossed its start boundary.
+        let mut read = channels.commands.read(7, "a", "raw", end).unwrap();
+        loop {
+            match read.poll(Instant::now()) {
+                lab_server::pending::Poll::Waiting(p) => {
+                    read = p;
+                    std::thread::yield_now();
+                }
+                lab_server::pending::Poll::Finished(
+                    lab_server::pending::Completion::Received { value: Ok(_), .. },
+                ) => break,
+                _ => panic!("worker failed"),
+            }
+        }
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            usize::from(!stop_before_start)
+        );
+        service.stop_controls();
+        channels.commands.shutdown();
+        join.join().unwrap();
+    }
+}

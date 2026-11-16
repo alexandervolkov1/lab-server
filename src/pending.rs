@@ -13,6 +13,7 @@ enum ExecutionState {
 pub struct SetExecution {
     deadline: Instant,
     state: Mutex<ExecutionState>,
+    permit: Mutex<Option<crate::output::Permit>>,
 }
 
 impl SetExecution {
@@ -20,13 +21,35 @@ impl SetExecution {
         Arc::new(Self {
             deadline,
             state: Mutex::new(ExecutionState::Queued),
+            permit: Mutex::new(None),
         })
     }
 
+    pub fn authorized(deadline: Instant, permit: crate::output::Permit) -> Arc<Self> {
+        Arc::new(Self {
+            deadline,
+            state: Mutex::new(ExecutionState::Queued),
+            permit: Mutex::new(Some(permit)),
+        })
+    }
+    pub fn mark_unknown(&self) {
+        if let Some(p) = self.permit.lock().unwrap().as_ref() {
+            p.unknown();
+        }
+    }
     pub fn try_start(&self) -> bool {
         let mut state = self.state.lock().expect("execution lock poisoned");
         // Read the clock inside the lock: a waiter must not use a stale timestamp.
         if matches!(*state, ExecutionState::Queued) && Instant::now() < self.deadline {
+            if self
+                .permit
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_some_and(|p| !p.start())
+            {
+                return false;
+            }
             *state = ExecutionState::Started;
             true
         } else {
@@ -37,6 +60,9 @@ impl SetExecution {
     pub fn complete(&self, send: impl FnOnce()) {
         let _state = self.state.lock().expect("execution lock poisoned");
         send();
+        if let Some(p) = self.permit.lock().unwrap().as_mut() {
+            p.finish();
+        }
     }
 }
 
@@ -87,6 +113,9 @@ impl<T> Pending<T> {
                     .as_deref()
                     .is_some_and(|s| matches!(s, ExecutionState::Started))
                 {
+                    if let Some(e) = &execution {
+                        e.mark_unknown();
+                    }
                     Poll::Finished(Completion::OutcomeUnknown { id: self.id })
                 } else {
                     if let Some(state) = state.as_deref_mut() {
@@ -101,6 +130,9 @@ impl<T> Pending<T> {
                     .as_deref()
                     .is_some_and(|s| matches!(s, ExecutionState::Started))
                 {
+                    if let Some(e) = &execution {
+                        e.mark_unknown();
+                    }
                     Poll::Finished(Completion::OutcomeUnknown { id: self.id })
                 } else {
                     if let Some(state) = state.as_deref_mut() {

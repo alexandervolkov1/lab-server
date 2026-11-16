@@ -178,6 +178,47 @@ pub struct Produced {
     pub proposal: Option<(String, u64, f64)>,
 }
 impl Engine {
+    pub fn touch(&mut self, expected: u64) -> Result<(), String> {
+        self.check_revision(expected)?;
+        self.revision += 1;
+        Ok(())
+    }
+    pub fn fault(&mut self, name: &str, reason: &str) {
+        if self.nodes.contains_key(name) {
+            self.invalidate_nodes(&[name.into()], reason);
+        }
+    }
+    pub fn ready_for_auto(&self, name: &str, expected: u64) -> Result<u64, String> {
+        self.check_revision(expected)?;
+        let n = self.nodes.get(name).ok_or("unknown_instance")?;
+        if n.description.kind != Kind::Controller
+            || n.state != State::Shadow
+            || n.description.proposal.is_none()
+        {
+            return Err("restart_in_shadow_first".into());
+        }
+        self.proposal_deadline(name)
+            .filter(|d| *d > Instant::now())
+            .ok_or("input_not_ready")?;
+        Ok(n.incarnation)
+    }
+    pub fn proposal_deadline(&self, name: &str) -> Option<Instant> {
+        let n = self.nodes.get(name)?;
+        n.config
+            .inputs
+            .values()
+            .map(|k| {
+                let o = self.latest.get(k)?;
+                o.reading.as_ref().ok()?;
+                o.metadata
+                    .as_ref()?
+                    .acquired_at
+                    .checked_add(Duration::from_millis(n.config.max_age_ms))
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
     pub fn new(registry: Registry, physical: HashMap<String, ParameterDescription>) -> Self {
         Self {
             registry,
@@ -601,6 +642,13 @@ pub fn signal(instance: &str, output: &str) -> String {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Management {
+    Outputs,
+    Bind {
+        name: String,
+        target: String,
+        command_timeout_ms: u64,
+        expected_revision: u64,
+    },
     Types,
     List,
     Create {

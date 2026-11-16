@@ -18,6 +18,7 @@ pub use subscriptions::{SubscriptionChange, SubscriptionError, SubscriptionSet};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnqueueError {
+    Authority(&'static str),
     DuplicateId,
     Full,
     RuntimeUnavailable,
@@ -30,6 +31,7 @@ pub enum EnqueueError {
 impl EnqueueError {
     fn code(&self) -> &'static str {
         match self {
+            Self::Authority(reason) => reason,
             Self::DuplicateId => "duplicate_id",
             Self::Full => "too_many_pending",
             Self::RuntimeUnavailable => "runtime_unavailable",
@@ -44,6 +46,9 @@ impl EnqueueError {
 /// Shared asynchronous command admission for transport sessions.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
+    fn components(&self, _command: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("unsupported_op".into())
+    }
     fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
         None
     }
@@ -420,7 +425,8 @@ impl<Input> SessionState<Input> {
         let catalog = snapshot.as_ref().unwrap_or(catalog);
         let id = match &incoming {
             ParsedMessage::Request(
-                Request::Hello { id }
+                Request::Components { id, .. }
+                | Request::Hello { id }
                 | Request::Describe { id }
                 | Request::Ping { id }
                 | Request::Get { id, .. }
@@ -447,6 +453,14 @@ impl<Input> SessionState<Input> {
         }
 
         match incoming {
+            ParsedMessage::Request(Request::Components { id, command }) => {
+                match commands.components(command) {
+                    Ok(data) => {
+                        self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
+                    }
+                    Err(error) => self.queue_error(id, &error),
+                }
+            }
             ParsedMessage::Request(Request::Subscribe { id, keys }) => {
                 self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)?;
                 Ok(())

@@ -14,6 +14,7 @@ use crate::port_worker::{CommandError, DeviceObservation, PortHandle, StopReason
 /// Pending completion types, including both forms of outcome_unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
+    Authority(&'static str),
     UnknownSignal(String),
     UnknownAction(String),
     UnknownDevice(String),
@@ -41,6 +42,7 @@ pub enum RouteError {
 impl fmt::Display for RouteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Authority(reason) => f.write_str(reason),
             Self::UnknownAction(key) => write!(f, "unknown global action {key:?}"),
             Self::UnknownSignal(key) => write!(f, "unknown global signal {key:?}"),
             Self::UnknownDevice(id) => write!(f, "unknown device {id:?}"),
@@ -79,13 +81,24 @@ impl std::error::Error for RouteError {}
 #[derive(Clone)]
 pub struct CommandRouter {
     registry: Arc<DeviceRegistry>,
+    authority: Arc<crate::output::Authority>,
 }
 
 impl CommandRouter {
     pub fn new(registry: DeviceRegistry) -> Self {
         Self {
+            authority: Arc::new(crate::output::Authority::new(
+                registry
+                    .parameters()
+                    .filter(|p| p.description.writable)
+                    .map(|p| p.global_key.clone()),
+            )),
             registry: Arc::new(registry),
         }
+    }
+
+    pub fn authority(&self) -> &crate::output::Authority {
+        &self.authority
     }
 
     pub fn registry(&self) -> &DeviceRegistry {
@@ -132,6 +145,29 @@ impl CommandRouter {
         value: Value,
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, RouteError> {
+        self.set_owned(id, global_key, value, deadline, None)
+    }
+
+    pub fn set_owned(
+        &self,
+        id: u64,
+        global_key: &str,
+        value: Value,
+        deadline: Instant,
+        owner: Option<&crate::output::Owner>,
+    ) -> Result<Pending<Result<(), CommandError>>, RouteError> {
+        self.set_control(id, global_key, value, deadline, owner, Vec::new())
+    }
+
+    pub(crate) fn set_control(
+        &self,
+        id: u64,
+        global_key: &str,
+        value: Value,
+        deadline: Instant,
+        owner: Option<&crate::output::Owner>,
+        sources: Vec<(PortHandle, u64)>,
+    ) -> Result<Pending<Result<(), CommandError>>, RouteError> {
         let parameter = self.description(global_key)?;
         if !parameter.description.writable {
             return Err(RouteError::ReadOnly {
@@ -143,13 +179,18 @@ impl CommandRouter {
                 global_key: global_key.into(),
             });
         }
+        let permit = self
+            .authority
+            .permit(&[global_key.into()], owner)
+            .map_err(RouteError::Authority)?
+            .with_sources(sources);
         self.handle(&parameter.device_id, &parameter.port_id)?
-            .set(
+            .set_guarded(
                 id,
                 &parameter.device_id,
                 &parameter.description.id,
                 value,
-                deadline,
+                (deadline, Some(permit)),
             )
             .map_err(|error| Self::submit_error(&parameter.device_id, &parameter.port_id, error))
     }
@@ -171,8 +212,25 @@ impl CommandRouter {
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, RouteError> {
         let action = self.action_description(global_key)?;
+        let mut keys = self
+            .registry
+            .parameters()
+            .filter(|p| p.device_id == action.device_id && p.description.writable)
+            .map(|p| p.global_key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        let permit = self
+            .authority
+            .permit(&keys, None)
+            .map_err(RouteError::Authority)?;
         self.handle(&action.device_id, &action.port_id)?
-            .invoke_action(id, &action.device_id, &action.description.name, deadline)
+            .action_guarded(
+                id,
+                &action.device_id,
+                &action.description.name,
+                deadline,
+                Some(permit),
+            )
             .map_err(|error| Self::submit_error(&action.device_id, &action.port_id, error))
     }
 

@@ -17,6 +17,9 @@ impl Continuity {
             stopped: false,
         }
     }
+    pub fn generation(&self) -> u64 {
+        self.minimum_generation
+    }
     pub fn lost(&mut self, generation: u64) {
         self.minimum_generation = self.minimum_generation.max(generation);
     }
