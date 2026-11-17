@@ -34,7 +34,7 @@ max_age_ms = 5000
 [processing.components.inputs]
 input = "processing/smooth/value"
 [processing.components.parameters]
-setpoint = 40.0
+setpoint = 20.0
 kp = 2.0
 ki = 0.1
 kd = 0.0
