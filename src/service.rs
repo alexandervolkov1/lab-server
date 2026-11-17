@@ -13,6 +13,9 @@ use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
+mod diagnostics;
+pub(crate) use diagnostics::Runtime;
+
 struct Control {
     owner: crate::output::Owner,
     target: String,
@@ -21,6 +24,7 @@ struct Control {
 }
 
 pub struct DeviceService {
+    pub(crate) runtime: std::sync::OnceLock<Runtime>,
     controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
     processing: Mutex<crate::processing::Engine>,
@@ -462,6 +466,7 @@ impl DeviceService {
             })
             .collect();
         Self {
+            runtime: std::sync::OnceLock::new(),
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
             processing: Mutex::new(
@@ -599,6 +604,9 @@ fn route_error(error: RouteError) -> EnqueueError {
 }
 
 impl CommandBackend for DeviceService {
+    fn server_status(&self) -> Result<serde_json::Value, String> {
+        self.diagnostics()
+    }
     fn components(&self, command: serde_json::Value) -> Result<serde_json::Value, String> {
         self.manage_inner(
             serde_json::from_value(command)

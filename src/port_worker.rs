@@ -242,6 +242,7 @@ impl Command {
 
 #[derive(Clone)]
 pub struct PortHandle {
+    last_success: Arc<Mutex<Option<SystemTime>>>,
     source_instance: u64,
     sender: mpsc::SyncSender<Command>,
     // Admission and closing share a lock: after close the drain has a finite end.
@@ -252,6 +253,10 @@ pub struct PortHandle {
 }
 
 impl PortHandle {
+    /// Last successful, schema-valid read (poll or explicit get), even after stop.
+    pub fn last_success(&self) -> Option<SystemTime> {
+        *self.last_success.lock().unwrap_or_else(|p| p.into_inner())
+    }
     pub fn source_alive(&self) -> bool {
         self.source_alive.load(Ordering::SeqCst)
     }
@@ -413,6 +418,7 @@ pub enum PortMode {
 }
 
 pub struct PortWorker<P: DeviceIo> {
+    last_success: Arc<Mutex<Option<SystemTime>>>,
     mode: PortMode,
     io: P,
     devices: Vec<DeviceInstance>,
@@ -486,6 +492,7 @@ impl<P: DeviceIo> PortWorker<P> {
         let (sender, commands) = mpsc::sync_channel(command_capacity);
         let (output, observations) = mpsc::sync_channel(observation_capacity);
         let stopped = Arc::new(Mutex::new(None));
+        let last_success = Arc::new(Mutex::new(None));
         let source_alive = Arc::new(AtomicBool::new(true));
         let loss_epoch = Arc::new(AtomicU64::new(0));
         let observation_boundary = Arc::new(Mutex::new(()));
@@ -493,6 +500,7 @@ impl<P: DeviceIo> PortWorker<P> {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
             .map_err(|_| BuildError("source identity exhausted".into()))?;
         let handle = PortHandle {
+            last_success: last_success.clone(),
             source_instance,
             sender,
             stopped: stopped.clone(),
@@ -502,6 +510,7 @@ impl<P: DeviceIo> PortWorker<P> {
         };
         Ok((
             Self {
+                last_success,
                 mode,
                 io,
                 devices,
@@ -677,13 +686,17 @@ impl<P: DeviceIo> PortWorker<P> {
                 Err("Value out of range".into())
             }
         });
+        let completed_at = SystemTime::now();
+        if reading.is_ok() {
+            *self.last_success.lock().unwrap_or_else(|p| p.into_inner()) = Some(completed_at);
+        }
         DeviceObservation {
             device_id: self.devices[device].id.clone(),
             observation: Observation {
                 source: name,
                 unit: description.unit.clone(),
                 metadata: None,
-                completed_at: SystemTime::now(),
+                completed_at,
                 reading,
             },
         }

@@ -555,6 +555,62 @@ fn concurrent_overflow_never_waits_for_writer_and_lost_datalost_remains_visible(
 }
 
 #[test]
+fn server_status_reads_loss_counters_without_waiting_for_sqlite() {
+    let db = Database::new();
+    let (hooks, entered, release, _) = first_flush_gate();
+    let recorder = Recorder::start(&db.0, options(1, 1), hooks).unwrap();
+    let handle = recorder.handle();
+    handle.try_record(event(0)).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    handle.try_record(event(1)).unwrap();
+    assert_eq!(
+        handle.try_record(AggregatorEvent::DataLost {
+            port_id: "bus".into(),
+            loss_epoch: 7
+        }),
+        Err(SubmitError::Full)
+    );
+    let mut invalid = observation(0);
+    invalid.reading = Ok(Value::Float(f64::NAN));
+    assert!(matches!(
+        handle.try_observation("bus", "device/value", invalid),
+        Err(SubmitError::InvalidData(_))
+    ));
+    let service = crate::service::DeviceService::new(
+        crate::command_router::CommandRouter::new(crate::device_registry::DeviceRegistry::new()),
+        8,
+    );
+    assert!(
+        service
+            .runtime
+            .set(crate::service::Runtime::new(
+                Instant::now(),
+                "127.0.0.1:7240".parse().unwrap(),
+                None,
+                Some(handle.clone())
+            ))
+            .is_ok()
+    );
+    let (send, receive) = mpsc::channel();
+    let join = thread::spawn(move || send.send(service.diagnostics().unwrap()).unwrap());
+    // The writer remains blocked until the snapshot has completed. Release it
+    // even on failure so this regression cannot leave shutdown waiting forever.
+    let snapshot = receive.recv_timeout(WAIT);
+    release.send(()).unwrap();
+    let snapshot = snapshot.unwrap();
+    join.join().unwrap();
+    assert_eq!(snapshot["recorder"]["state"], "running");
+    assert_eq!(snapshot["recorder"]["session_id"], handle.session_id());
+    assert_eq!(
+        snapshot["recorder"]["losses"],
+        serde_json::json!({"dropped_events":1,"dropped_data_lost_events":1,"rejected_invalid_data":1})
+    );
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.accepted_records, 2);
+    assert_eq!(summary.losses, handle.losses());
+}
+
+#[test]
 fn saturated_loss_is_sticky_and_persisted_as_exact_decimal_text() {
     let db = Database::new();
     let (hooks, entered, release, _) = first_flush_gate();

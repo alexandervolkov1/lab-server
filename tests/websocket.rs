@@ -1204,6 +1204,74 @@ fn component_binding_is_shared_by_tcp_peers_and_websocket_at_one_revision() {
 }
 
 #[test]
+fn server_status_has_one_tcp_ws_contract_and_tracks_client_slots_and_shutdown() {
+    let mut config = configuration();
+    config.ports.clear();
+    config.devices.clear();
+    let mut server = Running::with_config(config);
+    let mut tcp = server.tcp();
+    let mut ws = server.connect();
+    assert_eq!(
+        tcp_request(&mut tcp, json!({"id":1,"op":"ping"}))["status"],
+        "ok"
+    );
+    assert_eq!(
+        request(&mut ws, json!({"id":1,"op":"ping"}))["status"],
+        "ok"
+    );
+    let mut first = tcp_request(&mut tcp, json!({"id":2,"op":"server_status"}));
+    let mut second = request(&mut ws, json!({"id":2,"op":"server_status"}));
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["data"]["server"]["active_clients"], 2);
+    assert_eq!(first["data"]["server"]["state"], "running");
+    assert_eq!(
+        first["data"]["server"]["listeners"]["tcp"]["state"],
+        "accepting"
+    );
+    assert_eq!(
+        first["data"]["server"]["listeners"]["websocket"]["state"],
+        "accepting"
+    );
+    assert_eq!(first["data"]["recorder"]["enabled"], false);
+    assert_eq!(first["data"]["ports"], json!([]));
+    assert_eq!(first["data"]["devices"], json!([]));
+    assert!(
+        second["data"]["server"]["uptime_ms"].as_u64().unwrap()
+            >= first["data"]["server"]["uptime_ms"].as_u64().unwrap()
+    );
+    first["data"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("uptime_ms");
+    second["data"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("uptime_ms");
+    assert_eq!(first, second);
+    drop(tcp);
+    let deadline = Instant::now() + WAIT;
+    let mut id = 3;
+    loop {
+        let status = request(&mut ws, json!({"id":id,"op":"server_status"}));
+        if status["data"]["server"]["active_clients"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        id += 1;
+    }
+    drop(ws);
+    server.stop();
+    let status = server.service.diagnostics().unwrap();
+    assert_eq!(status["server"]["state"], "stopped");
+    assert_eq!(status["server"]["active_clients"], 0);
+    assert_eq!(status["server"]["listeners"]["tcp"]["state"], "closed");
+    assert_eq!(
+        status["server"]["listeners"]["websocket"]["state"],
+        "closed"
+    );
+}
+
+#[test]
 fn parameter_set_and_pid_setpoint_use_existing_tcp_ws_measurement_contract() {
     for use_ws in [false, true] {
         let server = Running::new();

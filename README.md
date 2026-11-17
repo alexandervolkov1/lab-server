@@ -131,12 +131,25 @@ JSON-примеры запросов нужно отправлять с заве
 | `hello` — версия протокола | — | `{"id":1,"op":"hello"}` | `{"id":1,"status":"ok","protocol":"lab-server","version":1}` |
 | `describe` — каталог параметров и действий | — | `{"id":2,"op":"describe"}` | `id`, `status: "ok"`, массивы `parameters` и `actions` |
 | `ping` — проверка связи | — | `{"id":3,"op":"ping"}` | `{"id":3,"status":"ok"}` |
+| `server_status` — диагностика сервера | — | `{"id":10,"op":"server_status"}` | `id`, `status: "ok"`, `data`: снимок состояния |
 | `get` — получить значение | `key`: строка | `{"id":4,"op":"get","key":"furnace1/heater_temperature"}` | `id`, `status: "ok"`, `key`, `value`, `unit`, `completed_at_unix_ms` |
 | `set` — записать значение | `key`: строка, `value`: число или Boolean | `{"id":5,"op":"set","key":"furnace1/power","value":20}` | `{"id":5,"status":"ok"}` |
 | `subscribe` — добавить подписки | `keys`: массив строк; либо одиночный `key` | `{"id":6,"op":"subscribe","keys":["furnace1/heater_temperature"]}` | `{"id":6,"status":"ok","keys":["furnace1/heater_temperature"]}` при отсутствии других подписок |
 | `unsubscribe` — удалить подписки | `keys`: массив строк | `{"id":7,"op":"unsubscribe","keys":["furnace1/heater_temperature"]}` | `{"id":7,"status":"ok","keys":[]}` при удалении последней подписки |
 | `invoke_action` — выполнить действие без аргументов | `key`: глобальное имя действия | `{"id":17,"op":"invoke_action","key":"furnace1/apply"}` | `{"id":17,"status":"ok"}` |
 
+
+## Диагностика сервера
+
+`{"id":10,"op":"server_status"}` возвращает один и тот же структурированный ответ
+через TCP и WebSocket: время работы, активные соединения, listeners, порты и приборы,
+состояния компонентов и SQLite Recorder. Частичные отказы видны в соответствующих
+разделах; поле `server.state` описывает жизненный цикл, общего флага `healthy` нет.
+
+Запрос читает состояние из памяти, не обращается к оборудованию или SQLite,
+не меняет Auto, выходы, компоненты и подписки. Снимок не является глобально атомарным.
+Неизвестные значения обозначаются `null`, выключенный Recorder — `state: "disabled"`.
+[Полный JSON-пример, поля, счётчики и ограничения](docs/server-status.md).
 
 ## Типы и ответы
 

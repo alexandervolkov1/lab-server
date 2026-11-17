@@ -3,6 +3,8 @@
 [Краткий справочник и запуск](../README.md) · [Архитектура](architecture.md)
 
 Дополнительная операция `components` описана в [API компонентов](processing-api.md).
+Read-only операция `server_status` описана в [диагностике сервера](server-status.md)
+с полным примером ответа и семантикой показателей; она доступна через TCP и WebSocket.
 Существующие команды и measurement-пакеты сохраняют формат v1.
 
 ## Формат обмена
@@ -29,6 +31,7 @@ JSON-примеры запросов нужно отправлять с заве
 | `hello` — версия протокола | — | `{"id":1,"op":"hello"}` | `{"id":1,"status":"ok","protocol":"lab-server","version":1}` |
 | `describe` — каталог параметров и действий | — | `{"id":2,"op":"describe"}` | `id`, `status: "ok"`, массивы `parameters` и `actions` |
 | `ping` — проверка связи | — | `{"id":3,"op":"ping"}` | `{"id":3,"status":"ok"}` |
+| `server_status` — диагностика сервера | — | `{"id":10,"op":"server_status"}` | `id`, `status: "ok"`, объект `data` с `server`, `ports`, `devices`, `processing`, `recorder` |
 | `get` — получить значение | `key`: строка | `{"id":4,"op":"get","key":"furnace1/heater_temperature"}` | `id`, `status: "ok"`, `key`, `value`, `unit`, `completed_at_unix_ms` |
 | `set` — записать значение | `key`: строка, `value`: число или Boolean | `{"id":5,"op":"set","key":"furnace1/power","value":20}` | `{"id":5,"status":"ok"}` |
 | `subscribe` — добавить подписки | `keys`: массив строк; либо одиночный `key` | `{"id":6,"op":"subscribe","keys":["furnace1/heater_temperature"]}` | `{"id":6,"status":"ok","keys":["furnace1/heater_temperature"]}` при отсутствии других подписок |

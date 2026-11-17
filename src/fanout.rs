@@ -255,9 +255,16 @@ impl ObservationFanout {
         })
     }
     pub(crate) fn report_loss(&self, id: &str, epoch: u64) -> io::Result<()> {
-        self.port(id)?
+        let previous = self
+            .port(id)?
             .reported_epoch
             .fetch_max(epoch, Ordering::SeqCst);
+        // One warning per port; continued loss remains visible in server_status.
+        if previous == 0 && epoch != 0 {
+            eprintln!(
+                "Observation data lost: port={id:?} loss_epoch={epoch}; see server_status for current counters"
+            );
+        }
         Ok(())
     }
     pub(crate) fn close_port(&self, id: &str) -> io::Result<()> {

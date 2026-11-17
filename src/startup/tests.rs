@@ -467,16 +467,28 @@ fn finishing_reads(queued: &[usize]) -> ShutdownFixture {
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let tcp = Arc::new(MultiDeviceTcp::new(
+        CommandRouter::new(registry),
+        OBSERVATION_QUEUE_CAPACITY,
+    ));
+    assert!(
+        tcp.runtime
+            .set(crate::service::Runtime::new(
+                Instant::now(),
+                listener.local_addr().unwrap(),
+                None,
+                None
+            ))
+            .is_ok()
+    );
     ShutdownFixture {
         server: StartedServer {
+            _lifetime: ServerLifetime(tcp.clone()),
             websocket_listener: None,
             websocket_origins: Arc::new(Vec::new()),
             workers,
             listener,
-            tcp: Arc::new(MultiDeviceTcp::new(
-                CommandRouter::new(registry),
-                OBSERVATION_QUEUE_CAPACITY,
-            )),
+            tcp,
             sources,
             recording: Recording::default(),
         },

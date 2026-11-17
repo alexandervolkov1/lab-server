@@ -11,7 +11,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::client_limit::{ClientSlots, MAX_CLIENTS};
+use crate::client_limit::MAX_CLIENTS;
 use crate::command_router::CommandRouter;
 use crate::config::{ConfigError, DeviceConfig, FlowControl, Parity, PortConfig, ServerConfig};
 use crate::device_registry::DeviceRegistry;
@@ -138,6 +138,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     mut factory: impl FnMut(&DeviceConfig) -> Result<DriverSetup, String>,
     mut open: impl FnMut(&PortConfig, Duration) -> io::Result<P>,
 ) -> StartupResult<StartedServer> {
+    let started_at = std::time::Instant::now();
     config.validate()?;
     let mut grouped = HashMap::<&str, (Vec<DeviceInstance>, Duration)>::new();
     for (index, device) in config.devices.iter().enumerate() {
@@ -253,6 +254,19 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
                 }
             }
         }
+        assert!(
+            tcp.runtime
+                .set(crate::service::Runtime::new(
+                    started_at,
+                    listener.local_addr()?,
+                    websocket_listener
+                        .as_ref()
+                        .map(TcpListener::local_addr)
+                        .transpose()?,
+                    recording.handle.clone(),
+                ))
+                .is_ok()
+        );
         let mut workers = Workers::default();
         // All ports are prepared before polling begins (including Arduino resets).
         for (id, handle, worker) in prepared {
@@ -265,6 +279,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     })();
     match prepared_server {
         Ok((tcp, sources, workers)) => Ok(StartedServer {
+            _lifetime: ServerLifetime(tcp.clone()),
             workers,
             listener,
             websocket_listener,
@@ -353,6 +368,17 @@ pub struct StartedServer {
     tcp: Arc<MultiDeviceTcp>,
     sources: Vec<(String, mpsc::Receiver<DeviceObservation>)>,
     recording: Recording,
+    // Dropped last, after listeners/workers/recording, even if run was never called.
+    _lifetime: ServerLifetime,
+}
+
+struct ServerLifetime(Arc<MultiDeviceTcp>);
+impl Drop for ServerLifetime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.runtime.get() {
+            runtime.transition("stopped", None);
+        }
+    }
 }
 
 impl StartedServer {
@@ -383,7 +409,9 @@ impl StartedServer {
         let mut aggregator =
             ObservationAggregator::new(tcp.registry(), std::mem::take(&mut self.sources))
                 .map_err(io::Error::other)?;
-        let slots = ClientSlots::new();
+        let runtime = tcp.runtime.get().expect("startup runtime");
+        runtime.transition("running", None);
+        let slots = &runtime.slots;
         let mut clients = Clients::default();
         let result = (|| -> io::Result<()> {
             while !stop.load(Ordering::Acquire) {
@@ -411,7 +439,10 @@ impl StartedServer {
                             Ok((stream, _)) => stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                runtime.listener_failed(websocket, error.to_string());
+                                return Err(error);
+                            }
                         };
                         let Some(slot) = slots.try_acquire() else {
                             continue;
@@ -452,6 +483,14 @@ impl StartedServer {
             }
             Ok(())
         })();
+        eprintln!(
+            "Server shutdown starting: {}",
+            result
+                .as_ref()
+                .err()
+                .map_or_else(|| "stop requested".into(), ToString::to_string)
+        );
+        runtime.transition("stopping", result.as_ref().err().map(ToString::to_string));
         let mut errors = ServerErrors::default();
         errors.capture(result);
         // No more accepts. WS closing is bounded but may take seconds. Keep
@@ -488,7 +527,16 @@ impl StartedServer {
         }
         errors.capture(self.workers.join());
         self.recording.finish(&mut errors);
-        errors.result()
+        let result = errors.result();
+        runtime.transition("stopping", result.as_ref().err().map(ToString::to_string));
+        eprintln!(
+            "Server shutdown finished: {}",
+            result
+                .as_ref()
+                .err()
+                .map_or_else(|| "complete".into(), ToString::to_string)
+        );
+        result
     }
 }
 

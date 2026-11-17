@@ -46,6 +46,9 @@ impl EnqueueError {
 /// Shared asynchronous command admission for transport sessions.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
+    fn server_status(&self) -> Result<serde_json::Value, String> {
+        Err("unsupported_op".into())
+    }
     fn components(&self, _command: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("unsupported_op".into())
     }
@@ -421,11 +424,20 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
-        let snapshot = commands.catalog_snapshot();
+        // Diagnostics never needs the (potentially much larger) signal catalog.
+        let snapshot = if matches!(
+            incoming,
+            ParsedMessage::Request(Request::ServerStatus { .. })
+        ) {
+            None
+        } else {
+            commands.catalog_snapshot()
+        };
         let catalog = snapshot.as_ref().unwrap_or(catalog);
         let id = match &incoming {
             ParsedMessage::Request(
-                Request::Components { id, .. }
+                Request::ServerStatus { id }
+                | Request::Components { id, .. }
                 | Request::Hello { id }
                 | Request::Describe { id }
                 | Request::Ping { id }
@@ -453,6 +465,14 @@ impl<Input> SessionState<Input> {
         }
 
         match incoming {
+            ParsedMessage::Request(Request::ServerStatus { id }) => {
+                match commands.server_status() {
+                    Ok(data) => {
+                        self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
+                    }
+                    Err(error) => self.queue_error(id, &error),
+                }
+            }
             ParsedMessage::Request(Request::Components { id, command }) => {
                 match commands.components(command) {
                     Ok(data) => {

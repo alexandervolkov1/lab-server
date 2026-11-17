@@ -137,6 +137,78 @@ fn create(f: &Fixture, name: &str, input: &str, revision: u64) {
 }
 
 #[test]
+fn server_status_preserves_controller_output_ownership_subscriptions_and_faults() {
+    let f = Fixture::new();
+    create(&f, "smooth", "a/x", 0);
+    let mut c = config("loop", "processing/smooth/value");
+    c["type_id"] = json!("pid");
+    c["parameters"] = json!({"setpoint":20.});
+    f.manage(json!({"action":"create","configuration":c,"expected_revision":1}));
+    f.manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1000,"expected_revision":2}));
+    f.publish("a/x", 10.);
+    f.manage(json!({"action":"state","name":"loop","state":"auto","expected_revision":3}));
+    let list = f.manage(json!({"action":"list"}));
+    let outputs = f.manage(json!({"action":"outputs"}));
+    let receiver = f.subscribe("processing/loop/setpoint");
+    let mut session = lab_server::session::Session::new(64, 65536);
+    f.service
+        .receive_message(
+            &mut session,
+            r#"{"id":1,"op":"subscribe","keys":["processing/loop/setpoint"]}"#,
+            Instant::now(),
+        )
+        .unwrap();
+    assert!(session.next_message().unwrap().unwrap().contains("\"ok\""));
+    let keys = session.subscriptions.keys();
+    for id in 2..20 {
+        f.service
+            .receive_message(
+                &mut session,
+                &json!({"id":id,"op":"server_status"}).to_string(),
+                Instant::now(),
+            )
+            .unwrap();
+        let response: Json =
+            serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            response["data"]["processing"],
+            json!([
+                {"name":"loop","type_id":"pid","state":"auto","error":null},
+                {"name":"smooth","type_id":"ema","state":"running","error":null}
+            ])
+        );
+        assert_eq!(session.subscriptions.keys(), keys);
+        assert!(session.pending.is_empty());
+        assert!(session.next_message().unwrap().is_none());
+    }
+    assert_eq!(f.manage(json!({"action":"list"})), list);
+    assert_eq!(f.manage(json!({"action":"outputs"})), outputs);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    // Explicitly leave Auto before publishing, so this fixture never writes.
+    f.manage(json!({"action":"state","name":"loop","state":"shadow","expected_revision":4}));
+    f.publish("a/x", 11.);
+    assert_eq!(
+        receiver.try_recv().unwrap().observation.reading,
+        Ok(Value::Float(20.))
+    );
+    f.service
+        .apply_event(AggregatorEvent::DataLost {
+            port_id: "a".into(),
+            loss_epoch: 1,
+        })
+        .unwrap();
+    let fault = f.manage(json!({"action":"list"}));
+    let status = f.service.diagnostics().unwrap();
+    assert_eq!(status["processing"][0]["state"], "fault");
+    assert_eq!(
+        status["processing"][0]["error"],
+        fault["instances"][0]["fault"]
+    );
+    assert!(status["processing"][0]["error"].is_string());
+    assert_eq!(f.manage(json!({"action":"list"})), fault);
+}
+
+#[test]
 fn parameter_set_is_atomic_and_concurrent_edits_preserve_other_parameters() {
     let f = Fixture::new();
     let mut c = config("loop", "a/x");

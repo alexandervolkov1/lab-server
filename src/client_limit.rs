@@ -15,6 +15,10 @@ impl Default for ClientSlots {
 pub struct ClientSlot(Arc<AtomicUsize>);
 
 impl ClientSlots {
+    /// Accepted connections holding a permit, including WebSocket handshakes.
+    pub fn active(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
     pub fn new() -> Self {
         Self(Arc::new(AtomicUsize::new(0)))
     }

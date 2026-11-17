@@ -264,6 +264,18 @@ impl Engine {
     pub fn list(&self) -> Json {
         self.page(0, 16).expect("default page")
     }
+    /// Compact live state; no configuration, bindings or algorithm history.
+    pub(crate) fn diagnostics(&self) -> Vec<Json> {
+        self.nodes
+            .iter()
+            .map(|(name, n)| {
+                json!({
+                    "name": name, "type_id": n.config.type_id,
+                    "state": n.state, "error": n.fault
+                })
+            })
+            .collect()
+    }
     pub fn page(&self, offset: usize, limit: usize) -> Result<Json, String> {
         self.page_with(offset, limit, |_, _, _| {})
     }

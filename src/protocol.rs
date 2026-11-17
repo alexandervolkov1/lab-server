@@ -209,6 +209,7 @@ pub fn parse_json_object(
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RequestOp {
+    ServerStatus,
     Components,
     Hello,
     Describe,
@@ -245,6 +246,7 @@ pub fn parse_request_header(
         .ok_or(RequestError::InvalidId)?;
 
     let op = match object.get("op").and_then(serde_json::Value::as_str) {
+        Some("server_status") => RequestOp::ServerStatus,
         Some("components") => RequestOp::Components,
         Some("hello") => RequestOp::Hello,
         Some("describe") => RequestOp::Describe,
@@ -343,6 +345,9 @@ pub fn parse_subscription_keys(
 
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    ServerStatus {
+        id: u64,
+    },
     Components {
         id: u64,
         command: serde_json::Value,
@@ -391,6 +396,7 @@ pub fn parse_request(frame: &str) -> Result<Request, ParseError> {
     let RequestHeader { id, op } = parse_request_header(&object).map_err(ParseError::Request)?;
 
     match op {
+        RequestOp::ServerStatus => Ok(Request::ServerStatus { id }),
         RequestOp::Components => Ok(Request::Components {
             id,
             command: object
