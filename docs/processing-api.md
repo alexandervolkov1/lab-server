@@ -31,6 +31,7 @@ JSON в Text message. ID по-прежнему положительные u64, �
 | `list` | offset=0, limit=16 (1…64) | revision, instances, total, next_offset |
 | `create` | configuration, expected_revision | Первая страница снимка после изменения |
 | `configure` | configuration, expected_revision | Первая страница снимка после изменения |
+| `parameter_set` | name, parameter, value, expected_revision (необязательно) | Первая страница снимка после изменения |
 | `delete` | name, cascade=false, expected_revision | Первая страница снимка после удаления |
 | `bind` | name, target, command_timeout_ms (1…10000), expected_revision | Первая страница снимка; привязка не включает Auto |
 | `state` | name, state, expected_revision | Первая страница снимка; допустимы shadow, stopped, auto |
@@ -49,7 +50,7 @@ state, fault (строка причины либо null) и binding. binding=nul
 контроллера или фильтра; иначе это `{ "target": "furnace1/power", "command_timeout_ms": 1000 }`.
 Привязка видна в shadow/auto/stopped/fault, сохраняется при остановке и исчезает при
 удалении экземпляра. Повторное создание того же имени не наследует старую привязку.
-Все снимки list/create/configure/delete/bind/state имеют одинаковый формат и ревизию;
+Все снимки list/create/configure/parameter_set/delete/bind/state имеют одинаковый формат и ревизию;
 binding входит в бюджет 48 KiB до выбора next_offset. Возможные состояния в ответах: running
 для фильтра, shadow/stopped/fault/auto для контроллера. running и fault нельзя
 установить командой оператора. Переход состояния сбрасывает математическую историю;
@@ -88,6 +89,24 @@ catalog_capacity до изменения графа. Поэтому допуст
 состояния; зависимые контроллеры переходят в fault. Настройка самого Auto-контроллера требует
 сначала остановить его. Изменение tau сохраняет состояние EMA и время последнего образца.
 
+`parameter_set` изменяет один параметр актуальной серверной конфигурации за один запрос:
+
+```json
+{"id":10,"op":"components","command":{"action":"parameter_set","name":"loop","parameter":"setpoint","value":35.0}}
+```
+
+Чтение конфигурации клиентом не требуется. Без expected_revision (или с null) сервер
+под общей блокировкой берёт актуальную конфигурацию, заменяет параметр и выполняет
+обычный configure/reconfigure. С expected_revision проверяется CAS; несовпадение даёт
+revision_conflict. Другие параметры, inputs, type_id, max_age_ms и binding сохраняются.
+Успех увеличивает общую revision ровно на один, в том числе при повторной записи того же
+значения; ошибка не меняет конфигурацию, состояние или ревизию. Параллельные изменения
+разных параметров без CAS сохраняются оба. Неизвестный параметр, неверный тип/диапазон
+или сочетание значений (например output_min >= output_max) отклоняются общей валидацией.
+Integer передаётся целым JSON i64, Float — конечным числом, Boolean — true/false,
+Choice — строкой из values. В Auto перенастройка PID запрещена (stop_before_configure).
+Изменение параметра сохраняет подписки и не включает Auto, не отправляет физический set.
+
 Изменение inputs завершает через observation_stream_closed все существующие подписки,
 содержащие выход изменённого компонента или его потомков, даже если новый вход находится
 на том же физическом порту. Уже опубликованный старый префикс может быть доставлен перед
@@ -96,7 +115,7 @@ catalog_capacity до изменения графа. Поэтому допуст
 параметров не закрываются. Переподключение графа не создаёт observation_data_lost.
 
 revision — общая конфигурационная ревизия сервера, изначально 0. Каждый успешный create,
-configure, delete, bind или state увеличивает её на один. Ошибка проверки ничего не меняет.
+configure, parameter_set, delete, bind или state увеличивает её на один. Ошибка проверки ничего не меняет.
 Ошибки runtime и новые измерения не увеличивают revision. incarnation уникален для каждого
 создания; повторное создание имени получает новый incarnation. Счётчики не оборачиваются.
 
@@ -113,7 +132,12 @@ observation_stream_closed; повторное создание имени не �
 EMA: type_id=`ema`, вход `input`, выход `value`, tau=1 s по умолчанию, диапазон
 0.000001…86400 s. Первое значение равно входу; alpha=-expm1(-dt/tau).
 
-PID: type_id=`pid`, вход `input`, выходы error/p/i/d/unconstrained/output.
+PID: type_id=`pid`, вход `input`, выходы error/p/i/d/unconstrained/output/setpoint.
+`processing/<name>/setpoint` — readonly Float с единицей входа (например degC),
+публикуется в Shadow и Auto вместе с остальными результатами на каждом входном образце,
+с тем же временем измерения и метаданными. После изменения уставки новое значение
+появится на следующем успешном вычислении; get до него возвращает последний образец.
+Используются обычные describe/get/subscribe по TCP и WS. kp/ki/kd остаются параметрами.
 defaults: setpoint=0, kp=1, ki=kd=0, output_min=0, output_max=100, max_gap=10 s.
 setpoint и границы выхода: ±1e12; коэффициенты: 0…1e12;
 max_gap: 0.000001…86400 s; обязательно output_min < output_max.
@@ -126,6 +150,25 @@ max_gap: 0.000001…86400 s; обязательно output_min < output_max.
 `state=shadow`; переход в Auto разрешается отдельно, после готовности свежего входа.
 
 ## Физические выходы
+
+Пример динамического переключения фильтра (для каждой мутации с CAS используйте
+актуальную revision из ответа предыдущей операции):
+
+1. Создать EMA smooth и PID loop с входом processing/smooth/value; выполнить bind,
+   дождаться свежего входа и явно включить state=auto.
+2. Вернуть loop в state=shadow: право управления освобождается, мощность не обнуляется.
+3. Создать EMA smooth2 и через configure заменить input PID на processing/smooth2/value,
+   сохранив остальные поля полной конфигурации.
+4. PID получает fault=input_changed, его история сбрасывается; затронутая подписка
+   завершается observation_stream_closed. Нужны новая сессия/подписка, явный state=shadow
+   и свежий образец. Автоматического восстановления Auto нет.
+5. Через configure вернуть input на processing/smooth/value. Снова восстановить Shadow
+   и подписку. Удалить smooth2 без cascade; PID остаётся в графе. После свежего образца
+   можно явно включить Auto. Пока PID зависит от smooth2, delete без cascade запрещён.
+
+Отдельной команды сброса интегратора нет. Существующие переходы состояния, изменение
+входов и инвалидирование состояния сбрасывают историю PID; перенастройка параметров
+сохраняет её, ограничивая интегратор новыми границами выхода.
 
 ```json
 {"id":2,"op":"components","command":{"action":"bind","name":"loop","target":"furnace1/power","command_timeout_ms":1000,"expected_revision":2}}

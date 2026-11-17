@@ -1204,6 +1204,86 @@ fn component_binding_is_shared_by_tcp_peers_and_websocket_at_one_revision() {
 }
 
 #[test]
+fn parameter_set_and_pid_setpoint_use_existing_tcp_ws_measurement_contract() {
+    for use_ws in [false, true] {
+        let server = Running::new();
+        let mut editor = ActionClient::new(&server, use_ws);
+        let mut subscriber = ActionClient::new(&server, !use_ws);
+        let c = json!({"name":"loop","type_id":"pid","inputs":{"input":"a/temperature"},"parameters":{"setpoint":20.},"max_age_ms":10000});
+        assert_eq!(editor.request(json!({"id":1,"op":"components","command":{"action":"create","configuration":c,"expected_revision":0}}))["status"], "ok");
+        let key = "processing/loop/setpoint";
+        let catalog = editor.request(json!({"id":2,"op":"describe"}));
+        let description = catalog["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["key"] == key)
+            .unwrap();
+        assert_eq!(description["unit"], "degC");
+        assert_eq!(description["writable"], false);
+        assert_eq!(
+            subscriber
+                .request(json!({"id":1,"op":"subscribe","keys":[key,"processing/loop/output"]}))["status"],
+            "ok"
+        );
+        let handle = server
+            .service
+            .registry()
+            .port("p")
+            .unwrap()
+            .handle()
+            .unwrap();
+        let stamp = |sequence| {
+            server
+                .service
+                .apply_event(AggregatorEvent::Measurement {
+                    port_id: "p".into(),
+                    global_key: "a/temperature".into(),
+                    observation: Observation {
+                        source: "temperature".into(),
+                        unit: "degC".into(),
+                        completed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(sequence),
+                        metadata: Some(lab_server::model::SourceMetadata {
+                            source_instance: handle.source_instance(),
+                            sequence,
+                            generation: 0,
+                            acquired_at: Instant::now(),
+                            elapsed: Duration::from_millis(sequence),
+                        }),
+                        reading: Ok(Value::Float(10.)),
+                    },
+                })
+                .unwrap();
+        };
+        for (sequence, value) in [(100, 20.), (101, 35.), (102, 35.)] {
+            if sequence == 101 {
+                // One request, with no preceding list or client revision read.
+                let changed = editor.request(json!({"id":4,"op":"components","command":{"action":"parameter_set","name":"loop","parameter":"setpoint","value":35.}}));
+                assert_eq!(changed["data"]["revision"], 2);
+            }
+            if sequence == 102 {
+                assert_eq!(editor.request(json!({"id":6,"op":"components","command":{"action":"bind","name":"loop","target":"a/level","command_timeout_ms":1000,"expected_revision":2}}))["status"], "ok");
+                assert_eq!(editor.request(json!({"id":7,"op":"components","command":{"action":"state","name":"loop","state":"auto","expected_revision":3}}))["status"], "ok");
+            }
+            stamp(sequence);
+            let events = [subscriber.receive(), subscriber.receive()];
+            assert!(events.iter().all(
+                |e| e["event"] == "measurement" && e["completed_at_unix_ms"] == sequence * 1000
+            ));
+            let setpoint = events.iter().find(|e| e["key"] == key).unwrap();
+            assert_eq!(setpoint["value"], value);
+            assert_eq!(setpoint["unit"], "degC");
+            let get = editor.request(
+                json!({"id":match sequence { 100 => 3, 101 => 5, _ => 8 },"op":"get","key":key}),
+            );
+            assert_eq!(get["value"], value);
+            assert_eq!(get["unit"], "degC");
+            assert_eq!(get["completed_at_unix_ms"], sequence * 1000);
+        }
+    }
+}
+
+#[test]
 fn same_port_rewire_closes_old_tcp_and_ws_sessions_and_new_session_receives_new_graph() {
     for use_ws in [false, true] {
         let server = Running::new();

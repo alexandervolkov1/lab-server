@@ -12,13 +12,21 @@ impl ComponentFactory for PidFactory {
             type_id: "pid".into(),
             kind: Kind::Controller,
             inputs: vec!["input".into()],
-            outputs: ["error", "p", "i", "d", "unconstrained", "output"]
-                .into_iter()
-                .map(|name| Output {
-                    name: name.into(),
-                    unit: Some(String::new()),
-                })
-                .collect(),
+            outputs: [
+                "error",
+                "p",
+                "i",
+                "d",
+                "unconstrained",
+                "output",
+                "setpoint",
+            ]
+            .into_iter()
+            .map(|name| Output {
+                name: name.into(),
+                unit: (name != "setpoint").then(String::new),
+            })
+            .collect(),
             parameters: vec![
                 float_parameter("setpoint", 0., -1e12, 1e12, ""),
                 float_parameter("kp", 1., 0., 1e12, ""),
@@ -100,6 +108,7 @@ impl Component for Pid {
         self.integral = integral;
         self.previous = Some((at, x));
         Ok([
+            ("setpoint", self.p("setpoint")),
             ("error", error),
             ("p", p),
             ("i", integral),

@@ -219,6 +219,12 @@ impl DeviceService {
                 configuration,
                 expected_revision,
             } => discontinued = engine.configure_with_changes(configuration, expected_revision)?,
+            ParameterSet {
+                name,
+                parameter,
+                value,
+                expected_revision,
+            } => engine.parameter_set(&name, parameter, value, expected_revision)?,
             Delete {
                 name,
                 cascade,

@@ -119,6 +119,75 @@ fn schemas_reject_unknown_fields_and_wrong_types_without_revision_change() {
 }
 
 #[test]
+fn parameter_set_validates_all_schema_types_without_coercion() {
+    struct TypedFactory;
+    impl ComponentFactory for TypedFactory {
+        fn describe(&self) -> TypeDescription {
+            let mut d = Factory.describe();
+            d.parameters.extend([
+                ParameterSchema {
+                    name: "count".into(),
+                    unit: String::new(),
+                    value_type: ParameterType::Integer {
+                        min: i64::MIN,
+                        max: i64::MAX,
+                    },
+                    default: json!(0),
+                },
+                ParameterSchema {
+                    name: "enabled".into(),
+                    unit: String::new(),
+                    value_type: ParameterType::Boolean,
+                    default: json!(false),
+                },
+                ParameterSchema {
+                    name: "mode".into(),
+                    unit: String::new(),
+                    value_type: ParameterType::Choice {
+                        values: vec!["a".into(), "b".into()],
+                    },
+                    default: json!("a"),
+                },
+            ]);
+            d
+        }
+        fn create(&self, p: &Parameters) -> Result<Box<dyn Component>, String> {
+            Factory.create(p)
+        }
+    }
+    let mut registry = Registry::default();
+    registry.register(TypedFactory).unwrap();
+    let mut e = Engine::new(registry, engine().catalog());
+    e.create(config("typed", "a/raw"), 0).unwrap();
+    for (p, v) in [
+        ("count", json!(i64::MAX)),
+        ("enabled", json!(true)),
+        ("mode", json!("b")),
+        ("gain", json!(2.5)),
+    ] {
+        let revision = e.revision;
+        e.parameter_set("typed", p.into(), v.clone(), None).unwrap();
+        assert_eq!(e.revision, revision + 1);
+        assert_eq!(
+            e.list()["instances"][0]["configuration"]["parameters"][p],
+            v
+        );
+    }
+    let before = e.list();
+    for (p, v) in [
+        ("count", json!(2.0)),
+        ("count", json!(u64::MAX)),
+        ("enabled", json!(1)),
+        ("mode", json!("c")),
+        ("mode", json!(true)),
+        ("gain", json!([])),
+    ] {
+        assert!(e.parameter_set("typed", p.into(), v, None).is_err());
+        assert_eq!(e.list(), before);
+    }
+}
+
+#[test]
 fn pid_derivative_antiwindup_gap_and_loss_require_explicit_restart() {
     let mut e = Engine::new(builtins(), engine().catalog());
     let mut c = config("loop", "a/raw");

@@ -232,7 +232,7 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         if fail_write {
             let mut recorded = Vec::new();
             service.tick_recorded(|e| recorded.push(e.clone())).unwrap();
-            assert_eq!(recorded.len(), 6);
+            assert_eq!(recorded.len(), 7);
             assert!(recorded.iter().all(|e| matches!(e, AggregatorEvent::Measurement { observation, .. } if observation.reading.is_err())));
             let list = manage(json!({"action":"list"})).unwrap();
             assert_eq!(list["instances"][0]["state"], "fault");

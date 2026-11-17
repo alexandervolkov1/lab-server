@@ -341,6 +341,25 @@ impl Engine {
     pub fn configure(&mut self, config: Configuration, expected: u64) -> Result<(), String> {
         self.configure_with_changes(config, expected).map(|_| ())
     }
+    /// Replace one parameter of the current configuration under the caller's commit lock.
+    pub fn parameter_set(
+        &mut self,
+        name: &str,
+        parameter: String,
+        value: Json,
+        expected: Option<u64>,
+    ) -> Result<(), String> {
+        let expected = expected.unwrap_or(self.revision);
+        self.check_revision(expected)?;
+        let mut config = self
+            .nodes
+            .get(name)
+            .ok_or("unknown_instance")?
+            .config
+            .clone();
+        config.parameters.insert(parameter, value);
+        self.configure(config, expected)
+    }
     /// Output histories invalidated by this committed rewire, including descendants.
     pub(crate) fn configure_with_changes(
         &mut self,
@@ -783,6 +802,12 @@ pub enum Management {
     Configure {
         configuration: Configuration,
         expected_revision: u64,
+    },
+    ParameterSet {
+        name: String,
+        parameter: String,
+        value: Json,
+        expected_revision: Option<u64>,
     },
     Delete {
         name: String,
