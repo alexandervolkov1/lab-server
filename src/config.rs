@@ -21,6 +21,53 @@ pub struct ServerConfig {
     pub devices: Vec<DeviceConfig>,
     pub recording: Option<RecordingConfig>,
     pub websocket: Option<WebSocketConfig>,
+    pub processing: Option<ProcessingConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessingConfig {
+    #[serde(default)]
+    pub components: Vec<StartupComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "toml::Table")]
+pub struct StartupComponent {
+    pub configuration: crate::processing::Configuration,
+    pub binding: Option<StartupBinding>,
+}
+
+impl TryFrom<toml::Table> for StartupComponent {
+    type Error = String;
+
+    fn try_from(mut table: toml::Table) -> Result<Self, Self::Error> {
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        // Remove only the startup extension, then deserialize the existing strict
+        // Configuration schema (including rejection of state/expected_revision).
+        let parse = || -> Result<Self, toml::de::Error> {
+            let binding = table
+                .remove("binding")
+                .map(toml::Value::try_into)
+                .transpose()?;
+            Ok(Self {
+                configuration: table.try_into()?,
+                binding,
+            })
+        };
+        parse().map_err(|error| format!("component {name:?}: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupBinding {
+    pub target: String,
+    pub command_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

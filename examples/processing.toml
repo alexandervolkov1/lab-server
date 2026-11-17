@@ -1,0 +1,46 @@
+# Arduino with startup EMA and PID. Set the port name for your equipment.
+# EMA starts Running; PID starts Shadow. Binding keeps the output Manual.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[[ports]]
+id = "arduino_link"
+name = "COM3"
+baud = 57600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 3000
+
+[[devices]]
+id = "furnace1"
+driver = "arduino"
+port = "arduino_link"
+
+[[processing.components]]
+name = "smooth"
+type_id = "ema"
+max_age_ms = 5000
+[processing.components.inputs]
+input = "furnace1/sample_temperature"
+[processing.components.parameters]
+tau = 2.0
+
+[[processing.components]]
+name = "loop"
+type_id = "pid"
+max_age_ms = 5000
+[processing.components.inputs]
+input = "processing/smooth/value"
+[processing.components.parameters]
+setpoint = 40.0
+kp = 2.0
+ki = 0.1
+kd = 0.0
+output_min = 0.0
+output_max = 100.0
+max_gap = 5.0
+[processing.components.binding]
+target = "furnace1/power"
+command_timeout_ms = 1000

@@ -3,6 +3,47 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn processing_example_and_strict_startup_schema() {
+    let example = include_str!("../examples/processing.toml");
+    let config = lab_server::config::ServerConfig::from_toml(example).unwrap();
+    let components = config.processing.unwrap().components;
+    assert_eq!(components.len(), 2);
+    assert_eq!(components[0].configuration.name, "smooth");
+    assert_eq!(components[0].configuration.parameters["tau"], 2.0);
+    assert_eq!(
+        components[1].binding.as_ref().unwrap().target,
+        "furnace1/power"
+    );
+    for field in ["state = 'auto'", "expected_revision = 0", "unknown = true"] {
+        let invalid = example.replacen(
+            "max_age_ms = 5000",
+            &format!("{field}\nmax_age_ms = 5000"),
+            1,
+        );
+        let error = lab_server::config::ServerConfig::from_toml(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("smooth"), "{error}");
+    }
+    let invalid = example.replacen("max_age_ms = 5000", "max_age_ms = 'wrong'", 1);
+    let error = lab_server::config::ServerConfig::from_toml(&invalid)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("smooth") && error.contains("invalid type"),
+        "{error}"
+    );
+    let invalid = example.replace(
+        "command_timeout_ms = 1000",
+        "command_timeout_ms = 1000\nstate = 'auto'",
+    );
+    let error = lab_server::config::ServerConfig::from_toml(&invalid)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("loop") && error.contains("state"), "{error}");
+}
+
 use lab_server::config::{ConfigError, FlowControl, Parity, ServerConfig};
 
 const TCP: &str = "[tcp]\nbind = '127.0.0.1:7240'\n";

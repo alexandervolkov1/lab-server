@@ -31,6 +31,27 @@ cargo run --release -- --config examples/arduino.toml
 [examples/lab-server.toml](examples/lab-server.toml) — только архитектурный пример;
 драйвер `custom_ascii` не реализован, запуск с ним завершается ошибкой.
 
+## Стартовые компоненты
+
+Необязательная секция `[[processing.components]]` задаёт экземпляры в порядке загрузки:
+сначала источник, затем его потребители. [examples/processing.toml](examples/processing.toml)
+содержит EMA `smooth` (`tau = 2.0`) и PID `loop` с входом `processing/smooth/value`
+и привязкой к `furnace1/power`.
+
+```powershell
+cargo run --release -- --config examples/processing.toml
+```
+
+EMA начинает в Running, PID — в Shadow, физический выход остаётся Manual.
+Создание и binding не отправляют `set`, не обнуляют мощность и не включают Auto.
+Ошибочное объявление прерывает запуск с именем компонента и причиной до запуска
+workers и обслуживания клиентов. Открытие портов происходит на прежнем этапе подготовки.
+Проверки выполняются обычными `Management::Create/Bind`; каждое успешное действие
+увеличивает ревизию (в примере итоговая ревизия 3). `expected_revision` и состояние
+в TOML не задаются. Компоненты видны через `components/list`, `describe`, `components/outputs`.
+Без секции `processing` поведение прежнее. Изменения через API остаются в RAM;
+TOML не перезаписывается. Подробнее: [API компонентов](docs/processing-api.md).
+
 ## МЕТАКОН 5Х3
 
 [examples/metakon-readonly.toml](examples/metakon-readonly.toml) — шаблон для первого испытания только чтением.

@@ -135,7 +135,7 @@ fn validate(d: &TypeDescription, params: &Parameters) -> Result<Parameters, Stri
         })
         .collect()
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub name: String,

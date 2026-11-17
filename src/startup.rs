@@ -21,6 +21,7 @@ use crate::port_worker::{
     COMMAND_QUEUE_CAPACITY, DeviceInstance, DeviceObservation, OBSERVATION_QUEUE_CAPACITY,
     PortHandle, PortMode, PortWorker, StopReason,
 };
+use crate::processing::Management;
 use crate::recorder::{
     DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
 };
@@ -220,6 +221,38 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             CommandRouter::with_authority(registry, authority),
             OBSERVATION_QUEUE_CAPACITY,
         ));
+        if let Some(processing) = &config.processing {
+            let mut revision = 0; // This service owns a fresh Engine; no clients exist yet.
+            for component in &processing.components {
+                let configuration = &component.configuration;
+                let invalid = |message| ConfigError::Validation {
+                    field: format!("processing component {:?}", configuration.name),
+                    message,
+                };
+                let snapshot = tcp
+                    .manage(Management::Create {
+                        configuration: configuration.clone(),
+                        expected_revision: revision,
+                    })
+                    .map_err(invalid)?;
+                revision = snapshot["revision"]
+                    .as_u64()
+                    .expect("component snapshot revision");
+                if let Some(binding) = &component.binding {
+                    let snapshot = tcp
+                        .manage(Management::Bind {
+                            name: configuration.name.clone(),
+                            target: binding.target.clone(),
+                            command_timeout_ms: binding.command_timeout_ms,
+                            expected_revision: revision,
+                        })
+                        .map_err(invalid)?;
+                    revision = snapshot["revision"]
+                        .as_u64()
+                        .expect("component snapshot revision");
+                }
+            }
+        }
         let mut workers = Workers::default();
         // All ports are prepared before polling begins (including Arduino resets).
         for (id, handle, worker) in prepared {
