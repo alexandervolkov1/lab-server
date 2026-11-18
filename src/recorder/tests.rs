@@ -732,6 +732,163 @@ fn open_errors_and_unknown_or_unrelated_schema_are_returned_without_adoption() {
 }
 
 #[test]
+fn v3_missing_audit_columns_are_rejected_before_starting_a_session() {
+    for column in ["kind", "registered_at_ns", "session_id"] {
+        let db = Database::new();
+        Recorder::open(&db.0, 8).unwrap().shutdown().unwrap();
+        let c = db.connect();
+        c.execute_batch(&format!(
+            "ALTER TABLE audit_events RENAME COLUMN {column} TO renamed"
+        ))
+        .unwrap();
+        assert_eq!(scalar(&c, "PRAGMA user_version"), 3);
+
+        let result = Recorder::with_options(
+            &db.0,
+            RecorderOptions {
+                audit_enabled: true,
+                ..Default::default()
+            },
+        );
+        let error = result.err().expect("incomplete v3 table must fail at open");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("audit_events.{column}")),
+            "{error}"
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+    }
+}
+
+#[test]
+fn v3_rejects_view_in_place_of_audit_table() {
+    let db = Database::new();
+    Recorder::open(&db.0, 8).unwrap().shutdown().unwrap();
+    let c = db.connect();
+    c.execute_batch(
+        "ALTER TABLE audit_events RENAME TO old_audit_events;
+                     CREATE VIEW audit_events AS SELECT * FROM old_audit_events;",
+    )
+    .unwrap();
+    let error = Recorder::open(&db.0, 8)
+        .err()
+        .expect("audit view must fail at open");
+    assert!(
+        error
+            .to_string()
+            .contains("audit_events: expected a STRICT table"),
+        "{error}"
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+}
+
+#[test]
+fn v3_rejects_incompatible_audit_column_definitions_and_keys() {
+    let (_, definition) = include_str!("schema-v3.sql")
+        .split_once("CREATE TABLE audit_events")
+        .unwrap();
+    for (old, changed, extra, expected) in [
+        (
+            "id INTEGER PRIMARY KEY",
+            "id INTEGER PRIMARY KEY DESC",
+            "",
+            "audit_events.id: primary key must alias rowid",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind TEXT",
+            "",
+            "incompatible column audit_events.kind",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind INTEGER NOT NULL",
+            "",
+            "incompatible column audit_events.kind",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind TEXT NOT NULL, required TEXT NOT NULL",
+            "",
+            "extra required column audit_events.required",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind TEXT NOT NULL, required TEXT NOT NULL DEFAULT (NULL)",
+            "",
+            "extra required column audit_events.required",
+        ),
+        (
+            "UNIQUE(session_id, operation_id, sequence)",
+            "CHECK(sequence > 0)",
+            "",
+            "audit_events requires a non-partial UNIQUE key",
+        ),
+        (
+            "UNIQUE(session_id, operation_id, sequence)",
+            "CHECK(sequence > 0)",
+            "CREATE UNIQUE INDEX audit_partial ON audit_events(session_id, operation_id, sequence) WHERE kind='accepted';",
+            "audit_events requires a non-partial UNIQUE key",
+        ),
+        (
+            "REFERENCES sessions(id)",
+            "REFERENCES sessions(missing)",
+            "",
+            "foreign key mismatch",
+        ),
+    ] {
+        let db = Database::new();
+        Recorder::open(&db.0, 8).unwrap().shutdown().unwrap();
+        let c = db.connect();
+        assert!(definition.contains(old));
+        c.execute_batch(&format!(
+            "DROP TABLE audit_events; CREATE TABLE audit_events{}\n{extra}",
+            definition.replace(old, changed)
+        ))
+        .unwrap();
+        let error = Recorder::open(&db.0, 8)
+            .err()
+            .expect("incompatible v3 table must fail at open");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+    }
+}
+
+#[test]
+fn reopens_v3_and_records_audit_with_compatible_extra_columns() {
+    let db = Database::new();
+    let options = RecorderOptions {
+        audit_enabled: true,
+        ..Default::default()
+    };
+    let first = Recorder::with_options(&db.0, options.clone()).unwrap();
+    crate::audit::Operation::new(&first.handle(), serde_json::json!({"source":"internal"}))
+        .accepted();
+    first.shutdown().unwrap();
+
+    let c = db.connect();
+    c.execute_batch(
+        "ALTER TABLE audit_events ADD COLUMN note TEXT;
+                     ALTER TABLE audit_events ADD COLUMN extension TEXT NOT NULL DEFAULT 'kept';",
+    )
+    .unwrap();
+    let second = Recorder::with_options(&db.0, options).unwrap();
+    crate::audit::Operation::new(&second.handle(), serde_json::json!({"source":"internal"}))
+        .accepted();
+    let summary = second.shutdown().unwrap();
+    assert_eq!(summary.audit_records, 1);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE extension='kept' AND kind='accepted'"
+        ),
+        2
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 2);
+}
+
+#[test]
 fn invalid_options_fail_before_creating_database() {
     let db = Database::new();
     for settings in [

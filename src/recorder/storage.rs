@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -12,6 +13,19 @@ use crate::port_worker::StopReason;
 
 // ASCII "LABR": reject unrelated databases rather than adopting their schema.
 const APPLICATION_ID: i32 = 0x4c414252;
+const SCHEMA_V1: &str = include_str!("schema.sql");
+const MIGRATE_TO_V2: &str = include_str!("schema-v2.sql");
+const MIGRATE_TO_V3: &str = include_str!("schema-v3.sql");
+
+const INSERT_SESSION: &str = "INSERT INTO sessions(started_at_ns, audit_enabled, measurements_enabled, audit_incomplete) VALUES (?, ?, ?, ?)";
+const INSERT_MEASUREMENT: &str = "INSERT INTO measurements(session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error, source_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_EVENT: &str = "INSERT INTO events(session_id, registered_at_ns, event_type, origin, port_id, details_json) VALUES (?, ?, ?, ?, ?, ?)";
+const INSERT_RECORD_ORDER: &str =
+    "INSERT INTO record_order(session_id, kind, row_id) VALUES (?, ?, ?)";
+const INSERT_AUDIT: &str = "INSERT INTO audit_events(session_id, operation_id, sequence, registered_at_ns, kind, context_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)";
+const UPDATE_AUDIT_LOSSES: &str = "UPDATE sessions SET audit_dropped_events=? WHERE id=?";
+const UPDATE_RECORDER_LOSSES: &str = "UPDATE sessions SET recorder_incomplete = ?, recorder_dropped_events = ?, recorder_dropped_data_lost_events = ? WHERE id = ?";
+const FINISH_SESSION: &str = "UPDATE sessions SET ended_at_ns = ?, audit_incomplete = CASE WHEN audit_enabled THEN ? ELSE 0 END WHERE id = ?";
 
 pub(super) struct Storage {
     connection: Connection,
@@ -38,7 +52,10 @@ impl Storage {
         initialize(&mut connection)?;
         let started = unix_ns(SystemTime::now()).map_err(RecorderError::Data)?;
         connection
-            .execute("INSERT INTO sessions(started_at_ns, audit_enabled, measurements_enabled, audit_incomplete) VALUES (?, ?, ?, ?)", params![started, audit_enabled, measurements_enabled, audit_enabled])
+            .execute(
+                INSERT_SESSION,
+                params![started, audit_enabled, measurements_enabled, audit_enabled],
+            )
             .map_err(|error| RecorderError::sqlite("start session", error))?;
         let session_id = connection.last_insert_rowid();
         Ok(Self {
@@ -68,16 +85,24 @@ impl Storage {
                 .map_err(|error| RecorderError::sqlite("insert batch", error))?;
         }
         for e in audit_batch {
-            transaction.prepare_cached(
-                "INSERT INTO audit_events(session_id, operation_id, sequence, registered_at_ns, kind, context_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            ).and_then(|mut statement| statement.execute(params![
-                self.session_id, e.operation.to_string(), e.sequence as i64,
-                e.time_ns, e.kind, e.context.as_ref(), e.details
-            ])).map_err(|error| RecorderError::sqlite("insert audit", error))?;
+            transaction
+                .prepare_cached(INSERT_AUDIT)
+                .and_then(|mut statement| {
+                    statement.execute(params![
+                        self.session_id,
+                        e.operation.to_string(),
+                        e.sequence as i64,
+                        e.time_ns,
+                        e.kind,
+                        e.context.as_ref(),
+                        e.details
+                    ])
+                })
+                .map_err(|error| RecorderError::sqlite("insert audit", error))?;
         }
         transaction
             .execute(
-                "UPDATE sessions SET audit_dropped_events=? WHERE id=?",
+                UPDATE_AUDIT_LOSSES,
                 params![losses.dropped_audit_events.to_string(), self.session_id],
             )
             .map_err(|e| RecorderError::sqlite("audit losses", e))?;
@@ -97,8 +122,16 @@ impl Storage {
                     "counts_are_cumulative": true, "gap_position_known": false}),
             )
             .map_err(|error| RecorderError::sqlite("record losses", error))?;
-            transaction.execute("UPDATE sessions SET recorder_incomplete = ?, recorder_dropped_events = ?, recorder_dropped_data_lost_events = ? WHERE id = ?",
-                params![losses.is_incomplete(), losses.dropped_events.to_string(), losses.dropped_data_lost_events.to_string(), self.session_id])
+            transaction
+                .execute(
+                    UPDATE_RECORDER_LOSSES,
+                    params![
+                        losses.is_incomplete(),
+                        losses.dropped_events.to_string(),
+                        losses.dropped_data_lost_events.to_string(),
+                        self.session_id
+                    ],
+                )
                 .map_err(|error| RecorderError::sqlite("update losses", error))?;
         }
         transaction
@@ -110,7 +143,7 @@ impl Storage {
         let ended = unix_ns(SystemTime::now()).map_err(RecorderError::Data)?;
         self.connection
             .execute(
-                "UPDATE sessions SET ended_at_ns = ?, audit_incomplete = CASE WHEN audit_enabled THEN ? ELSE 0 END WHERE id = ?",
+                FINISH_SESSION,
                 params![ended, !audit_complete, self.session_id],
             )
             .map_err(|error| RecorderError::sqlite("finish session", error))?;
@@ -157,10 +190,10 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
             .transaction()
             .map_err(|error| RecorderError::sqlite("begin schema", error))?;
         transaction
-            .execute_batch(include_str!("schema.sql"))
+            .execute_batch(SCHEMA_V1)
             .map_err(|error| RecorderError::sqlite("create schema", error))?;
         transaction
-            .execute_batch(include_str!("schema-v2.sql"))
+            .execute_batch(MIGRATE_TO_V2)
             .map_err(|error| RecorderError::sqlite("create schema v2", error))?;
         transaction
             .pragma_update(None, "application_id", APPLICATION_ID)
@@ -176,7 +209,7 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
         let tx = connection
             .transaction()
             .map_err(|e| RecorderError::sqlite("begin migration", e))?;
-        tx.execute_batch(include_str!("schema-v2.sql"))
+        tx.execute_batch(MIGRATE_TO_V2)
             .map_err(|e| RecorderError::sqlite("migrate v1 to v2", e))?;
         tx.pragma_update(None, "user_version", 2)
             .map_err(|e| RecorderError::sqlite("version migration", e))?;
@@ -187,29 +220,165 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
         let tx = connection
             .transaction()
             .map_err(|e| RecorderError::sqlite("begin v3", e))?;
-        tx.execute_batch(include_str!("schema-v3.sql"))
+        tx.execute_batch(MIGRATE_TO_V3)
             .map_err(|e| RecorderError::sqlite("migrate v2 to v3", e))?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| RecorderError::sqlite("version v3", e))?;
         tx.commit()
             .map_err(|e| RecorderError::sqlite("commit v3", e))?;
     }
-    // Fail during construction for missing/incompatible required columns, even
-    // when a damaged file still advertises our application id and version.
-    for sql in [
-        "SELECT operation_id, sequence, context_json, details_json FROM audit_events LIMIT 0",
-        "SELECT audit_enabled, measurements_enabled, audit_incomplete, audit_dropped_events FROM sessions LIMIT 0",
-        "SELECT source_metadata FROM measurements LIMIT 0",
-        "SELECT session_id, kind, row_id FROM record_order LIMIT 0",
-        "SELECT id, started_at_ns, ended_at_ns, recorder_incomplete, recorder_dropped_events, recorder_dropped_data_lost_events FROM sessions LIMIT 0",
-        "SELECT session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error FROM measurements LIMIT 0",
-        "SELECT session_id, registered_at_ns, event_type, origin, port_id, details_json FROM events LIMIT 0",
+    validate_schema(connection)
+}
+
+fn validate_schema(connection: &Connection) -> Result<(), RecorderError> {
+    // Derive the required columns from the migrations themselves so the
+    // validator and schema cannot drift independently.
+    let reference = Connection::open_in_memory().map_err(schema_sqlite_error)?;
+    for sql in [SCHEMA_V1, MIGRATE_TO_V2, MIGRATE_TO_V3] {
+        reference.execute_batch(sql).map_err(schema_sqlite_error)?;
+    }
+    for table in [
+        "sessions",
+        "measurements",
+        "events",
+        "record_order",
+        "audit_events",
     ] {
-        connection
-            .prepare(sql)
-            .map_err(|error| RecorderError::sqlite("validate schema", error))?;
+        validate_table(connection, &reference, table)?;
+    }
+    let unique_audit_identity: bool = connection
+        .query_row(
+            r#"SELECT EXISTS (
+            SELECT 1 FROM pragma_index_list('audit_events', 'main') AS idx
+            WHERE idx."unique" = 1 AND idx.partial = 0
+              AND (SELECT count(*) FROM pragma_index_info(idx.name, 'main')) = 3
+              AND (SELECT count(DISTINCT lower(name)) FROM pragma_index_info(idx.name, 'main')
+                   WHERE lower(name) IN ('session_id', 'operation_id', 'sequence')) = 3
+        )"#,
+            [],
+            |row| row.get(0),
+        )
+        .map_err(schema_sqlite_error)?;
+    if !unique_audit_identity {
+        return Err(schema_error("audit_events requires a non-partial UNIQUE key on (session_id, operation_id, sequence)".into()));
+    }
+    // Compile the writer's actual statements to also catch e.g. foreign key
+    // mismatches. No writes or trigger execution during validation.
+    for sql in [
+        INSERT_SESSION,
+        INSERT_MEASUREMENT,
+        INSERT_EVENT,
+        INSERT_RECORD_ORDER,
+        INSERT_AUDIT,
+        UPDATE_AUDIT_LOSSES,
+        UPDATE_RECORDER_LOSSES,
+        FINISH_SESSION,
+    ] {
+        connection.prepare(sql).map_err(schema_sqlite_error)?;
     }
     Ok(())
+}
+
+fn validate_table(
+    connection: &Connection,
+    reference: &Connection,
+    table: &str,
+) -> Result<(), RecorderError> {
+    let rowid_table: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_list
+          WHERE schema='main' AND name=? COLLATE NOCASE AND type='table' AND strict=1 AND wr=0)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(schema_sqlite_error)?;
+    if !rowid_table {
+        return Err(schema_error(format!(
+            "{table}: expected a STRICT table with rowid"
+        )));
+    }
+    // An indexed PRIMARY KEY (including INTEGER PRIMARY KEY DESC) does not
+    // alias rowid. Recorder uses last_insert_rowid() as the generated id.
+    let indexed_primary_key: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_index_list(?, 'main') WHERE origin='pk')",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(schema_sqlite_error)?;
+    if indexed_primary_key {
+        return Err(schema_error(format!(
+            "{table}.id: primary key must alias rowid"
+        )));
+    }
+    let mut actual = table_columns(connection, table).map_err(schema_sqlite_error)?;
+    for (name, expected) in table_columns(reference, table).map_err(schema_sqlite_error)? {
+        let Some(column) = actual.remove(&name) else {
+            return Err(schema_error(format!(
+                "missing required column {table}.{name}"
+            )));
+        };
+        if !column.data_type.eq_ignore_ascii_case(&expected.data_type)
+            || column.primary_key != expected.primary_key
+            || (expected.primary_key == 0 && column.not_null != expected.not_null)
+            || column.hidden != 0
+            || (expected.has_non_null_default() && !column.has_non_null_default())
+        {
+            return Err(schema_error(format!(
+                "incompatible column {table}.{name}: expected {expected:?}, found {column:?}"
+            )));
+        }
+    }
+    for (name, column) in actual {
+        if column.hidden == 0 && column.not_null && !column.has_non_null_default() {
+            return Err(schema_error(format!(
+                "extra required column {table}.{name} has no non-NULL default"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Column {
+    data_type: String,
+    not_null: bool,
+    default: Option<String>,
+    primary_key: u32,
+    hidden: u32,
+}
+
+impl Column {
+    fn has_non_null_default(&self) -> bool {
+        self.default.as_deref().is_some_and(|default| {
+            !default
+                .trim_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '(' | ')'))
+                .eq_ignore_ascii_case("NULL")
+        })
+    }
+}
+
+fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> rusqlite::Result<BTreeMap<String, Column>> {
+    connection.prepare(r#"SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_table_xinfo(?, 'main')"#)?
+        .query_map([table], |row| Ok((
+            row.get::<_, String>(0)?.to_ascii_lowercase(),
+            Column { data_type: row.get(1)?, not_null: row.get(2)?, default: row.get(3)?, primary_key: row.get(4)?, hidden: row.get(5)? },
+        )))?.collect()
+}
+
+fn schema_error(message: String) -> RecorderError {
+    RecorderError::Sqlite {
+        operation: "validate schema",
+        extended_code: None,
+        message,
+    }
+}
+
+fn schema_sqlite_error(error: rusqlite::Error) -> RecorderError {
+    RecorderError::sqlite("validate schema", error)
 }
 
 fn insert_entry(tx: &Transaction<'_>, session: i64, entry: &Entry) -> rusqlite::Result<()> {
@@ -227,11 +396,11 @@ fn insert_entry(tx: &Transaction<'_>, session: i64, entry: &Entry) -> rusqlite::
             };
             // Admission checked this before accepting the immutable event.
             let time = unix_ns(observation.completed_at).expect("validated timestamp");
-            tx.prepare_cached("INSERT INTO measurements(session_id, port_id, global_key, local_source, completed_at_ns, unit, value_type, integer_value, real_value, boolean_value, read_error, source_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+            tx.prepare_cached(INSERT_MEASUREMENT)?
                 .execute(params![session, port_id, global_key, observation.source, time, observation.unit, kind, integer, real, boolean, error, observation.metadata.as_ref().map(|m| json!({"source_instance":m.source_instance.to_string(), "sequence":m.sequence.to_string(), "generation":m.generation.to_string(), "elapsed_ns":m.elapsed.as_nanos().to_string()}).to_string())])?;
             tx.execute(
-                "INSERT INTO record_order(session_id, kind, row_id) VALUES (?, 'measurement', ?)",
-                params![session, tx.last_insert_rowid()],
+                INSERT_RECORD_ORDER,
+                params![session, "measurement", tx.last_insert_rowid()],
             )?;
             return Ok(());
         }
@@ -291,11 +460,17 @@ fn insert_event(
     port: Option<&str>,
     details: Json,
 ) -> rusqlite::Result<()> {
-    tx.prepare_cached("INSERT INTO events(session_id, registered_at_ns, event_type, origin, port_id, details_json) VALUES (?, ?, ?, ?, ?, ?)")?
-        .execute(params![session, time, kind, origin, port, details.to_string()])?;
+    tx.prepare_cached(INSERT_EVENT)?.execute(params![
+        session,
+        time,
+        kind,
+        origin,
+        port,
+        details.to_string()
+    ])?;
     tx.execute(
-        "INSERT INTO record_order(session_id, kind, row_id) VALUES (?, 'event', ?)",
-        params![session, tx.last_insert_rowid()],
+        INSERT_RECORD_ORDER,
+        params![session, "event", tx.last_insert_rowid()],
     )?;
     Ok(())
 }

@@ -45,6 +45,55 @@ fn sqlite_open_failure_precedes_hardware_and_releases_listener() {
 }
 
 #[test]
+fn incompatible_audit_schema_releases_listener_without_opening_hardware() {
+    use lab_server::recorder::Recorder;
+
+    let db = Database::new();
+    let session = Recorder::open(&db.0, 8)
+        .unwrap()
+        .shutdown()
+        .unwrap()
+        .session_id;
+    let c = db.connect();
+    c.execute_batch("INSERT INTO measurements(session_id,port_id,global_key,local_source,completed_at_ns,unit,value_type,integer_value) VALUES (1,'p','a/value','value',42,'','integer',17);
+         INSERT INTO audit_events(session_id,operation_id,sequence,registered_at_ns,kind,context_json,details_json) VALUES (1,'1',1,42,'accepted','{}','{}');
+         ALTER TABLE audit_events RENAME COLUMN kind TO historical_kind;").unwrap();
+
+    let mut cfg = config(1, &[("a", "fake_a", 0)]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    cfg.tcp.bind = listener.local_addr().unwrap();
+    drop(listener);
+    enable(&mut cfg, &db);
+    cfg.recording.as_mut().unwrap().audit_enabled = true;
+    let mut opens = 0;
+    let result = start_with(&cfg, factory, |_, _| {
+        opens += 1;
+        Ok(FakeIo {
+            input: Cursor::new(vec![]),
+            probe: Arc::new(PortProbe::default()),
+        })
+    });
+    let error = result.err().expect("bad schema must prevent startup");
+    assert!(error.to_string().contains("audit_events.kind"), "{error}");
+    assert_eq!(opens, 0);
+    TcpListener::bind(cfg.tcp.bind).unwrap();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+    assert_eq!(
+        scalar(&c, "SELECT id FROM sessions WHERE ended_at_ns IS NOT NULL"),
+        session
+    );
+    assert_eq!(scalar(&c, "SELECT integer_value FROM measurements"), 17);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE historical_kind='accepted'"
+        ),
+        1
+    );
+    assert_eq!(scalar(&c, "PRAGMA user_version"), 3);
+}
+
+#[test]
 fn disabled_recording_does_not_open_even_an_invalid_path() {
     let db = Database::new();
     let mut config = config(1, &[("a", "fake_a", 0)]);
