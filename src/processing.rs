@@ -580,8 +580,12 @@ impl Engine {
         node.state = state;
         node.fault = None;
         if state == State::Stopped {
-            self.invalidate_nodes(&[name.into()], "component_stopped");
-            self.nodes.get_mut(name).unwrap().state = State::Stopped;
+            self.invalidate_node_outputs(name, "component_stopped");
+            for dependent in self.dependents(name) {
+                if dependent != name {
+                    self.invalidate_node(&dependent, "component_stopped");
+                }
+            }
         }
         self.revision += 1;
         Ok(())
@@ -641,17 +645,26 @@ impl Engine {
     fn invalidate_nodes(&mut self, names: &[String], reason: &str) {
         let names: BTreeSet<_> = names.iter().flat_map(|n| self.dependents(n)).collect();
         for name in names {
-            let n = self.nodes.get_mut(&name).unwrap();
-            n.component.reset();
-            if n.description.kind == Kind::Controller {
-                audit_fault(self.audit.as_ref(), &name, n, self.revision, reason);
-                n.state = State::Fault;
-            }
-            n.fault = Some(reason.into());
-            for o in &n.description.outputs {
-                self.latest.remove(&signal(&name, &o.name));
-                self.oldest.remove(&signal(&name, &o.name));
-            }
+            self.invalidate_node(&name, reason);
+        }
+    }
+    fn invalidate_node(&mut self, name: &str, reason: &str) {
+        let node = self.nodes.get_mut(name).unwrap();
+        node.component.reset();
+        if node.description.kind == Kind::Controller {
+            audit_fault(self.audit.as_ref(), name, node, self.revision, reason);
+            node.state = State::Fault;
+        }
+        self.invalidate_node_outputs(name, reason);
+    }
+    fn invalidate_node_outputs(&mut self, name: &str, reason: &str) {
+        let node = self.nodes.get_mut(name).unwrap();
+        // invalid_outputs uses this reason even when the controller is Stopped.
+        node.fault = Some(reason.into());
+        for output in &node.description.outputs {
+            let key = signal(name, &output.name);
+            self.latest.remove(&key);
+            self.oldest.remove(&key);
         }
     }
     pub fn invalidate(&mut self, keys: &[String], reason: &str) {

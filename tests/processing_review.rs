@@ -6,7 +6,9 @@ use lab_server::{
     model::{Observation, ParameterDescription, SourceMetadata, Spec, Value},
     observation_aggregator::AggregatorEvent,
     port_worker::{DeviceInstance, PortChannels, PortWorker},
+    recorder::{Recorder, RecorderOptions},
     service::DeviceService,
+    session::Session,
 };
 use serde_json::{Value as Json, json};
 use std::{
@@ -18,6 +20,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+
+#[path = "support/recording_db.rs"]
+mod audit_db;
 
 struct Source(usize);
 impl Driver for Source {
@@ -134,6 +139,171 @@ fn create(f: &Fixture, name: &str, input: &str, revision: u64) {
     f.manage(
         json!({"action":"create","configuration":config(name,input),"expected_revision":revision}),
     );
+}
+
+#[test]
+fn stopping_controller_invalidates_its_graph_without_a_false_fault() {
+    for auto in [false, true] {
+        let f = Fixture::new();
+        let database = audit_db::Database::new();
+        let recorder = Recorder::with_options(
+            &database.0,
+            RecorderOptions {
+                audit_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        f.service.enable_audit(recorder.handle());
+
+        let pid = |name, input| json!({"name":name,"type_id":"pid","inputs":{"input":input},"parameters":{"setpoint":20.},"max_age_ms":60000});
+        f.manage(
+            json!({"action":"create","configuration":pid("root", "a/x"),"expected_revision":0}),
+        );
+        create(&f, "filter", "processing/root/output", 1);
+        f.manage(json!({"action":"create","configuration":pid("dependent", "processing/filter/value"),"expected_revision":2}));
+        let mut revision = 3;
+        if auto {
+            f.manage(json!({"action":"bind","name":"root","target":"a/power","command_timeout_ms":1000,"expected_revision":revision}));
+            revision += 1;
+        }
+
+        let keys = [
+            "processing/root/output",
+            "processing/filter/value",
+            "processing/dependent/output",
+        ];
+        let observations = f.service.register_client().unwrap();
+        let mut session = Session::new(16, 65536);
+        session.bind_observations(&observations);
+        let mut request_id = 0;
+        let mut request = |session: &mut Session, mut body: Json| {
+            request_id += 1;
+            body["id"] = json!(request_id);
+            f.service
+                .receive_message(session, &body.to_string(), Instant::now())
+                .unwrap();
+            serde_json::from_str::<Json>(&session.next_message().unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(
+            request(&mut session, json!({"op":"subscribe","keys":keys}))["status"],
+            "ok"
+        );
+        f.publish("a/x", 10.);
+        session.collect_observations(&observations).unwrap();
+        for key in keys {
+            let event: Json =
+                serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+            assert_eq!(event["key"], key);
+            assert_eq!(event["status"], "ok");
+        }
+        for key in keys {
+            assert_eq!(
+                request(&mut session, json!({"op":"get","key":key}))["value"],
+                10.
+            );
+        }
+        if auto {
+            let snapshot = f.manage(
+                json!({"action":"state","name":"root","state":"auto","expected_revision":revision}),
+            );
+            assert_eq!(snapshot["instances"][2]["state"], "auto");
+            revision += 1;
+        }
+
+        let stop = request(
+            &mut session,
+            json!({"op":"components","command":{"action":"state","name":"root","state":"stopped","expected_revision":revision}}),
+        );
+        assert_eq!(stop["status"], "ok");
+        assert_eq!(stop["data"]["revision"], revision + 1);
+        let instances = stop["data"]["instances"].as_array().unwrap();
+        for (name, state) in [
+            ("root", "stopped"),
+            ("filter", "running"),
+            ("dependent", "fault"),
+        ] {
+            let instance = instances
+                .iter()
+                .find(|node| node["configuration"]["name"] == name)
+                .unwrap();
+            assert_eq!(instance["state"], state);
+            assert_eq!(instance["fault"], "component_stopped");
+        }
+        for key in keys {
+            assert_eq!(
+                request(&mut session, json!({"op":"get","key":key}))["status"],
+                "no_data"
+            );
+        }
+        session.collect_observations(&observations).unwrap();
+        assert!(session.next_message().unwrap().is_none());
+        f.publish("a/x", 11.);
+        session.collect_observations(&observations).unwrap();
+        for key in keys {
+            let event: Json =
+                serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+            assert_eq!(event["key"], key);
+            assert_eq!(event["status"], "error");
+            assert!(event.get("value").is_none());
+        }
+        assert!(session.next_message().unwrap().is_none());
+
+        f.manage(json!({"action":"state","name":"root","state":"shadow","expected_revision":revision + 1}));
+        f.service
+            .apply_event(AggregatorEvent::DataLost {
+                port_id: "a".into(),
+                loss_epoch: 1,
+            })
+            .unwrap();
+        recorder.shutdown().unwrap();
+        let db = database.connect();
+        let mut faults = db.prepare(
+            "SELECT json_extract(context_json,'$.component'),
+                    json_extract(context_json,'$.request.reason'),
+                    json_extract(details_json,'$.state_before')
+             FROM audit_events WHERE kind='applied' AND json_extract(details_json,'$.state_after')='fault'
+             ORDER BY id"
+        ).unwrap();
+        let faults = faults
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            faults,
+            [
+                (
+                    "dependent".into(),
+                    "component_stopped".into(),
+                    "shadow".into()
+                ),
+                ("root".into(), "source_data_lost".into(), "shadow".into()),
+            ],
+            "root started in {}",
+            if auto { "Auto" } else { "Shadow" }
+        );
+        assert_eq!(
+            audit_db::scalar(
+                &db,
+                "SELECT count(*) FROM audit_events WHERE kind='applied' AND json_extract(context_json,'$.source')='tcp' AND json_extract(context_json,'$.request.command.state')='stopped'"
+            ),
+            1
+        );
+        assert_eq!(
+            audit_db::scalar(
+                &db,
+                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.source')='controller'"
+            ),
+            0
+        );
+    }
 }
 
 #[test]
