@@ -329,6 +329,8 @@ fn processing_management_tcp_ws_dynamic_subscriptions_and_sqlite_share_one_graph
     }
     // Use the same recording setup as the other startup integration cases.
     config.recording = Some(lab_server::config::RecordingConfig {
+        audit_enabled: false,
+        audit_queue_capacity: None,
         enabled: true,
         path: Some(database.0.clone()),
         queue_capacity: Some(4096),
@@ -874,6 +876,8 @@ fn concurrent_mock_polling_reaches_tcp_ws_and_sqlite_identically() {
     let database = db::Database::new();
     let mut config = configuration();
     config.recording = Some(lab_server::config::RecordingConfig {
+        audit_enabled: false,
+        audit_queue_capacity: None,
         enabled: true,
         path: Some(database.0.clone()),
         queue_capacity: Some(1024),
@@ -964,6 +968,8 @@ fn concurrent_sqlite_records_without_tcp_or_ws_subscribers_and_drains_on_stop() 
     let database = db::Database::new();
     let mut config = configuration();
     config.recording = Some(lab_server::config::RecordingConfig {
+        audit_enabled: false,
+        audit_queue_capacity: None,
         enabled: true,
         path: Some(database.0.clone()),
         queue_capacity: Some(1024),
@@ -1126,7 +1132,16 @@ fn actions_catalog_commands_ids_and_subscriptions_match_tcp_and_ws() {
 #[test]
 fn actions_timeout_disconnect_and_other_port_progress_on_both_transports() {
     for use_ws in [false, true] {
-        let server = Running::new();
+        let database = db::Database::new();
+        let mut config = configuration();
+        config.recording = Some(lab_server::config::RecordingConfig {
+            enabled: false,
+            audit_enabled: true,
+            audit_queue_capacity: None,
+            path: Some(database.0.clone()),
+            queue_capacity: None,
+        });
+        let mut server = Running::with_config(config);
         let mut client = ActionClient::new(&server, use_ws);
         let mut peer = ActionClient::new(&server, !use_ws);
         assert_eq!(
@@ -1176,6 +1191,37 @@ fn actions_timeout_disconnect_and_other_port_progress_on_both_transports() {
         assert_eq!(
             peer.request(json!({"id":2,"op":"get","key":"a/count"}))["value"],
             8
+        );
+        drop(peer);
+        server.stop();
+        let c = database.connect();
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='completed' AND json_extract(context_json,'$.request_id')='5' AND json_extract(details_json,'$.status')='ok'"
+            ),
+            1
+        );
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='started' AND json_extract(context_json,'$.request_id')='5'"
+            ),
+            1
+        );
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='cancelled'"
+            ),
+            0
+        );
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events r JOIN audit_events d ON r.operation_id=d.operation_id AND r.session_id=d.session_id WHERE r.kind='response' AND json_extract(r.details_json,'$.error')='outcome_unknown' AND d.kind='completed' AND d.sequence>r.sequence"
+            ),
+            1
         );
     }
 }
@@ -1404,4 +1450,45 @@ fn same_port_rewire_closes_old_tcp_and_ws_sessions_and_new_session_receives_new_
         stamp(101, "temperature", Value::Float(90.));
         assert_eq!(new.receive()["value"], 90.);
     }
+}
+
+#[test]
+fn websocket_and_tcp_audit_keep_connections_distinct() {
+    let database = db::Database::new();
+    let mut config = configuration();
+    config.recording = Some(lab_server::config::RecordingConfig {
+        enabled: false,
+        audit_enabled: true,
+        audit_queue_capacity: None,
+        path: Some(database.0.clone()),
+        queue_capacity: None,
+    });
+    let mut server = Running::with_config(config);
+    let mut ws = server.connect();
+    let mut tcp = server.tcp();
+    for (id, value) in [(1, true), (2, false)] {
+        let cmd = json!({"id":id,"op":"set","key":"a/enabled","value":value});
+        assert_eq!(request(&mut ws, cmd.clone())["status"], "ok");
+        assert_eq!(tcp_request(&mut tcp, cmd)["status"], "ok");
+    }
+    drop(ws);
+    drop(tcp);
+    server.stop();
+    let c = database.connect();
+    for source in ["tcp", "websocket"] {
+        let count:i64=c.query_row("SELECT count(*) FROM audit_events WHERE kind='completed' AND json_extract(context_json,'$.source')=?",[source],|r|r.get(0)).unwrap();
+        assert_eq!(count, 2);
+    }
+    assert_eq!(
+        db::scalar(
+            &c,
+            "SELECT count(DISTINCT json_extract(context_json,'$.connection_id')) FROM audit_events"
+        ),
+        2
+    );
+    assert_eq!(
+        db::scalar(&c, "SELECT count(DISTINCT operation_id) FROM audit_events"),
+        4
+    );
+    assert_eq!(db::scalar(&c, "SELECT count(*) FROM measurements"), 0);
 }

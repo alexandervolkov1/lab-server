@@ -224,7 +224,7 @@ fn managed_checks_permit_issuer_and_exact_output_scope_at_worker_boundary() {
                 "a",
                 "power",
                 Value::Integer(5),
-                (Instant::now() + WAIT, Some(permit)),
+                (Instant::now() + WAIT, Some(permit), None),
             )
             .unwrap();
         assert_eq!(f.execute(p), Err(CommandError::Unauthorized));
@@ -239,7 +239,7 @@ fn managed_checks_permit_issuer_and_exact_output_scope_at_worker_boundary() {
         let p = f
             .channels
             .commands
-            .action_guarded(2, "a", "reset", Instant::now() + WAIT, Some(permit))
+            .action_guarded(2, "a", "reset", Instant::now() + WAIT, Some(permit), None)
             .unwrap();
         assert_eq!(f.execute(p), Err(CommandError::Unauthorized));
     }

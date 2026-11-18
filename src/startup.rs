@@ -222,6 +222,9 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             CommandRouter::with_authority(registry, authority),
             OBSERVATION_QUEUE_CAPACITY,
         ));
+        if let Some(handle) = &recording.handle {
+            tcp.enable_audit(handle.clone());
+        }
         if let Some(processing) = &config.processing {
             let mut revision = 0; // This service owns a fresh Engine; no clients exist yet.
             for component in &processing.components {
@@ -577,14 +580,22 @@ struct Recording {
 }
 impl Recording {
     fn open(config: &ServerConfig) -> StartupResult<Self> {
-        let Some(options) = config.recording.as_ref().filter(|r| r.enabled) else {
+        let Some(options) = config
+            .recording
+            .as_ref()
+            .filter(|r| r.enabled || r.audit_enabled)
+        else {
             return Ok(Self::default());
         };
-        let recorder = Recorder::open(
+        let recorder = Recorder::with_options(
             options.path.as_ref().expect("validated recording path"),
-            options
-                .queue_capacity
-                .unwrap_or_else(|| RecorderOptions::default().queue_capacity),
+            RecorderOptions {
+                queue_capacity: options.queue_capacity.unwrap_or(1024),
+                audit_queue_capacity: options.audit_queue_capacity.unwrap_or(1024),
+                audit_enabled: options.audit_enabled,
+                measurements_enabled: options.enabled,
+                ..RecorderOptions::default()
+            },
         )?;
         Ok(Self {
             handle: Some(recorder.handle()),
@@ -657,6 +668,16 @@ impl Recording {
                     summary.losses.is_incomplete(),
                 )),
                 Err(error) => errors.capture(Err(io::Error::other(error))),
+            }
+            if let Some(h) = self.handle.clone().filter(|h| h.audit_enabled) {
+                self.report(format_args!(
+                    "Audit summary: enabled={} dropped_audit_events={} state={:?} incomplete={}",
+                    h.audit_enabled,
+                    h.losses().dropped_audit_events,
+                    h.state(),
+                    h.losses().dropped_audit_events != 0
+                        || matches!(h.state(), RecorderState::Failed(_))
+                ));
             }
         }
     }

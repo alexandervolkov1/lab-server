@@ -46,6 +46,16 @@ impl EnqueueError {
 /// Shared asynchronous command admission for transport sessions.
 /// Implementations only admit bounded asynchronous requests; no physical I/O.
 pub trait CommandBackend {
+    fn audit_recorder(&self) -> Option<crate::recorder::RecorderHandle> {
+        None
+    }
+    fn components_audited(
+        &self,
+        command: serde_json::Value,
+        _audit: Option<&crate::audit::Operation>,
+    ) -> Result<serde_json::Value, String> {
+        self.components(command)
+    }
     fn server_status(&self) -> Result<serde_json::Value, String> {
         Err("unsupported_op".into())
     }
@@ -120,6 +130,9 @@ pub struct SessionState<Input> {
     pub subscriptions: SubscriptionSet,
     pub(crate) terminal: bool,
     last_request_id: u64,
+    connection_id: u64,
+    pub(crate) audit_source: &'static str,
+    audits: HashMap<u64, crate::audit::Operation>,
     observation_clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     observation_interest: Option<std::sync::Arc<crate::fanout::ObservationInterest>>,
     activated_after: HashMap<String, u64>,
@@ -135,6 +148,9 @@ impl<Input: Default> SessionState<Input> {
             subscriptions: SubscriptionSet::default(),
             terminal: false,
             last_request_id: 0,
+            connection_id: crate::audit::connection_id(),
+            audit_source: "tcp",
+            audits: HashMap::new(),
             observation_clock: None,
             observation_interest: None,
             activated_after: HashMap::new(),
@@ -184,6 +200,13 @@ impl<Input> SessionState<Input> {
     }
 
     pub(crate) fn queue_response(&mut self, response: &str) -> io::Result<()> {
+        if !self.audits.is_empty()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(response)
+            && let Some(id) = v["id"].as_u64()
+            && let Some(a) = self.audits.remove(&id)
+        {
+            a.response(v);
+        }
         if let Err(error) = self.outbound.enqueue_message(response) {
             self.terminal = true;
 
@@ -454,8 +477,43 @@ impl<Input> SessionState<Input> {
                     .filter(|id| *id > 0)
             }
         };
+        let audit = commands.audit_recorder().and_then(|r| {
+            let raw = match &incoming {
+                ParsedMessage::Request(Request::Set { id, key, value }) => {
+                    json!({"id":id,"op":"set","key":key,"value":crate::audit::value(value)})
+                }
+                ParsedMessage::Request(Request::InvokeAction { id, key }) => {
+                    json!({"id":id,"op":"invoke_action","key":key})
+                }
+                ParsedMessage::Request(Request::Components { id, command }) => {
+                    json!({"id":id,"op":"components","command":command})
+                }
+                ParsedMessage::InvalidRequest { frame, .. } => {
+                    serde_json::from_str(frame).unwrap_or(serde_json::Value::Null)
+                }
+                _ => serde_json::Value::Null,
+            };
+            crate::audit::mutation(&raw).then(|| {
+                crate::audit::Operation::new(
+                    &r,
+                    json!({
+                            "source": self.audit_source,
+                            "connection_id": self.connection_id.to_string(),
+                            "request_id": id.map(|v| v.to_string()),
+                            "request": raw,
+                    "invalid_frame": match &incoming {
+                        ParsedMessage::InvalidRequest { frame, .. } => Some(frame.as_str()),
+                        _ => None,
+                    }
+                        }),
+                )
+            })
+        });
         if let Some(id) = id {
             if id <= self.last_request_id || self.pending.contains_id(id) {
+                if let Some(a) = audit {
+                    a.response(json!({"status":"error","error":"duplicate_id"}));
+                }
                 self.queue_response(
                     &json!({"status":"error", "error":"duplicate_id"}).to_string(),
                 )?;
@@ -464,7 +522,11 @@ impl<Input> SessionState<Input> {
             self.last_request_id = id;
         }
 
-        match incoming {
+        self.pending.audit = audit.clone();
+        if let (Some(id), Some(a)) = (id, audit.clone()) {
+            self.audits.insert(id, a);
+        }
+        let result = match incoming {
             ParsedMessage::Request(Request::ServerStatus { id }) => {
                 match commands.server_status() {
                     Ok(data) => {
@@ -474,7 +536,7 @@ impl<Input> SessionState<Input> {
                 }
             }
             ParsedMessage::Request(Request::Components { id, command }) => {
-                match commands.components(command) {
+                match commands.components_audited(command, audit.as_ref()) {
                     Ok(data) => {
                         self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
                     }
@@ -573,10 +635,17 @@ impl<Input> SessionState<Input> {
                     response["id"] = json!(id);
                 }
 
+                if id.is_none()
+                    && let Some(a) = &audit
+                {
+                    a.response(response.clone());
+                }
                 self.queue_response(&response.to_string())?;
                 Ok(())
             }
-        }
+        };
+        self.pending.audit = None;
+        result
     }
 
     pub fn collect_ready(&mut self, now: Instant) -> io::Result<()> {
@@ -666,5 +735,16 @@ impl<Input> SessionState<Input> {
 
         let event = crate::observation_json(None, observation)?;
         self.queue_response(&event)
+    }
+}
+
+impl<Input> Drop for SessionState<Input> {
+    fn drop(&mut self) {
+        for a in self.audits.values() {
+            a.event(
+                "detached",
+                json!({"reason":"session_dropped_without_response"}),
+            );
+        }
     }
 }

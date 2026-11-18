@@ -98,7 +98,9 @@ impl Runtime {
         };
         let losses = handle.losses();
         json!({"enabled":true,"state":state,"session_id":handle.session_id(),"error":error,
-            "losses":{"dropped_events":losses.dropped_events,
+            "audit_enabled":handle.audit_enabled,"measurements_enabled":handle.measurements_enabled,
+            "audit_incomplete":handle.audit_enabled && (state != "stopped" || losses.dropped_audit_events != 0),
+            "losses":{"dropped_events":losses.dropped_events,"dropped_audit_events":losses.dropped_audit_events,
                 "dropped_data_lost_events":losses.dropped_data_lost_events,
                 "rejected_invalid_data":losses.rejected_invalid_data}})
     }

@@ -1,3 +1,5 @@
+#[path = "support/recording_db.rs"]
+mod audit_db;
 use lab_server::{
     command_router::CommandRouter,
     device_registry::DeviceRegistry,
@@ -154,6 +156,15 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         }
     }
     for (stop_before_start, fail_write) in [(true, false), (false, false), (false, true)] {
+        let database = audit_db::Database::new();
+        let recorder = lab_server::recorder::Recorder::with_options(
+            &database.0,
+            lab_server::recorder::RecorderOptions {
+                audit_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let writes = Arc::new(AtomicUsize::new(0));
         let (worker, channels) = PortWorker::new(
             BufReader::new(Cursor::new(vec![])),
@@ -170,6 +181,7 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         registry.register_device("p", &worker.devices()[0]).unwrap();
         let router = CommandRouter::new(registry);
         let service = DeviceService::new(router.clone(), 32);
+        service.enable_audit(recorder.handle());
         let manage = |command| service.manage(serde_json::from_value(command).unwrap());
         manage(json!({"action":"create","expected_revision":0,"configuration":{"name":"loop","type_id":"pid","inputs":{"input":"a/raw"},"parameters":{"setpoint":3.5},"max_age_ms":10000}})).unwrap();
         manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1000,"expected_revision":1})).unwrap();
@@ -247,5 +259,105 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         service.stop_controls();
         channels.commands.shutdown();
         join.join().unwrap();
+        recorder.shutdown().unwrap();
+        let c = database.connect();
+        assert_eq!(
+            audit_db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.source')='controller' AND kind='accepted'"
+            ),
+            1
+        );
+        assert_eq!(
+            audit_db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.source')='controller' AND kind='completed'"
+            ),
+            i64::from(!stop_before_start)
+        );
+        assert_eq!(
+            audit_db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.component')='loop' AND json_extract(context_json,'$.incarnation')='1' AND kind='requested' AND json_extract(details_json,'$.value')=3"
+            ),
+            1
+        );
+        assert_eq!(
+            audit_db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='applied' AND json_extract(context_json,'$.request.command.state')='auto' AND json_extract(details_json,'$.revision_before')=2 AND json_extract(details_json,'$.revision_after')=3"
+            ),
+            1
+        );
     }
+}
+
+#[test]
+fn audit_management_records_arguments_revisions_and_shadow_transition() {
+    let database = audit_db::Database::new();
+    let recorder = lab_server::recorder::Recorder::with_options(
+        &database.0,
+        lab_server::recorder::RecorderOptions {
+            audit_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (worker, channels) = PortWorker::new(
+        BufReader::new(Cursor::new(vec![])),
+        vec![DeviceInstance::new("a", Source).unwrap()],
+        8,
+        8,
+    )
+    .unwrap();
+    let mut registry = DeviceRegistry::new();
+    registry.register_port("p", channels.commands).unwrap();
+    registry.register_device("p", &worker.devices()[0]).unwrap();
+    let service = DeviceService::new(CommandRouter::new(registry), 8);
+    service.enable_audit(recorder.handle());
+    let mut session = Session::new(8, 65536);
+    let config = json!({"name":"loop","type_id":"pid","inputs":{"input":"a/raw"},"parameters":{},"max_age_ms":10000});
+    let commands = [
+        json!({"action":"create","configuration":config,"expected_revision":0}),
+        json!({"action":"parameter_set","name":"loop","parameter":"kp","value":2.0,"expected_revision":1}),
+        json!({"action":"state","name":"loop","state":"stopped","expected_revision":2}),
+        json!({"action":"state","name":"loop","state":"shadow","expected_revision":3}),
+        json!({"action":"configure","configuration":config,"expected_revision":4}),
+        json!({"action":"delete","name":"loop","expected_revision":5}),
+    ];
+    for (i, command) in commands.iter().enumerate() {
+        service
+            .receive_message(
+                &mut session,
+                &json!({"id":i+1,"op":"components","command":command}).to_string(),
+                Instant::now(),
+            )
+            .unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+        assert_eq!(reply["status"], "ok", "{reply}");
+    }
+    recorder.shutdown().unwrap();
+    let c = database.connect();
+    assert_eq!(
+        audit_db::scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE kind='applied' AND json_extract(details_json,'$.revision_after')=json_extract(details_json,'$.revision_before')+1"
+        ),
+        6
+    );
+    assert_eq!(
+        audit_db::scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE kind='applied' AND json_extract(context_json,'$.request.command.action')='parameter_set' AND json_extract(context_json,'$.request.command.value')=2.0"
+        ),
+        1
+    );
+    assert_eq!(
+        audit_db::scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE kind='applied' AND json_extract(context_json,'$.request.command.state')='shadow'"
+        ),
+        1
+    );
 }

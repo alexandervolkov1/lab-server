@@ -164,6 +164,7 @@ struct Instance {
     fault: Option<String>,
 }
 pub struct Engine {
+    audit: Option<crate::recorder::RecorderHandle>,
     registry: Registry,
     physical: HashMap<String, ParameterDescription>,
     nodes: BTreeMap<String, Instance>,
@@ -180,6 +181,10 @@ pub struct Produced {
     pub proposal: Option<(String, u64, f64)>,
 }
 impl Engine {
+    pub(crate) fn enable_audit(&mut self, recorder: crate::recorder::RecorderHandle) {
+        self.audit = Some(recorder);
+    }
+
     pub(crate) fn with_catalog_budget(mut self, bytes: usize) -> Self {
         self.catalog_budget = bytes.min(48 * 1024);
         self
@@ -226,6 +231,7 @@ impl Engine {
     }
     pub fn new(registry: Registry, physical: HashMap<String, ParameterDescription>) -> Self {
         Self {
+            audit: None,
             registry,
             physical,
             nodes: BTreeMap::new(),
@@ -638,6 +644,7 @@ impl Engine {
             let n = self.nodes.get_mut(&name).unwrap();
             n.component.reset();
             if n.description.kind == Kind::Controller {
+                audit_fault(self.audit.as_ref(), &name, n, self.revision, reason);
                 n.state = State::Fault;
             }
             n.fault = Some(reason.into());
@@ -746,6 +753,7 @@ impl Engine {
                 node.component.reset();
                 node.fault = Some(error.clone());
                 if node.description.kind == Kind::Controller && node.state != State::Stopped {
+                    audit_fault(self.audit.as_ref(), name, node, self.revision, error);
                     node.state = State::Fault;
                 }
             } else {
@@ -790,7 +798,7 @@ pub fn signal(instance: &str, output: &str) -> String {
     format!("processing/{instance}/{output}")
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Management {
     Outputs,
@@ -871,4 +879,23 @@ pub fn builtins() -> Registry {
     r.register(ema::EmaFactory).expect("builtin descriptor");
     r.register(pid::PidFactory).expect("builtin descriptor");
     r
+}
+
+fn audit_fault(
+    recorder: Option<&crate::recorder::RecorderHandle>,
+    name: &str,
+    node: &Instance,
+    revision: u64,
+    reason: &str,
+) {
+    if node.state != State::Fault
+        && let Some(r) = recorder
+    {
+        let a = crate::audit::Operation::new(
+            r,
+            json!({"source":"internal","component":name,"incarnation":node.incarnation.to_string(),"request":{"op":"state","state":"fault","reason":reason}}),
+        );
+        a.accepted();
+        a.event("applied",json!({"state_before":node.state,"state_after":"fault","revision_before":revision,"revision_after":revision}));
+    }
 }

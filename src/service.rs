@@ -17,6 +17,7 @@ mod diagnostics;
 pub(crate) use diagnostics::Runtime;
 
 struct Control {
+    audit: Option<crate::audit::Operation>,
     owner: crate::output::Owner,
     target: String,
     timeout: std::time::Duration,
@@ -24,6 +25,7 @@ struct Control {
 }
 
 pub struct DeviceService {
+    audit: std::sync::OnceLock<crate::recorder::RecorderHandle>,
     pub(crate) runtime: std::sync::OnceLock<Runtime>,
     controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
@@ -36,6 +38,17 @@ pub struct DeviceService {
 }
 
 impl DeviceService {
+    /// Attach once before admitting commands or processing observations.
+    pub fn enable_audit(&self, recorder: crate::recorder::RecorderHandle) {
+        if recorder.audit_enabled {
+            self.processing
+                .lock()
+                .unwrap()
+                .enable_audit(recorder.clone());
+            assert!(self.audit.set(recorder).is_ok());
+        }
+    }
+
     pub fn stop_controls(&self) {
         let _gate = self.lock_service();
         self.router.authority().release_all();
@@ -51,8 +64,28 @@ impl DeviceService {
             if let Some(pending) = c.pending.take() {
                 match pending.poll(Instant::now()) {
                     Poll::Waiting(p) => c.pending = Some(p),
-                    Poll::Finished(Completion::Received { value: Ok(()), .. }) => {}
-                    Poll::Finished(_) => {
+                    Poll::Finished(Completion::Received { value: Ok(()), .. }) => {
+                        if let Some(a) = c.audit.take() {
+                            a.event("controller_result", serde_json::json!({"status":"ok"}));
+                        }
+                    }
+                    Poll::Finished(result) => {
+                        if let Some(a) = c.audit.take() {
+                            let error = match result {
+                                Completion::Received {
+                                    value: Err(error), ..
+                                } => error.to_string(),
+                                Completion::Timeout { .. } => "runtime_timeout".into(),
+                                Completion::Disconnected { .. } => "runtime_unavailable".into(),
+                                Completion::OutcomeUnknown { .. } => "outcome_unknown".into(),
+                                _ => unreachable!("success handled above"),
+                            };
+                            a.event(
+                                "controller_result",
+                                serde_json::json!({"status": "error", "error": error}),
+                            );
+                        }
+
                         if engine.state(name).is_some_and(|(_, inc)| inc == c.owner.1) {
                             engine.fault(name, "output_failed");
                         }
@@ -80,6 +113,16 @@ impl DeviceService {
         if c.owner.1 != incarnation || c.pending.is_some() {
             return;
         }
+        let audit = self.audit.get().map(|recorder| {
+            crate::audit::Operation::new(
+                recorder,
+                serde_json::json!({
+                    "source": "controller", "component": name,
+                    "incarnation": incarnation.to_string(),
+                    "request": {"op": "set", "key": c.target, "proposal": value}
+                }),
+            )
+        });
         let result = (|| {
             let deadline = engine
                 .proposal_deadline(name)
@@ -118,7 +161,14 @@ impl DeviceService {
                         .map(|h| (h.clone(), continuity[p].generation()))
                 })
                 .collect();
+            if let Some(a) = &audit {
+                a.event(
+                    "requested",
+                    serde_json::json!({"value":crate::audit::value(&value)}),
+                );
+            }
             self.router
+                .with_operation(audit.clone())
                 .set_control(
                     incarnation,
                     &c.target,
@@ -130,8 +180,14 @@ impl DeviceService {
                 .map_err(|e| e.to_string())
         })();
         match result {
-            Ok(p) => c.pending = Some(p),
+            Ok(p) => {
+                c.pending = Some(p);
+                c.audit = audit;
+            }
             Err(reason) => {
+                if let Some(a) = audit {
+                    a.event("rejected", serde_json::json!({"error":reason}));
+                }
                 engine.fault(name, &reason);
                 self.router.authority().release(&c.owner);
             }
@@ -171,6 +227,50 @@ impl DeviceService {
         &self,
         command: crate::processing::Management,
     ) -> Result<serde_json::Value, String> {
+        let raw = serde_json::to_value(&command).expect("management serializes");
+        let request = serde_json::json!({"op":"components","command":raw});
+        let audit = self
+            .audit
+            .get()
+            .filter(|_| crate::audit::mutation(&request))
+            .map(|r| {
+                crate::audit::Operation::new(
+                    r,
+                    serde_json::json!({"source":"internal","request":request}),
+                )
+            });
+        self.manage_audited(command, audit.as_ref())
+    }
+    fn manage_audited(
+        &self,
+        command: crate::processing::Management,
+        audit: Option<&crate::audit::Operation>,
+    ) -> Result<serde_json::Value, String> {
+        let before = self.processing.lock().unwrap().revision;
+        let result = self.manage_impl(command);
+        let after = self.processing.lock().unwrap().revision;
+        if let Some(a) = audit {
+            if result.is_ok() || after != before {
+                a.accepted();
+            }
+            let kind = if result.is_ok() || after != before {
+                "applied"
+            } else {
+                "rejected"
+            };
+            a.event(
+                kind,
+                serde_json::json!({
+                    "revision_before": before, "revision_after": after, "result": result
+                }),
+            );
+        }
+        result
+    }
+    fn manage_impl(
+        &self,
+        command: crate::processing::Management,
+    ) -> Result<serde_json::Value, String> {
         use crate::processing::Management::*;
         let mut engine = self.processing.lock().expect("processing lock poisoned");
         let mut discontinued = std::collections::BTreeSet::new();
@@ -206,6 +306,7 @@ impl DeviceService {
                 controls.insert(
                     name.clone(),
                     Control {
+                        audit: None,
                         owner: (name, incarnation),
                         target,
                         timeout: std::time::Duration::from_millis(command_timeout_ms),
@@ -466,6 +567,7 @@ impl DeviceService {
             })
             .collect();
         Self {
+            audit: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
@@ -604,6 +706,21 @@ fn route_error(error: RouteError) -> EnqueueError {
 }
 
 impl CommandBackend for DeviceService {
+    fn audit_recorder(&self) -> Option<crate::recorder::RecorderHandle> {
+        self.audit.get().cloned()
+    }
+    fn components_audited(
+        &self,
+        command: serde_json::Value,
+        audit: Option<&crate::audit::Operation>,
+    ) -> Result<serde_json::Value, String> {
+        self.manage_audited(
+            serde_json::from_value(command)
+                .map_err(|e| format!("invalid_component_request:{e}"))?,
+            audit,
+        )
+    }
+
     fn server_status(&self) -> Result<serde_json::Value, String> {
         self.diagnostics()
     }
@@ -641,6 +758,7 @@ impl CommandBackend for DeviceService {
         requests.ensure_available(id)?;
         let pending = self
             .router
+            .with_operation(requests.audit.clone())
             .invoke_action(id, &key, deadline)
             .map_err(route_error)?;
         requests.add_routed_mutation(id, pending);
@@ -672,6 +790,7 @@ impl CommandBackend for DeviceService {
         requests.ensure_available(id)?;
         let pending = self
             .router
+            .with_operation(requests.audit.clone())
             .set(id, &key, value, deadline)
             .map_err(route_error)?;
         requests.add_routed_mutation(id, pending);

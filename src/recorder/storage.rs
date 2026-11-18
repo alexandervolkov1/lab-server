@@ -19,7 +19,12 @@ pub(super) struct Storage {
 }
 
 impl Storage {
-    pub fn open(path: &Path, busy_timeout: Duration) -> Result<Self, RecorderError> {
+    pub fn open(
+        path: &Path,
+        busy_timeout: Duration,
+        audit_enabled: bool,
+        measurements_enabled: bool,
+    ) -> Result<Self, RecorderError> {
         let mut connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -33,7 +38,7 @@ impl Storage {
         initialize(&mut connection)?;
         let started = unix_ns(SystemTime::now()).map_err(RecorderError::Data)?;
         connection
-            .execute("INSERT INTO sessions(started_at_ns) VALUES (?)", [started])
+            .execute("INSERT INTO sessions(started_at_ns, audit_enabled, measurements_enabled, audit_incomplete) VALUES (?, ?, ?, ?)", params![started, audit_enabled, measurements_enabled, audit_enabled])
             .map_err(|error| RecorderError::sqlite("start session", error))?;
         let session_id = connection.last_insert_rowid();
         Ok(Self {
@@ -45,6 +50,7 @@ impl Storage {
     pub fn write_batch(
         &mut self,
         batch: &[Entry],
+        audit_batch: &[crate::audit::Event],
         losses: LossInfo,
         changed: bool,
     ) -> Result<(), RecorderError> {
@@ -61,6 +67,20 @@ impl Storage {
             insert_entry(&transaction, self.session_id, entry)
                 .map_err(|error| RecorderError::sqlite("insert batch", error))?;
         }
+        for e in audit_batch {
+            transaction.prepare_cached(
+                "INSERT INTO audit_events(session_id, operation_id, sequence, registered_at_ns, kind, context_json, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ).and_then(|mut statement| statement.execute(params![
+                self.session_id, e.operation.to_string(), e.sequence as i64,
+                e.time_ns, e.kind, e.context.as_ref(), e.details
+            ])).map_err(|error| RecorderError::sqlite("insert audit", error))?;
+        }
+        transaction
+            .execute(
+                "UPDATE sessions SET audit_dropped_events=? WHERE id=?",
+                params![losses.dropped_audit_events.to_string(), self.session_id],
+            )
+            .map_err(|e| RecorderError::sqlite("audit losses", e))?;
         if let Some(time) = loss_time {
             insert_event(
                 &transaction,
@@ -72,6 +92,7 @@ impl Storage {
                 json!({"dropped_events": losses.dropped_events.to_string(),
                     "dropped_data_lost_events": losses.dropped_data_lost_events.to_string(),
                     "rejected_invalid_data": losses.rejected_invalid_data.to_string(),
+                    "dropped_audit_events": losses.dropped_audit_events.to_string(),
                     "port_worker_continuity_unknown": losses.dropped_data_lost_events != 0,
                     "counts_are_cumulative": true, "gap_position_known": false}),
             )
@@ -85,12 +106,12 @@ impl Storage {
             .map_err(|error| RecorderError::sqlite("commit batch", error))
     }
 
-    pub fn finish(self) -> Result<(), RecorderError> {
+    pub fn finish(self, audit_complete: bool) -> Result<(), RecorderError> {
         let ended = unix_ns(SystemTime::now()).map_err(RecorderError::Data)?;
         self.connection
             .execute(
-                "UPDATE sessions SET ended_at_ns = ? WHERE id = ?",
-                params![ended, self.session_id],
+                "UPDATE sessions SET ended_at_ns = ?, audit_incomplete = CASE WHEN audit_enabled THEN ? ELSE 0 END WHERE id = ?",
+                params![ended, !audit_complete, self.session_id],
             )
             .map_err(|error| RecorderError::sqlite("finish session", error))?;
         self.connection
@@ -114,7 +135,7 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
     let (application_id, version, has_objects) =
         inspect().map_err(|error| RecorderError::sqlite("inspect schema", error))?;
     let fresh = application_id == 0 && version == 0 && !has_objects;
-    if !fresh && (application_id != APPLICATION_ID || version != SCHEMA_VERSION && version != 1) {
+    if !fresh && (application_id != APPLICATION_ID || !(1..=SCHEMA_VERSION).contains(&version)) {
         return Err(RecorderError::UnsupportedSchema {
             application_id,
             version,
@@ -145,7 +166,7 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
             .pragma_update(None, "application_id", APPLICATION_ID)
             .map_err(|error| RecorderError::sqlite("identify schema", error))?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 2)
             .map_err(|error| RecorderError::sqlite("version schema", error))?;
         transaction
             .commit()
@@ -157,14 +178,27 @@ fn initialize(connection: &mut Connection) -> Result<(), RecorderError> {
             .map_err(|e| RecorderError::sqlite("begin migration", e))?;
         tx.execute_batch(include_str!("schema-v2.sql"))
             .map_err(|e| RecorderError::sqlite("migrate v1 to v2", e))?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        tx.pragma_update(None, "user_version", 2)
             .map_err(|e| RecorderError::sqlite("version migration", e))?;
         tx.commit()
             .map_err(|e| RecorderError::sqlite("commit migration", e))?;
     }
+    if fresh || version < 3 {
+        let tx = connection
+            .transaction()
+            .map_err(|e| RecorderError::sqlite("begin v3", e))?;
+        tx.execute_batch(include_str!("schema-v3.sql"))
+            .map_err(|e| RecorderError::sqlite("migrate v2 to v3", e))?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| RecorderError::sqlite("version v3", e))?;
+        tx.commit()
+            .map_err(|e| RecorderError::sqlite("commit v3", e))?;
+    }
     // Fail during construction for missing/incompatible required columns, even
     // when a damaged file still advertises our application id and version.
     for sql in [
+        "SELECT operation_id, sequence, context_json, details_json FROM audit_events LIMIT 0",
+        "SELECT audit_enabled, measurements_enabled, audit_incomplete, audit_dropped_events FROM sessions LIMIT 0",
         "SELECT source_metadata FROM measurements LIMIT 0",
         "SELECT session_id, kind, row_id FROM record_order LIMIT 0",
         "SELECT id, started_at_ns, ended_at_ns, recorder_incomplete, recorder_dropped_events, recorder_dropped_data_lost_events FROM sessions LIMIT 0",

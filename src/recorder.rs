@@ -17,7 +17,7 @@ use crate::observation_aggregator::AggregatorEvent;
 mod storage;
 use storage::Storage;
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataError {
@@ -100,6 +100,9 @@ pub enum RecorderState {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LossInfo {
     pub dropped_events: u64,
+    /// Audit facts not durably recorded: full/closed queue, invalid data, or
+    /// uncommitted entries at writer failure. Includes subsequent failed attempts.
+    pub dropped_audit_events: u64,
     /// Subset of dropped_events: aggregator notifications of PortWorker loss
     /// that could not themselves enter the recorder queue. Port details may be
     /// lost, but the fact that worker continuity was broken cannot disappear.
@@ -111,7 +114,9 @@ pub struct LossInfo {
 
 impl LossInfo {
     pub fn is_incomplete(self) -> bool {
-        self.dropped_events != 0 || self.rejected_invalid_data != 0
+        self.dropped_events != 0
+            || self.rejected_invalid_data != 0
+            || self.dropped_audit_events != 0
     }
 
     fn record(&mut self, event: &AggregatorEvent) {
@@ -144,6 +149,9 @@ impl std::error::Error for SubmitError {}
 #[derive(Debug, Clone)]
 pub struct RecorderOptions {
     pub queue_capacity: usize,
+    pub audit_queue_capacity: usize,
+    pub audit_enabled: bool,
+    pub measurements_enabled: bool,
     pub batch_size: usize,
     /// Upper bound on accumulation time, not on filesystem latency.
     pub flush_interval: Duration,
@@ -154,6 +162,9 @@ impl Default for RecorderOptions {
     fn default() -> Self {
         Self {
             queue_capacity: 1024,
+            audit_queue_capacity: 1024,
+            audit_enabled: false,
+            measurements_enabled: true,
             batch_size: 128,
             flush_interval: Duration::from_millis(100),
             busy_timeout: Duration::from_millis(250),
@@ -162,9 +173,9 @@ impl Default for RecorderOptions {
 }
 impl RecorderOptions {
     fn validate(&self) -> Result<(), RecorderError> {
-        if self.queue_capacity == 0 || self.batch_size == 0 {
+        if self.queue_capacity == 0 || self.audit_queue_capacity == 0 || self.batch_size == 0 {
             return Err(RecorderError::InvalidOptions(
-                "queue_capacity and batch_size must be positive",
+                "queue_capacity, audit_queue_capacity and batch_size must be positive",
             ));
         }
         if self.flush_interval.is_zero()
@@ -187,11 +198,13 @@ impl RecorderOptions {
 pub struct RecordingSummary {
     pub session_id: i64,
     pub accepted_records: u64,
+    pub audit_records: u64,
     pub losses: LossInfo,
 }
 
 struct Control {
     state: RecorderState,
+    audit_pending: u64,
     losses: LossInfo,
 }
 type Shared = Arc<Mutex<Control>>;
@@ -216,11 +229,45 @@ enum Message {
 #[derive(Clone)]
 pub struct RecorderHandle {
     sender: mpsc::SyncSender<Message>,
+    audit_sender: mpsc::SyncSender<crate::audit::Event>,
+    operations: Arc<std::sync::atomic::AtomicU64>,
+    pub audit_enabled: bool,
+    pub measurements_enabled: bool,
     shared: Shared,
     session_id: i64,
 }
 
 impl RecorderHandle {
+    pub(crate) fn next_operation(&self) -> u64 {
+        self.operations
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .expect("operation id exhausted")
+    }
+    pub(crate) fn audit_lost(&self) {
+        if self.audit_enabled {
+            let mut c = control(&self.shared);
+            c.losses.dropped_audit_events = c.losses.dropped_audit_events.saturating_add(1);
+        }
+    }
+    pub(crate) fn audit_event(&self, event: crate::audit::Event) {
+        if !self.audit_enabled {
+            return;
+        }
+        let mut c = control(&self.shared);
+        if event.context.len().saturating_add(event.details.len()) > 128 * 1024
+            || c.state != RecorderState::Running
+            || self.audit_sender.try_send(event).is_err()
+        {
+            c.losses.dropped_audit_events = c.losses.dropped_audit_events.saturating_add(1);
+        } else {
+            c.audit_pending = c.audit_pending.saturating_add(1);
+        }
+    }
+
     pub fn session_id(&self) -> i64 {
         self.session_id
     }
@@ -230,6 +277,9 @@ impl RecorderHandle {
     /// InvalidData increments rejected_invalid_data, independently of overflow.
     /// Closed/Failed mean NOT accepted and do not change the loss counters.
     pub fn try_record(&self, event: AggregatorEvent) -> Result<(), SubmitError> {
+        if !self.measurements_enabled {
+            return Ok(());
+        }
         let mut shared = control(&self.shared);
         match &shared.state {
             RecorderState::Running => {}
@@ -322,8 +372,12 @@ impl Recorder {
         options.validate()?;
         let path = path.to_owned();
         let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
+        let (audit_sender, audit_receiver) = mpsc::sync_channel(options.audit_queue_capacity);
+        let audit_enabled = options.audit_enabled;
+        let measurements_enabled = options.measurements_enabled;
         let shared = Arc::new(Mutex::new(Control {
             state: RecorderState::Running,
+            audit_pending: 0,
             losses: LossInfo::default(),
         }));
         let writer_shared = shared.clone();
@@ -332,15 +386,36 @@ impl Recorder {
             .name("sqlite-recorder".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let storage = Storage::open(&path, options.busy_timeout)?;
+                    let storage = Storage::open(
+                        &path,
+                        options.busy_timeout,
+                        audit_enabled,
+                        measurements_enabled,
+                    )?;
                     let _ = ready.send(Ok(storage.session_id));
-                    write_loop(storage, receiver, &writer_shared, options, &mut hooks)
+                    write_loop(
+                        storage,
+                        receiver,
+                        audit_receiver,
+                        &writer_shared,
+                        options,
+                        &mut hooks,
+                    )
                 }))
                 .unwrap_or(Err(RecorderError::WriterPanicked));
-                control(&writer_shared).state = match &result {
+                let mut c = control(&writer_shared);
+                if result.is_err() {
+                    c.losses.dropped_audit_events = c
+                        .losses
+                        .dropped_audit_events
+                        .saturating_add(c.audit_pending);
+                    c.audit_pending = 0;
+                }
+                c.state = match &result {
                     Ok(_) => RecorderState::Stopped,
                     Err(error) => RecorderState::Failed(error.clone()),
                 };
+                drop(c);
                 #[cfg(test)]
                 if let Some(stopped) = hooks.stopped.take() {
                     let _ = stopped.send(());
@@ -355,6 +430,10 @@ impl Recorder {
             Ok(Ok(session_id)) => Ok(Self {
                 handle: RecorderHandle {
                     sender,
+                    audit_sender,
+                    operations: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                    audit_enabled,
+                    measurements_enabled,
                     shared,
                     session_id,
                 },
@@ -407,7 +486,7 @@ impl Drop for Recorder {
     }
 }
 
-fn unix_ns(time: SystemTime) -> Result<i64, DataError> {
+pub(crate) fn unix_ns(time: SystemTime) -> Result<i64, DataError> {
     match time.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(duration) => duration_ns(duration, false),
         Err(error) => duration_ns(error.duration(), true),
@@ -456,22 +535,32 @@ impl Hooks {
 fn write_loop(
     mut storage: Storage,
     receiver: mpsc::Receiver<Message>,
+    audit_receiver: mpsc::Receiver<crate::audit::Event>,
     shared: &Shared,
     options: RecorderOptions,
     hooks: &mut Hooks,
 ) -> Result<RecordingSummary, RecorderError> {
     let mut batch = Vec::with_capacity(options.batch_size);
+    let mut audit_batch = Vec::with_capacity(options.batch_size);
+    let mut audit_written = 0_u64;
     let mut deadline = Instant::now() + options.flush_interval;
     let mut written = 0_u64;
     let mut persisted_loss = LossInfo::default();
     loop {
         let closing = control(shared).state == RecorderState::Closing;
+        // One from each queue per turn: neither traffic class can starve the
+        // other. Idle audit waits at most flush_interval (excluding disk I/O).
+        let audit_next = audit_receiver.try_recv().ok();
+        let audit_empty = audit_next.is_none();
+        if let Some(event) = audit_next {
+            audit_batch.push(event);
+        }
         let mut drained = false;
-        let next = if closing {
+        let next = if closing || !audit_empty {
             match receiver.try_recv() {
                 Ok(message) => Some(message),
                 Err(_) => {
-                    drained = true;
+                    drained = closing;
                     None
                 }
             }
@@ -488,11 +577,19 @@ fn write_loop(
         if let Some(Message::Event(entry)) = next {
             batch.push(entry);
         }
-        if batch.len() == options.batch_size || drained || Instant::now() >= deadline {
+        drained = drained && audit_empty;
+        if batch.len() == options.batch_size
+            || audit_batch.len() == options.batch_size
+            || drained
+            || Instant::now() >= deadline
+        {
             let losses = control(shared).losses;
-            if !batch.is_empty() || losses != persisted_loss {
+            if !batch.is_empty() || !audit_batch.is_empty() || losses != persisted_loss {
                 hooks.before_flush();
-                storage.write_batch(&batch, losses, losses != persisted_loss)?;
+                storage.write_batch(&batch, &audit_batch, losses, losses != persisted_loss)?;
+                audit_written = audit_written.saturating_add(audit_batch.len() as u64);
+                control(shared).audit_pending -= audit_batch.len() as u64;
+                audit_batch.clear();
                 written = written.saturating_add(batch.len() as u64);
                 batch.clear();
                 persisted_loss = losses;
@@ -504,9 +601,10 @@ fn write_loop(
             let summary = RecordingSummary {
                 session_id: storage.session_id,
                 accepted_records: written,
+                audit_records: audit_written,
                 losses: persisted_loss,
             };
-            storage.finish()?;
+            storage.finish(persisted_loss.dropped_audit_events == 0)?;
             return Ok(summary);
         }
     }

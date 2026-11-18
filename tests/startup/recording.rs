@@ -8,6 +8,8 @@ use db::{Database, scalar};
 
 fn enable(config: &mut ServerConfig, db: &Database) {
     config.recording = Some(RecordingConfig {
+        audit_enabled: false,
+        audit_queue_capacity: None,
         enabled: true,
         path: Some(db.0.clone()),
         queue_capacity: None,
@@ -392,4 +394,57 @@ fn concurrent_port_failure_does_not_stop_neighbor_recording() {
         ),
         2
     );
+}
+
+#[test]
+fn audit_only_open_failure_precedes_equipment() {
+    let db = Database::new();
+    let mut cfg = config(1, &[("a", "fake_a", 0)]);
+    enable(&mut cfg, &db);
+    let r = cfg.recording.as_mut().unwrap();
+    r.enabled = false;
+    r.audit_enabled = true;
+    r.path = Some(db.0.join("missing/audit.sqlite"));
+    assert!(
+        start_with(&cfg, factory, |_, _| -> io::Result<FakeIo> {
+            panic!("must fail before equipment")
+        })
+        .is_err()
+    );
+}
+#[test]
+fn independent_audit_and_measurement_modes() {
+    for (measurements, audit) in [(false, false), (false, true), (true, false), (true, true)] {
+        let db = Database::new();
+        let mut cfg = config(1, &[("a", "fake_a", 0)]);
+        enable(&mut cfg, &db);
+        let r = cfg.recording.as_mut().unwrap();
+        r.enabled = measurements;
+        r.audit_enabled = audit;
+        let (running, _) = launch(&cfg, &[0]);
+        let mut client = Client::new(running.addr);
+        assert_eq!(
+            client.request(json!({"op":"set","key":"missing/value","value":1}))["status"],
+            "error"
+        );
+        drop(client);
+        drop(running);
+        assert_eq!(db.0.exists(), measurements || audit);
+        if measurements || audit {
+            let c = db.connect();
+            assert_eq!(
+                scalar(&c, "SELECT measurements_enabled FROM sessions"),
+                i64::from(measurements)
+            );
+            assert_eq!(
+                scalar(&c, "SELECT audit_enabled FROM sessions"),
+                i64::from(audit)
+            );
+            assert_eq!(
+                scalar(&c, "SELECT count(*) FROM audit_events"),
+                if audit { 2 } else { 0 }
+            );
+            assert_eq!(scalar(&c, "SELECT audit_incomplete FROM sessions"), 0);
+        }
+    }
 }

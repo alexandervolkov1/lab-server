@@ -42,7 +42,7 @@ fn v1_migration_preserves_history_and_v2_records_metadata_and_order() {
         .unwrap();
     recorder.shutdown().unwrap();
     let c = db.connect();
-    assert_eq!(scalar(&c, "PRAGMA user_version"), 2);
+    assert_eq!(scalar(&c, "PRAGMA user_version"), 3);
     assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 2);
     let metadata: String = c
         .query_row("SELECT source_metadata FROM measurements", [], |r| r.get(0))
@@ -512,6 +512,7 @@ fn concurrent_overflow_never_waits_for_writer_and_lost_datalost_remains_visible(
     assert_eq!(
         losses,
         LossInfo {
+            dropped_audit_events: 0,
             dropped_events: 1001,
             dropped_data_lost_events: 1,
             rejected_invalid_data: 0,
@@ -603,7 +604,7 @@ fn server_status_reads_loss_counters_without_waiting_for_sqlite() {
     assert_eq!(snapshot["recorder"]["session_id"], handle.session_id());
     assert_eq!(
         snapshot["recorder"]["losses"],
-        serde_json::json!({"dropped_events":1,"dropped_data_lost_events":1,"rejected_invalid_data":1})
+        serde_json::json!({"dropped_events":1,"dropped_data_lost_events":1,"rejected_invalid_data":1,"dropped_audit_events":0})
     );
     let summary = recorder.shutdown().unwrap();
     assert_eq!(summary.accepted_records, 2);
@@ -620,6 +621,7 @@ fn saturated_loss_is_sticky_and_persisted_as_exact_decimal_text() {
     entered.recv_timeout(WAIT).unwrap();
     handle.try_record(event(1)).unwrap();
     control(&handle.shared).losses = LossInfo {
+        dropped_audit_events: 0,
         dropped_events: u64::MAX - 1,
         dropped_data_lost_events: u64::MAX - 1,
         rejected_invalid_data: 0,
@@ -638,6 +640,7 @@ fn saturated_loss_is_sticky_and_persisted_as_exact_decimal_text() {
     assert_eq!(
         handle.losses(),
         LossInfo {
+            dropped_audit_events: 0,
             dropped_events: u64::MAX,
             dropped_data_lost_events: u64::MAX,
             rejected_invalid_data: 0,
@@ -1255,4 +1258,162 @@ fn invalid_data_counter_saturates_independently() {
     let connection = db.connect();
     let value: String = connection.query_row("SELECT json_extract(details_json, '$.rejected_invalid_data') FROM events WHERE event_type='RecorderDataLost' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     assert_eq!(value, u64::MAX.to_string());
+}
+
+#[test]
+fn audit_queue_is_reserved_bounded_and_loss_survives_shutdown() {
+    let db = Database::new();
+    let (hooks, entered, release, _) = first_flush_gate();
+    let recorder = Recorder::start(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            audit_queue_capacity: 2,
+            ..options(2, 1)
+        },
+        hooks,
+    )
+    .unwrap();
+    let handle = recorder.handle();
+    handle.try_record(event(0)).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
+    handle.try_record(event(1)).unwrap();
+    handle.try_record(event(2)).unwrap();
+    assert_eq!(handle.try_record(event(3)), Err(SubmitError::Full));
+    let a = crate::audit::Operation::new(&handle, serde_json::json!({"source":"internal"}));
+    a.accepted();
+    a.event("started", serde_json::json!({}));
+    for _ in 0..100 {
+        a.event("completed", serde_json::json!({}));
+    }
+    assert_eq!(handle.losses().dropped_audit_events, 100);
+    release.send(()).unwrap();
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.audit_records, 2);
+    assert_eq!(summary.accepted_records, 3);
+    assert_eq!(summary.losses.dropped_audit_events, 100);
+    let c = db.connect();
+    assert_eq!(scalar(&c, "SELECT audit_incomplete FROM sessions"), 1);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT CAST(audit_dropped_events AS INTEGER) FROM sessions"
+        ),
+        100
+    );
+    assert_eq!(scalar(&c, "SELECT count(*) FROM audit_events"), 2);
+}
+
+#[test]
+fn v2_migration_keeps_measurements_events_and_order() {
+    let db = Database::new();
+    let c = db.connect();
+    c.execute_batch(include_str!("schema.sql")).unwrap();
+    c.execute_batch(include_str!("schema-v2.sql")).unwrap();
+    c.pragma_update(None, "application_id", 0x4c414252).unwrap();
+    c.pragma_update(None, "user_version", 2).unwrap();
+    c.execute_batch("INSERT INTO sessions(id,started_at_ns) VALUES (1,1); INSERT INTO measurements(session_id,port_id,global_key,local_source,completed_at_ns,unit,value_type,integer_value) VALUES (1,'p','a/v','v',42,'','integer',17); INSERT INTO events(session_id,registered_at_ns,event_type,origin,details_json) VALUES(1,42,'RecorderDataLost','recorder','{}'); INSERT INTO record_order(session_id,kind,row_id) VALUES(1,'event',1);").unwrap();
+    drop(c);
+    let r = Recorder::with_options(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    crate::audit::Operation::new(&r.handle(), serde_json::json!({"source":"internal"})).accepted();
+    r.shutdown().unwrap();
+    let c = db.connect();
+    assert_eq!(scalar(&c, "PRAGMA user_version"), 3);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT integer_value FROM measurements WHERE session_id=1"
+        ),
+        17
+    );
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM events WHERE session_id=1 AND event_type='RecorderDataLost'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM record_order WHERE session_id=1"),
+        1
+    );
+    assert_eq!(
+        scalar(&c, "SELECT audit_enabled FROM sessions WHERE id=1"),
+        0
+    );
+    assert_eq!(
+        scalar(&c, "SELECT count(*) FROM audit_events WHERE session_id=2"),
+        1
+    );
+}
+
+#[test]
+fn recording_modes_filter_their_own_traffic_and_share_session() {
+    for (measurements_enabled, audit_enabled) in [(false, true), (true, false), (true, true)] {
+        let db = Database::new();
+        let recorder = Recorder::with_options(
+            &db.0,
+            RecorderOptions {
+                measurements_enabled,
+                audit_enabled,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let h = recorder.handle();
+        h.try_record(event(7)).unwrap();
+        crate::audit::Operation::new(&h, serde_json::json!({"source":"internal"})).accepted();
+        let summary = recorder.shutdown().unwrap();
+        assert_eq!(summary.accepted_records, u64::from(measurements_enabled));
+        assert_eq!(summary.audit_records, u64::from(audit_enabled));
+        let c = db.connect();
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM measurements"),
+            i64::from(measurements_enabled)
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM audit_events"),
+            i64::from(audit_enabled)
+        );
+        assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+        if measurements_enabled && audit_enabled {
+            assert_eq!(
+                scalar(
+                    &c,
+                    "SELECT count(*) FROM measurements m JOIN audit_events a ON m.session_id=a.session_id"
+                ),
+                1
+            );
+        }
+    }
+}
+#[test]
+fn oversized_audit_is_counted_and_not_silently_truncated() {
+    let db = Database::new();
+    let recorder = Recorder::with_options(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let a =
+        crate::audit::Operation::new(&recorder.handle(), serde_json::json!({"source":"internal"}));
+    a.event("applied", serde_json::json!({"data":"x".repeat(128*1024)}));
+    a.accepted();
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.audit_records, 1);
+    assert_eq!(summary.losses.dropped_audit_events, 1);
+    assert_eq!(
+        scalar(&db.connect(), "SELECT sequence FROM audit_events"),
+        2
+    );
 }

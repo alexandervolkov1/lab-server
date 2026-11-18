@@ -223,6 +223,7 @@ struct Connection<S> {
 impl<S: Read + Write> Connection<S> {
     fn new(socket: WebSocket<BoundedIo<S>>, observations: ObservationReceiver) -> Self {
         let mut session = Session::new(64, MAX_OUTPUT_BYTES);
+        session.audit_source = "websocket";
         session.bind_observations(&observations);
         Self {
             socket,

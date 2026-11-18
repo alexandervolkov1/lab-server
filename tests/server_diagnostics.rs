@@ -165,6 +165,8 @@ fn recorder_running_failure_and_stopped_are_read_from_the_live_handle() {
         let db = db::Database::new();
         let mut config = config();
         config.recording = Some(RecordingConfig {
+            audit_enabled: false,
+            audit_queue_capacity: None,
             enabled: true,
             path: Some(db.0.clone()),
             queue_capacity: Some(64),
@@ -207,7 +209,7 @@ fn recorder_running_failure_and_stopped_are_read_from_the_live_handle() {
         assert_eq!(status["recorder"]["session_id"], session_id);
         assert_eq!(
             status["recorder"]["losses"],
-            json!({"dropped_events":0,"dropped_data_lost_events":0,"rejected_invalid_data":0})
+            json!({"dropped_events":0,"dropped_data_lost_events":0,"rejected_invalid_data":0,"dropped_audit_events":0})
         );
         assert_eq!(status["server"]["state"], "stopped");
     }

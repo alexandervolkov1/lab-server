@@ -83,6 +83,9 @@ pub struct WebSocketConfig {
 #[serde(deny_unknown_fields)]
 pub struct RecordingConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub audit_enabled: bool,
+    pub audit_queue_capacity: Option<usize>,
     /// Relative paths are resolved against the process working directory.
     pub path: Option<PathBuf>,
     pub queue_capacity: Option<usize>,
@@ -222,7 +225,7 @@ impl ServerConfig {
             }
         }
         if let Some(recording) = &self.recording {
-            if recording.enabled
+            if (recording.enabled || recording.audit_enabled)
                 && recording
                     .path
                     .as_ref()
@@ -233,7 +236,7 @@ impl ServerConfig {
                     "must be nonempty when recording is enabled",
                 ));
             }
-            if recording.queue_capacity == Some(0) {
+            if recording.queue_capacity == Some(0) || recording.audit_queue_capacity == Some(0) {
                 return Err(invalid(
                     "recording.queue_capacity",
                     "must be greater than zero",

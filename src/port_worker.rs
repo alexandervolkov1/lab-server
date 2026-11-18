@@ -275,10 +275,21 @@ impl PortHandle {
         if let Some(reason) = stopped.as_ref() {
             return Err(SubmitError::Stopped(reason.clone()));
         }
+        let execution = match &command {
+            Command::Set { execution, .. } | Command::InvokeAction { execution, .. } => {
+                Some(execution.clone())
+            }
+            _ => None,
+        };
+        let _admission = execution.as_ref().map(|e| e.admission());
         self.sender.try_send(command).map_err(|error| match error {
             mpsc::TrySendError::Full(_) => SubmitError::Full,
             mpsc::TrySendError::Disconnected(_) => SubmitError::Stopped(StopReason::Shutdown),
-        })
+        })?;
+        if let Some(e) = &execution {
+            e.accepted();
+        }
+        Ok(())
     }
 
     pub fn read(
@@ -308,7 +319,7 @@ impl PortHandle {
         value: Value,
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
-        self.set_guarded(id, device, parameter, value, (deadline, None))
+        self.set_guarded(id, device, parameter, value, (deadline, None, None))
     }
 
     pub(crate) fn set_guarded(
@@ -317,14 +328,19 @@ impl PortHandle {
         device: impl Into<String>,
         parameter: impl Into<String>,
         value: Value,
-        authorization: (Instant, Option<crate::output::Permit>),
+        authorization: (
+            Instant,
+            Option<crate::output::Permit>,
+            Option<crate::audit::Operation>,
+        ),
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
-        let (deadline, permit) = authorization;
+        let (deadline, permit, audit) = authorization;
         let (reply, receiver) = mpsc::sync_channel(1);
         let execution = match permit {
             Some(p) => SetExecution::authorized(deadline, p),
             None => SetExecution::new(deadline),
-        };
+        }
+        .with_audit(audit);
         self.submit(Command::Set {
             device: device.into(),
             parameter: parameter.into(),
@@ -344,7 +360,7 @@ impl PortHandle {
         action: impl Into<String>,
         deadline: Instant,
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
-        self.action_guarded(id, device, action, deadline, None)
+        self.action_guarded(id, device, action, deadline, None, None)
     }
 
     pub(crate) fn action_guarded(
@@ -354,12 +370,14 @@ impl PortHandle {
         action: impl Into<String>,
         deadline: Instant,
         permit: Option<crate::output::Permit>,
+        audit: Option<crate::audit::Operation>,
     ) -> Result<Pending<Result<(), CommandError>>, SubmitError> {
         let (reply, receiver) = mpsc::sync_channel(1);
         let execution = match permit {
             Some(p) => SetExecution::authorized(deadline, p),
             None => SetExecution::new(deadline),
-        };
+        }
+        .with_audit(audit);
         self.submit(Command::InvokeAction {
             device: device.into(),
             action: action.into(),
@@ -754,6 +772,7 @@ impl<P: DeviceIo> PortWorker<P> {
                                 PortState::Desynchronized,
                             ))
                         });
+                        execution.driver_completed(&result);
                         result.map_err(|error| {
                             self.record_error(&error);
                             CommandError::OutcomeUnknown
@@ -803,6 +822,7 @@ impl<P: DeviceIo> PortWorker<P> {
                                 PortState::Desynchronized,
                             ))
                         });
+                        execution.driver_completed(&result);
                         result.map_err(|error| {
                             self.record_error(&error);
                             CommandError::OutcomeUnknown

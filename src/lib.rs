@@ -1,5 +1,6 @@
 //! Models, drivers, transport sessions and configured multi-port server startup.
 
+pub mod audit;
 pub mod command_router;
 pub mod config;
 pub mod device_registry;

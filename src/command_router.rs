@@ -81,6 +81,7 @@ impl std::error::Error for RouteError {}
 #[derive(Clone)]
 pub struct CommandRouter {
     registry: Arc<DeviceRegistry>,
+    operation: Option<crate::audit::Operation>,
     authority: Arc<crate::output::Authority>,
 }
 
@@ -102,8 +103,15 @@ impl CommandRouter {
     ) -> Self {
         Self {
             authority,
+            operation: None,
             registry: Arc::new(registry),
         }
+    }
+
+    pub(crate) fn with_operation(&self, operation: Option<crate::audit::Operation>) -> Self {
+        let mut r = self.clone();
+        r.operation = operation;
+        r
     }
 
     pub fn authority(&self) -> &crate::output::Authority {
@@ -199,7 +207,7 @@ impl CommandRouter {
                 &parameter.device_id,
                 &parameter.description.id,
                 value,
-                (deadline, Some(permit)),
+                (deadline, Some(permit), self.operation.clone()),
             )
             .map_err(|error| Self::submit_error(&parameter.device_id, &parameter.port_id, error))
     }
@@ -239,6 +247,7 @@ impl CommandRouter {
                 &action.description.name,
                 deadline,
                 Some(permit),
+                self.operation.clone(),
             )
             .map_err(|error| Self::submit_error(&action.device_id, &action.port_id, error))
     }

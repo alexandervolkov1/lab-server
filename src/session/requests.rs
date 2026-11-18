@@ -86,6 +86,7 @@ impl Entry {
 }
 
 pub struct PendingRequests {
+    pub(crate) audit: Option<crate::audit::Operation>,
     limit: usize,
     entries: VecDeque<Entry>,
 }
@@ -93,6 +94,7 @@ pub struct PendingRequests {
 impl PendingRequests {
     pub fn new(limit: usize) -> Self {
         Self {
+            audit: None,
             limit,
             entries: VecDeque::new(),
         }

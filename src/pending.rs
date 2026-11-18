@@ -12,6 +12,7 @@ enum ExecutionState {
 /// Shared execution boundary for state-changing operations (set and actions).
 pub struct SetExecution {
     deadline: Instant,
+    audit: Option<crate::audit::Operation>,
     state: Mutex<ExecutionState>,
     permit: Mutex<Option<crate::output::Permit>>,
 }
@@ -20,6 +21,7 @@ impl SetExecution {
     pub fn new(deadline: Instant) -> Arc<Self> {
         Arc::new(Self {
             deadline,
+            audit: None,
             state: Mutex::new(ExecutionState::Queued),
             permit: Mutex::new(None),
         })
@@ -28,9 +30,39 @@ impl SetExecution {
     pub fn authorized(deadline: Instant, permit: crate::output::Permit) -> Arc<Self> {
         Arc::new(Self {
             deadline,
+            audit: None,
             state: Mutex::new(ExecutionState::Queued),
             permit: Mutex::new(Some(permit)),
         })
+    }
+    pub(crate) fn with_audit(
+        mut self: Arc<Self>,
+        audit: Option<crate::audit::Operation>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("unshared execution").audit = audit;
+        self
+    }
+    // Port admission holds this until accepted is emitted. Worker-side
+    // validation may fail before try_start, so the port lock alone is insufficient.
+    pub(crate) fn admission(&self) -> impl Drop + '_ {
+        self.state.lock().expect("execution lock poisoned")
+    }
+    pub(crate) fn accepted(&self) {
+        if let Some(a) = &self.audit {
+            a.accepted();
+        }
+    }
+    pub(crate) fn driver_completed(&self, result: &Result<(), crate::driver::DriverError>) {
+        if let Some(a) = &self.audit {
+            let details = match result {
+                Ok(()) => serde_json::json!({"status": "ok"}),
+                Err(error) => serde_json::json!({
+                    "status": "error", "message": error.message,
+                    "port_state": format!("{:?}", error.port_state)
+                }),
+            };
+            a.event("completed", details);
+        }
     }
     pub fn mark_unknown(&self) {
         if let Some(p) = self.permit.lock().unwrap().as_ref() {
@@ -62,6 +94,9 @@ impl SetExecution {
                 return false;
             }
             *state = ExecutionState::Started;
+            if let Some(a) = &self.audit {
+                a.event("started", serde_json::json!({}));
+            }
             true
         } else {
             false
@@ -69,7 +104,12 @@ impl SetExecution {
     }
 
     pub fn complete(&self, send: impl FnOnce()) {
-        let _state = self.state.lock().expect("execution lock poisoned");
+        let state = self.state.lock().expect("execution lock poisoned");
+        if !matches!(*state, ExecutionState::Started)
+            && let Some(a) = &self.audit
+        {
+            a.cancelled("execution_not_started");
+        }
         send();
         if let Some(p) = self.permit.lock().unwrap().as_mut() {
             p.finish();
@@ -131,6 +171,9 @@ impl<T> Pending<T> {
                 } else {
                     if let Some(state) = state.as_deref_mut() {
                         *state = ExecutionState::Cancelled;
+                        if let Some(a) = execution.as_ref().and_then(|e| e.audit.as_ref()) {
+                            a.cancelled("pending_finished_before_start");
+                        }
                     }
                     Poll::Finished(Completion::Disconnected { id: self.id })
                 }
@@ -148,6 +191,9 @@ impl<T> Pending<T> {
                 } else {
                     if let Some(state) = state.as_deref_mut() {
                         *state = ExecutionState::Cancelled;
+                        if let Some(a) = execution.as_ref().and_then(|e| e.audit.as_ref()) {
+                            a.cancelled("pending_finished_before_start");
+                        }
                     }
                     Poll::Finished(Completion::Timeout { id: self.id })
                 }
