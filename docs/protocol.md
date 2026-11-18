@@ -230,6 +230,7 @@ ACK (`status: "ok"`) для `subscribe` предшествует события�
 | Параметр и запись | `unknown_key`; `Parameter is read-only`; `Value does not match parameter spec` |
 | Подписки | `not_subscribable` — нет периодического опроса; `too_many_subscriptions` — превышен лимит |
 | Очереди | `too_many_pending` — лимит ожидающих запросов клиента; `runtime_busy` — очередь команд заполнена; `runtime_unavailable` — порт недоступен или остановлен |
+| Остановка сервера | `server_stopping` — закрыт допуск `set`, `invoke_action` и изменений обработки |
 | Ожидание | `runtime_timeout`, `outcome_unknown` — различия для `set` и `invoke_action` описаны ниже |
 | Поток наблюдений | `observation_data_lost` — потеря данных; `observation_stream_closed` — закрытие без обнаруженного переполнения |
 

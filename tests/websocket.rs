@@ -1492,3 +1492,124 @@ fn websocket_and_tcp_audit_keep_connections_distinct() {
     );
     assert_eq!(db::scalar(&c, "SELECT count(*) FROM measurements"), 0);
 }
+
+#[test]
+fn shutdown_rejects_tcp_and_websocket_mutations_but_keeps_reads_available() {
+    use lab_server::processing::Management;
+
+    let database = db::Database::new();
+    let mut config = configuration();
+    config.recording = Some(lab_server::config::RecordingConfig {
+        enabled: true,
+        audit_enabled: true,
+        audit_queue_capacity: None,
+        path: Some(database.0.clone()),
+        queue_capacity: None,
+    });
+    let mut server = Running::with_config(config);
+    let mut tcp = ActionClient::new(&server, false);
+    let mut ws = ActionClient::new(&server, true);
+    let state = |state| json!({"action":"state","name":"loop","state":state,"expected_revision":3});
+    let configuration = json!({"name":"loop","type_id":"pid","inputs":{"input":"a/sample"},"parameters":{},"max_age_ms":60000});
+    let commands = [
+        json!({"action":"create","configuration":configuration,"expected_revision":0}),
+        json!({"action":"bind","name":"loop","target":"a/count","command_timeout_ms":1000,"expected_revision":1}),
+        json!({"action":"state","name":"loop","state":"auto","expected_revision":2}),
+    ];
+    for (index, command) in commands.into_iter().enumerate() {
+        let reply = tcp.request(json!({"id":index+1,"op":"components","command":command}));
+        assert_eq!(reply["status"], "ok", "{reply}");
+    }
+    assert_eq!(
+        ws.request(json!({"id":1,"op":"components","command":{"action":"outputs"}}))["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slot| slot["key"] == "a/count")
+            .unwrap()["mode"],
+        "auto"
+    );
+
+    server.service.stop_controls();
+    server.service.stop_controls();
+    let manage = |command| {
+        server
+            .service
+            .manage(serde_json::from_value::<Management>(command).unwrap())
+    };
+    let stopped = manage(json!({"action":"list"})).unwrap();
+    assert_eq!(stopped["instances"][0]["state"], "fault");
+    assert_eq!(stopped["instances"][0]["fault"], "shutdown");
+    assert_eq!(manage(state("shadow")).unwrap_err(), "server_stopping");
+    assert_eq!(manage(state("auto")).unwrap_err(), "server_stopping");
+    for client in [&mut tcp, &mut ws] {
+        for (index, mut command) in [
+            json!({"op":"components","command":state("shadow")}),
+            json!({"op":"components","command":state("auto")}),
+            json!({"op":"components","command":{"action":"parameter_set","name":"loop","parameter":"setpoint","value":25.0}}),
+            json!({"op":"set","key":"a/count","value":42}),
+            json!({"op":"invoke_action","key":"a/decrement"}),
+        ].into_iter().enumerate() {
+            let id = index + 10;
+            command["id"] = json!(id);
+            assert_eq!(client.request(command), json!({"id":id,"status":"error","error":"server_stopping"}));
+        }
+        assert_eq!(
+            client.request(json!({"id":15,"op":"components","command":{"action":"list"}}))["data"],
+            stopped
+        );
+        assert_eq!(client.request(json!({"id":16,"op":"ping"}))["status"], "ok");
+        assert_eq!(
+            client.request(json!({"id":17,"op":"get","key":"a/count"}))["value"],
+            i64::MAX
+        );
+    }
+    let outputs = manage(json!({"action":"outputs"})).unwrap();
+    let output = outputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|slot| slot["key"] == "a/count")
+        .unwrap();
+    assert_eq!(output["mode"], "manual");
+    assert_eq!(output["in_flight"], 0);
+
+    tcp.disconnect();
+    ws.disconnect();
+    server.stop();
+    let connection = database.connect();
+    for source in ["tcp", "websocket"] {
+        for (kind, expected) in [
+            ("rejected", 5),
+            ("response", 5),
+            ("accepted", 0),
+            ("started", 0),
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM audit_events
+                 WHERE kind = ? AND json_extract(context_json, '$.source') = ?
+                 AND CAST(json_extract(context_json, '$.request_id') AS INTEGER) BETWEEN 10 AND 14",
+                    [kind, source],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{source} {kind}");
+        }
+    }
+    assert_eq!(
+        db::scalar(
+            &connection,
+            "SELECT count(*) FROM audit_events WHERE kind IN ('started', 'completed')"
+        ),
+        0
+    );
+    assert!(db::scalar(&connection, "SELECT count(*) FROM measurements") > 0);
+    assert_eq!(
+        db::scalar(
+            &connection,
+            "SELECT count(*) FROM sessions WHERE ended_at_ns IS NOT NULL AND audit_incomplete=0"
+        ),
+        1
+    );
+}

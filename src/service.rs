@@ -49,10 +49,16 @@ impl DeviceService {
         }
     }
 
+    /// Permanently close mutation admission while leaving reads and completions available.
     pub fn stop_controls(&self) {
         let _gate = self.lock_service();
-        self.router.authority().release_all();
+        // Serialize the transition with direct CommandBackend management calls too.
         let mut engine = self.processing.lock().unwrap();
+        let authority = self.router.authority();
+        if !authority.close_admission() {
+            return;
+        }
+        authority.release_all();
         for name in self.controls.lock().unwrap().keys() {
             engine.fault(name, "shutdown");
         }
@@ -246,9 +252,10 @@ impl DeviceService {
         command: crate::processing::Management,
         audit: Option<&crate::audit::Operation>,
     ) -> Result<serde_json::Value, String> {
-        let before = self.processing.lock().unwrap().revision;
-        let result = self.manage_impl(command);
-        let after = self.processing.lock().unwrap().revision;
+        let mut engine = self.processing.lock().expect("processing lock poisoned");
+        let before = engine.revision;
+        let result = self.manage_impl(&mut engine, command);
+        let after = engine.revision;
         if let Some(a) = audit {
             if result.is_ok() || after != before {
                 a.accepted();
@@ -269,10 +276,13 @@ impl DeviceService {
     }
     fn manage_impl(
         &self,
+        engine: &mut crate::processing::Engine,
         command: crate::processing::Management,
     ) -> Result<serde_json::Value, String> {
         use crate::processing::Management::*;
-        let mut engine = self.processing.lock().expect("processing lock poisoned");
+        if !matches!(command, Outputs | Types | List { .. }) {
+            self.router.authority().ensure_admission()?;
+        }
         let mut discontinued = std::collections::BTreeSet::new();
         match command {
             Outputs => return Ok(self.router.authority().snapshot()),
@@ -315,7 +325,7 @@ impl DeviceService {
                 );
             }
             Types => return Ok(engine.types()),
-            List { offset, limit } => return self.component_page(&engine, offset, limit),
+            List { offset, limit } => return self.component_page(engine, offset, limit),
             Create {
                 configuration,
                 expected_revision,
@@ -359,7 +369,7 @@ impl DeviceService {
                 engine.set_state(&name, state, expected_revision)?;
             }
         }
-        self.reconcile_controls(&mut engine);
+        self.reconcile_controls(engine);
         let invalid = engine.invalid_outputs();
         let catalog = engine.catalog();
         let physical = self
@@ -378,7 +388,7 @@ impl DeviceService {
             .lock()
             .expect("cache lock poisoned")
             .retain(|k, _| catalog.contains_key(k) && !invalid.contains(k));
-        self.component_page(&engine, 0, 16)
+        self.component_page(engine, 0, 16)
     }
     pub fn apply_event(&self, event: AggregatorEvent) -> io::Result<()> {
         self.apply_event_recorded(event, |_| {})

@@ -1,6 +1,7 @@
 //! Physical-output authority, independent of any controller algorithm.
 use crate::model::{Spec, Value};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,20 +20,31 @@ struct State {
 }
 #[derive(Default)]
 pub struct Authority {
-    issuer: Arc<()>,
+    // The shared flag also identifies the issuer of a permit.
+    admission_closed: Arc<AtomicBool>,
     slots: BTreeMap<String, Arc<Mutex<State>>>,
 }
 impl Authority {
     pub fn new(keys: impl Iterator<Item = String>) -> Self {
         Self {
-            issuer: Arc::new(()),
+            admission_closed: Arc::default(),
             slots: keys
                 .map(|k| (k, Arc::new(Mutex::new(State::default()))))
                 .collect(),
         }
     }
+    pub(crate) fn close_admission(&self) -> bool {
+        !self.admission_closed.swap(true, Ordering::SeqCst)
+    }
+    pub(crate) fn ensure_admission(&self) -> Result<(), &'static str> {
+        if self.admission_closed.load(Ordering::SeqCst) {
+            return Err("server_stopping");
+        }
+        Ok(())
+    }
     pub fn acquire(&self, key: &str, owner: Owner) -> Result<(), &'static str> {
         let mut s = self.slots.get(key).ok_or("unknown_output")?.lock().unwrap();
+        self.ensure_admission()?;
         if s.unknown {
             return Err("output_fault");
         }
@@ -73,6 +85,7 @@ impl Authority {
         }
     }
     pub fn permit(&self, keys: &[String], owner: Option<&Owner>) -> Result<Permit, &'static str> {
+        self.ensure_admission()?;
         let mut leases = Vec::new();
         for key in keys.iter().collect::<std::collections::BTreeSet<_>>() {
             let slot = self.slots.get(key).ok_or("unknown_output")?;
@@ -86,8 +99,9 @@ impl Authority {
             }
             leases.push((slot.clone(), s.generation));
         }
+        self.ensure_admission()?;
         Ok(Permit {
-            issuer: self.issuer.clone(),
+            admission_closed: self.admission_closed.clone(),
             keys: keys.iter().cloned().collect(),
             leases,
             started: false,
@@ -108,7 +122,7 @@ impl Authority {
     }
 }
 pub struct Permit {
-    issuer: Arc<()>,
+    admission_closed: Arc<AtomicBool>,
     keys: std::collections::BTreeSet<String>,
     manual: bool,
     sources: Vec<(crate::port_worker::PortHandle, u64)>,
@@ -119,7 +133,8 @@ pub struct Permit {
 impl Permit {
     /// Exact immutable resource scope and issuer, independent of the current owner.
     pub(crate) fn covers(&self, authority: &Authority, keys: &[String]) -> bool {
-        Arc::ptr_eq(&self.issuer, &authority.issuer) && self.keys == keys.iter().cloned().collect()
+        Arc::ptr_eq(&self.admission_closed, &authority.admission_closed)
+            && self.keys == keys.iter().cloned().collect()
     }
     pub(crate) fn with_sources(
         mut self,
@@ -157,6 +172,10 @@ impl Permit {
             .zip(&self.leases)
             .any(|(s, (_, g))| s.generation != *g || (s.unknown && !self.manual) || s.active > 0)
         {
+            return false;
+        }
+        // Shutdown revokes even queued manual permits and actions with no leases.
+        if self.admission_closed.load(Ordering::SeqCst) {
             return false;
         }
         // Acquiring the source boundaries and output leases can outlast the deadline.
@@ -228,6 +247,21 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+    #[test]
+    fn shutdown_revokes_action_permits_even_without_output_leases() {
+        let authority = Authority::default();
+        let permit = authority.permit(&[], None).unwrap();
+        let execution = SetExecution::authorized(Instant::now() + Duration::from_secs(10), permit);
+
+        assert!(authority.close_admission());
+        assert!(!authority.close_admission());
+        assert!(!execution.try_start());
+        assert!(matches!(
+            authority.permit(&[], None),
+            Err("server_stopping")
+        ));
+    }
+
     #[test]
     fn concurrent_revoke_and_driver_start_have_one_authority_boundary() {
         for _ in 0..64 {

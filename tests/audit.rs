@@ -237,6 +237,147 @@ fn cancellation_before_start_prevents_driver_and_records_one_response() {
         ["accepted", "cancelled", "response"]
     );
 }
+
+#[test]
+fn received_request_waiting_for_service_is_rejected_after_shutdown() {
+    let f = fixture();
+    let reply = thread::scope(|scope| {
+        let (send_request, requests) = mpsc::channel();
+        let (received, staged) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        let service = &f.service;
+        let client = scope.spawn(move || {
+            let request = requests.recv_timeout(WAIT).unwrap();
+            received.send(()).unwrap();
+            proceed.recv_timeout(WAIT).unwrap();
+            let mut session = Session::new(8, 65536);
+            send(service, &mut session, request);
+            response(&mut session)
+        });
+        send_request
+            .send(json!({"id":1,"op":"set","key":"a/value","value":true}))
+            .unwrap();
+        staged.recv_timeout(WAIT).unwrap();
+        f.service.stop_controls();
+        resume.send(()).unwrap();
+        client.join().unwrap()
+    });
+    assert_eq!(
+        reply,
+        json!({"id":1,"status":"error","error":"server_stopping"})
+    );
+    // The port is still open. A read behind any queued command checks that
+    // the refusal did not enqueue a hidden write.
+    let join = thread::spawn(move || f.worker.run());
+    let mut session = Session::new(8, 65536);
+    send(
+        &f.service,
+        &mut session,
+        json!({"id":1,"op":"get","key":"a/value"}),
+    );
+    assert_eq!(response(&mut session)["status"], "ok");
+    f.channels.commands.shutdown();
+    join.join().unwrap();
+    assert!(f.entered.try_recv().is_err());
+    f.recorder.shutdown().unwrap();
+    let e = events(&f.database);
+    assert_eq!(
+        e.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+        ["rejected", "response"]
+    );
+    assert!(
+        e.iter()
+            .all(|e| e.1["request_id"] == "1" && e.2["error"] == "server_stopping")
+    );
+}
+
+#[test]
+fn shutdown_finishes_started_write_and_cancels_queued_mutations() {
+    for known_outcome in [true, false] {
+        let f = fixture();
+        let mut session = Session::new(8, 65536);
+        let join = thread::spawn(move || f.worker.run());
+        send(
+            &f.service,
+            &mut session,
+            json!({"id":1,"op":"set","key":"a/value","value":true}),
+        );
+        f.entered.recv_timeout(WAIT).unwrap();
+        send(
+            &f.service,
+            &mut session,
+            json!({"id":2,"op":"invoke_action","key":"a/reset"}),
+        );
+
+        f.service.stop_controls();
+        f.service.stop_controls();
+        if !known_outcome {
+            session.collect_ready(Instant::now() + WAIT).unwrap();
+            assert_eq!(
+                response(&mut session),
+                json!({"id":1,"status":"error","error":"outcome_unknown"})
+            );
+            assert_eq!(
+                response(&mut session),
+                json!({"id":2,"status":"error","error":"runtime_timeout"})
+            );
+        }
+        f.resume.send(true).unwrap();
+        send(
+            &f.service,
+            &mut session,
+            json!({"id":3,"op":"get","key":"a/value"}),
+        );
+        let read = if known_outcome {
+            let mut replies: [Json; 3] = std::array::from_fn(|_| response(&mut session));
+            replies.sort_by_key(|reply| reply["id"].as_u64().unwrap());
+            let [write, queued, read] = replies;
+            assert_eq!(write, json!({"id":1,"status":"ok"}));
+            assert_eq!(
+                queued,
+                json!({"id":2,"status":"error","error":"runtime_timeout"})
+            );
+            read
+        } else {
+            response(&mut session)
+        };
+        assert_eq!(read["id"], 3);
+        assert_eq!(read["status"], "ok");
+        assert!(session.next_message().unwrap().is_none());
+        f.channels.commands.shutdown();
+        join.join().unwrap();
+        assert!(f.entered.try_recv().is_err());
+        f.recorder.shutdown().unwrap();
+
+        let e = events(&f.database);
+        let kinds = |id| {
+            e.iter()
+                .filter(|e| e.1["request_id"] == id)
+                .map(|e| e.0.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds("1"),
+            if known_outcome {
+                ["accepted", "started", "completed", "response"]
+            } else {
+                ["accepted", "started", "response", "completed"]
+            }
+        );
+        assert_eq!(kinds("2"), ["accepted", "cancelled", "response"]);
+        assert!(
+            e.iter()
+                .any(|e| e.0 == "completed" && e.1["request_id"] == "1" && e.2["status"] == "ok")
+        );
+        assert_eq!(
+            db::scalar(
+                &f.database.connect(),
+                "SELECT audit_incomplete FROM sessions"
+            ),
+            0
+        );
+    }
+}
 #[test]
 fn timeout_after_start_keeps_late_success_after_unknown() {
     let f = fixture();
