@@ -375,6 +375,53 @@ fn check_controller_writes(cases: &[(Option<&str>, WriteResult)]) {
                 .tick_recorded(|_| panic!("fault must only be published once"))
                 .unwrap();
             assert_eq!(writes.load(Ordering::SeqCst), 1);
+
+            let assert_fault = || {
+                let list = manage(json!({"action":"list"})).unwrap();
+                assert_eq!(list["instances"][0]["state"], "fault");
+                assert_eq!(list["instances"][0]["fault"], "output_failed");
+                let status = service.diagnostics().unwrap();
+                assert_eq!(status["processing"][0]["state"], "fault");
+                assert_eq!(status["processing"][0]["error"], "output_failed");
+            };
+            for (sequence, reading) in [
+                (3, Ok(Value::Float(2.))),
+                (4, Ok(Value::Float(3.))),
+                (5, Err("sensor error".into())),
+            ] {
+                let mut sample = event(sequence);
+                let AggregatorEvent::Measurement { observation, .. } = &mut sample else {
+                    unreachable!()
+                };
+                observation.reading = reading;
+                let mut recorded = Vec::new();
+                service
+                    .apply_event_recorded(sample, |e| recorded.push(e.clone()))
+                    .unwrap();
+                assert_eq!(recorded.len(), 8);
+                assert!(recorded[1..].iter().all(|e| matches!(
+                    e, AggregatorEvent::Measurement { observation, .. } if observation.reading.is_err()
+                )));
+                assert_fault();
+            }
+            service
+                .apply_event(AggregatorEvent::DataLost {
+                    port_id: "p".into(),
+                    loss_epoch: 1,
+                })
+                .unwrap();
+            assert_fault();
+            let shadow = manage(
+                json!({"action":"state","name":"loop","state":"shadow","expected_revision":3}),
+            )
+            .unwrap();
+            assert_eq!(shadow["instances"][0]["state"], "shadow");
+            assert!(shadow["instances"][0]["fault"].is_null());
+            assert!(service.diagnostics().unwrap()["processing"][0]["error"].is_null());
+            assert_eq!(
+                manage(json!({"action":"outputs"})).unwrap()[0]["outcome_unknown"],
+                true
+            );
         }
         service.tick_recorded(|_| {}).unwrap();
         if matches!(write_result, LateFailure | SuccessAfterTimeout) {
@@ -393,6 +440,7 @@ fn check_controller_writes(cases: &[(Option<&str>, WriteResult)]) {
         service.stop_controls();
         channels.commands.shutdown();
         join.join().unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), usize::from(!cancelled));
         recorder.shutdown().unwrap();
         let c = database.connect();
         let controller_events = c.prepare(
@@ -439,6 +487,20 @@ fn check_controller_writes(cases: &[(Option<&str>, WriteResult)]) {
                 ),
                 1
             );
+        }
+        if write_result == Failure {
+            let faults = c
+                .prepare(
+                    "SELECT json_extract(context_json, '$.request.reason') FROM audit_events
+                 WHERE kind='applied' AND json_extract(context_json, '$.component')='loop'
+                     AND json_extract(details_json, '$.state_after')='fault' ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(faults, ["output_failed", "shutdown"]);
         }
         if write_result == SuccessAfterTimeout {
             assert_eq!(

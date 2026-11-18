@@ -260,6 +260,98 @@ fn pid_derivative_antiwindup_gap_and_loss_require_explicit_restart() {
 }
 
 #[test]
+fn watchdog_and_input_invalidation_preserve_inactive_controllers() {
+    let mut e = Engine::new(builtins(), engine().catalog());
+    for (revision, name, type_id) in [
+        (0, "loop", "pid"),
+        (1, "paused", "pid"),
+        (2, "smooth", "ema"),
+        (3, "watchdog", "pid"),
+    ] {
+        let mut component = config(name, "a/raw");
+        component.type_id = type_id.into();
+        e.create(component, revision).unwrap();
+    }
+    let start = Instant::now();
+    let sample = |seconds| Observation {
+        source: "raw".into(),
+        unit: "C".into(),
+        completed_at: SystemTime::now(),
+        metadata: Some(SourceMetadata {
+            source_instance: 1,
+            sequence: seconds + 1,
+            generation: 0,
+            acquired_at: start + Duration::from_secs(seconds),
+            elapsed: Duration::from_secs(seconds),
+        }),
+        reading: Ok(Value::Float(3.)),
+    };
+    e.process("a/raw".into(), sample(0), start);
+    e.set_state("loop", State::Auto, 4).unwrap();
+    e.fault("loop", "output_failed");
+    e.set_state("paused", State::Stopped, 5).unwrap();
+
+    let causes = |e: &Engine| {
+        e.list()["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                (
+                    node["configuration"]["name"].as_str().unwrap().to_owned(),
+                    node["fault"].clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let stale = e.tick(start + Duration::from_secs(2));
+    assert!(stale.iter().any(|name| name == "watchdog"));
+    let fault = causes(&e);
+    assert_eq!(fault["loop"], "output_failed");
+    assert_eq!(fault["paused"], "component_stopped");
+    assert_eq!(fault["smooth"], "stale_input");
+    assert_eq!(fault["watchdog"], "stale_input");
+    assert_eq!(e.state("paused").unwrap().0, State::Stopped);
+    assert_eq!(e.state("watchdog").unwrap().0, State::Fault);
+
+    e.invalidate(&["a/raw".into()], "source_data_lost");
+    let invalid = causes(&e);
+    assert_eq!(invalid["loop"], "output_failed");
+    assert_eq!(invalid["paused"], "component_stopped");
+    assert_eq!(invalid["watchdog"], "stale_input");
+    assert_eq!(invalid["smooth"], "source_data_lost");
+    let produced = e.process("a/raw".into(), sample(3), start + Duration::from_secs(3));
+    let output = |key: &str| produced.iter().find(|item| item.key == key).unwrap();
+    assert_eq!(
+        output("processing/smooth/value").observation.reading,
+        Ok(Value::Float(3.))
+    );
+    for key in [
+        "processing/loop/output",
+        "processing/paused/output",
+        "processing/watchdog/output",
+    ] {
+        assert!(output(key).observation.reading.is_err());
+    }
+    assert!(produced.iter().all(|item| item.proposal.is_none()));
+    assert!(e.invalid_outputs().contains("processing/loop/output"));
+    assert!(e.invalid_outputs().contains("processing/paused/output"));
+    assert!(causes(&e)["smooth"].is_null());
+
+    e.fault("loop", "shutdown");
+    assert_eq!(causes(&e)["loop"], "shutdown");
+    e.set_state("loop", State::Shadow, 6).unwrap();
+    assert!(causes(&e)["loop"].is_null());
+    let resumed = e.process("a/raw".into(), sample(4), start + Duration::from_secs(4));
+    let resumed = resumed
+        .iter()
+        .find(|item| item.key == "processing/loop/output")
+        .unwrap();
+    assert!(resumed.observation.reading.is_ok());
+    assert!(resumed.proposal.is_none());
+}
+
+#[test]
 fn multi_input_fresh_trigger_cannot_hide_old_ancestor_from_controller_watchdog() {
     struct PairFactory;
     impl ComponentFactory for PairFactory {

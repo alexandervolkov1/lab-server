@@ -155,6 +155,18 @@ pub enum State {
     Fault,
     Auto,
 }
+impl State {
+    fn is_inactive(self) -> bool {
+        matches!(self, Self::Stopped | Self::Fault)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FaultUpdate {
+    PreserveInactive,
+    Replace,
+}
+
 struct Instance {
     config: Configuration,
     description: TypeDescription,
@@ -196,7 +208,7 @@ impl Engine {
     }
     pub fn fault(&mut self, name: &str, reason: &str) {
         if self.nodes.contains_key(name) {
-            self.invalidate_nodes(&[name.into()], reason);
+            self.invalidate_nodes(&[name.into()], reason, FaultUpdate::Replace);
         }
     }
     pub fn ready_for_auto(&self, name: &str, expected: u64) -> Result<u64, String> {
@@ -416,7 +428,7 @@ impl Engine {
         node.config = config;
         node.component = replacement;
         if rewire {
-            self.invalidate_nodes(&[name], "input_changed");
+            self.invalidate_nodes(&[name], "input_changed", FaultUpdate::PreserveInactive);
         }
         self.order = order;
         self.revision += 1;
@@ -580,10 +592,15 @@ impl Engine {
         node.state = state;
         node.fault = None;
         if state == State::Stopped {
-            self.invalidate_node_outputs(name, "component_stopped");
+            node.fault = Some("component_stopped".into());
+            self.clear_node_outputs(name);
             for dependent in self.dependents(name) {
                 if dependent != name {
-                    self.invalidate_node(&dependent, "component_stopped");
+                    self.invalidate_node(
+                        &dependent,
+                        "component_stopped",
+                        FaultUpdate::PreserveInactive,
+                    );
                 }
             }
         }
@@ -642,26 +659,26 @@ impl Engine {
         }
         domains
     }
-    fn invalidate_nodes(&mut self, names: &[String], reason: &str) {
+    fn invalidate_nodes(&mut self, names: &[String], reason: &str, update: FaultUpdate) {
         let names: BTreeSet<_> = names.iter().flat_map(|n| self.dependents(n)).collect();
         for name in names {
-            self.invalidate_node(&name, reason);
+            self.invalidate_node(&name, reason, update);
         }
     }
-    fn invalidate_node(&mut self, name: &str, reason: &str) {
+    fn invalidate_node(&mut self, name: &str, reason: &str, update: FaultUpdate) {
         let node = self.nodes.get_mut(name).unwrap();
-        node.component.reset();
-        if node.description.kind == Kind::Controller {
-            audit_fault(self.audit.as_ref(), name, node, self.revision, reason);
-            node.state = State::Fault;
+        if matches!(update, FaultUpdate::Replace) || !node.state.is_inactive() {
+            node.component.reset();
+            if node.description.kind == Kind::Controller {
+                audit_fault(self.audit.as_ref(), name, node, self.revision, reason);
+                node.state = State::Fault;
+            }
+            node.fault = Some(reason.into());
         }
-        self.invalidate_node_outputs(name, reason);
+        self.clear_node_outputs(name);
     }
-    fn invalidate_node_outputs(&mut self, name: &str, reason: &str) {
-        let node = self.nodes.get_mut(name).unwrap();
-        // invalid_outputs uses this reason even when the controller is Stopped.
-        node.fault = Some(reason.into());
-        for output in &node.description.outputs {
+    fn clear_node_outputs(&mut self, name: &str) {
+        for output in &self.nodes[name].description.outputs {
             let key = signal(name, &output.name);
             self.latest.remove(&key);
             self.oldest.remove(&key);
@@ -678,7 +695,7 @@ impl Engine {
             .filter(|(_, n)| n.config.inputs.values().any(|k| keys.contains(k)))
             .map(|(n, _)| n.clone())
             .collect::<Vec<_>>();
-        self.invalidate_nodes(&names, reason);
+        self.invalidate_nodes(&names, reason, FaultUpdate::PreserveInactive);
     }
     pub fn tick(&mut self, now: Instant) -> Vec<String> {
         let stale = self
@@ -694,7 +711,7 @@ impl Engine {
             })
             .map(|(n, _)| n.clone())
             .collect::<Vec<_>>();
-        self.invalidate_nodes(&stale, "stale_input");
+        self.invalidate_nodes(&stale, "stale_input", FaultUpdate::PreserveInactive);
         stale
     }
     pub fn process(
@@ -743,9 +760,10 @@ impl Engine {
                     now.saturating_duration_since(at)
                         <= Duration::from_millis(node.config.max_age_ms)
                 });
+            let inactive = node.state.is_inactive();
             let result = if !valid {
                 Err("invalid_input".into())
-            } else if matches!(node.state, State::Stopped | State::Fault) {
+            } else if inactive {
                 Err("controller_stopped".into())
             } else {
                 node.component.process(&inputs).and_then(|v| {
@@ -762,15 +780,18 @@ impl Engine {
                     }
                 })
             };
-            if let Err(error) = &result {
-                node.component.reset();
-                node.fault = Some(error.clone());
-                if node.description.kind == Kind::Controller && node.state != State::Stopped {
-                    audit_fault(self.audit.as_ref(), name, node, self.revision, error);
-                    node.state = State::Fault;
+            // An observation can carry an error without changing the controller's cause.
+            if !inactive {
+                if let Err(error) = &result {
+                    node.component.reset();
+                    node.fault = Some(error.clone());
+                    if node.description.kind == Kind::Controller {
+                        audit_fault(self.audit.as_ref(), name, node, self.revision, error);
+                        node.state = State::Fault;
+                    }
+                } else {
+                    node.fault = None;
                 }
-            } else {
-                node.fault = None;
             }
             for output in &node.description.outputs {
                 let key = signal(name, &output.name);
