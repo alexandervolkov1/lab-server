@@ -213,3 +213,13 @@ SQLite v2 включает транзакционную миграцию v1, и�
 Конфигурации пока RAM-only; data-only Configuration допускает последующий TOML loader.
 Физическое оборудование, аппаратные interlock и восстановление COM-порта не проверены.
 Автоматического повторного открытия остановившегося порта по-прежнему нет.
+
+
+### Command audit
+
+The shared Recorder now uses schema v3 with additive v1/v2 migrations and a separate
+bounded audit queue. PID writes carry component name/incarnation, proposal and converted
+value through SetExecution. Driver completion and controller Pending result are separate
+facts. Management commands retain arguments and revisions under the existing service gate;
+automatic Fault transitions are internal operations. No ownership, state transition or
+retry rules changed. See [audit.md](audit.md) for the event contract and completeness limits.
