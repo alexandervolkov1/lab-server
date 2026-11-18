@@ -115,13 +115,55 @@ fn ema_chain_retune_loss_old_queue_and_dynamic_catalog() {
     assert_eq!(get(1)["error"], "unknown_key");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteResult {
+    Success,
+    Failure,
+    LateSuccess,
+    LateFailure,
+    SuccessAfterTimeout,
+}
+
 #[test]
-fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
+fn stopping_auto_preserves_state_after_queued_write_cancellation() {
+    check_controller_writes(&[
+        (Some("stopped"), WriteResult::Success),
+        (Some("shadow"), WriteResult::Success),
+        (Some("shutdown"), WriteResult::Success),
+    ]);
+}
+
+#[test]
+fn auto_uses_router_integer_output_and_faults_on_driver_error() {
+    check_controller_writes(&[(None, WriteResult::Success), (None, WriteResult::Failure)]);
+}
+
+#[test]
+fn stopping_auto_preserves_started_write_results_and_the_unknown_latch() {
+    check_controller_writes(&[
+        (Some("stopped"), WriteResult::LateSuccess),
+        (Some("shadow"), WriteResult::LateFailure),
+        (Some("shadow"), WriteResult::SuccessAfterTimeout),
+    ]);
+}
+
+fn check_controller_writes(cases: &[(Option<&str>, WriteResult)]) {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     };
-    struct Actuator(Arc<AtomicUsize>, bool);
+    use std::thread;
+
+    struct WriteGate {
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    struct Actuator {
+        writes: Arc<AtomicUsize>,
+        fail: bool,
+        gate: Option<WriteGate>,
+    }
     impl Driver for Actuator {
         fn parameters(&self) -> Vec<ParameterDescription> {
             let mut p = Source.parameters();
@@ -144,8 +186,12 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
             _: &mut dyn DeviceIo,
         ) -> Result<(), DriverError> {
             assert_eq!(*value, Value::Integer(3));
-            self.0.fetch_add(1, Ordering::SeqCst);
-            if self.1 {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = self.gate.take() {
+                gate.entered.send(()).unwrap();
+                gate.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            if self.fail {
                 Err(DriverError::new(
                     "write failed",
                     lab_server::driver::PortState::Synchronized,
@@ -155,7 +201,19 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
             }
         }
     }
-    for (stop_before_start, fail_write) in [(true, false), (false, false), (false, true)] {
+    use WriteResult::*;
+    for &(stop, write_result) in cases {
+        let stop_during_write = matches!(
+            write_result,
+            LateSuccess | LateFailure | SuccessAfterTimeout
+        );
+        let cancelled = stop.is_some() && !stop_during_write;
+        let fail_write = matches!(write_result, Failure | LateFailure);
+        let command_timeout = if write_result == SuccessAfterTimeout {
+            3000
+        } else {
+            10000
+        };
         let database = audit_db::Database::new();
         let recorder = lab_server::recorder::Recorder::with_options(
             &database.0,
@@ -166,9 +224,21 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         )
         .unwrap();
         let writes = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
         let (worker, channels) = PortWorker::new(
             BufReader::new(Cursor::new(vec![])),
-            vec![DeviceInstance::new("a", Actuator(writes.clone(), fail_write)).unwrap()],
+            vec![
+                DeviceInstance::new(
+                    "a",
+                    Actuator {
+                        writes: writes.clone(),
+                        fail: fail_write,
+                        gate: stop_during_write.then_some(WriteGate { entered, resume }),
+                    },
+                )
+                .unwrap(),
+            ],
             8,
             8,
         )
@@ -183,8 +253,8 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         let service = DeviceService::new(router.clone(), 32);
         service.enable_audit(recorder.handle());
         let manage = |command| service.manage(serde_json::from_value(command).unwrap());
-        manage(json!({"action":"create","expected_revision":0,"configuration":{"name":"loop","type_id":"pid","inputs":{"input":"a/raw"},"parameters":{"setpoint":3.5},"max_age_ms":10000}})).unwrap();
-        manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1000,"expected_revision":1})).unwrap();
+        manage(json!({"action":"create","expected_revision":0,"configuration":{"name":"loop","type_id":"pid","inputs":{"input":"a/raw"},"parameters":{"setpoint":3.5},"max_age_ms":60000}})).unwrap();
+        manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":command_timeout,"expected_revision":1})).unwrap();
         let event = |seq| AggregatorEvent::Measurement {
             port_id: "p".into(),
             global_key: "a/raw".into(),
@@ -217,11 +287,43 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
                 .is_err()
         );
         service.apply_event(event(2)).unwrap();
-        if stop_before_start {
-            manage(json!({"action":"state","name":"loop","state":"stopped","expected_revision":3}))
-                .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(command_timeout);
+        let stop_controller = || match stop {
+            Some("shutdown") => service.stop_controls(),
+            Some(state) => {
+                manage(json!({"action":"state","name":"loop","state":state,"expected_revision":3}))
+                    .unwrap();
+            }
+            None => {}
+        };
+        if cancelled {
+            // The worker has not been started, so the proposal is still queued.
+            stop_controller();
         }
-        let join = std::thread::spawn(move || worker.run());
+        let join = thread::spawn(move || worker.run());
+        if stop_during_write {
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            stop_controller();
+            let output = &manage(json!({"action":"outputs"})).unwrap()[0];
+            assert_eq!(output["mode"], "manual");
+            assert_eq!(output["in_flight"], 1);
+            assert_eq!(output["outcome_unknown"], false);
+            if write_result == SuccessAfterTimeout {
+                // The driver's channel keeps the call in flight across the deadline.
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    thread::sleep(remaining);
+                }
+                service.tick_recorded(|_| {}).unwrap();
+                let output = &manage(json!({"action":"outputs"})).unwrap()[0];
+                assert_eq!(output["in_flight"], 1);
+                assert_eq!(output["outcome_unknown"], true);
+                assert_eq!(
+                    manage(json!({"action":"list"})).unwrap()["instances"][0]["fault"],
+                    "output_failed"
+                );
+            }
+            release.send(()).unwrap();
+        }
         let end = Instant::now() + Duration::from_secs(3);
         // A read queued behind the mutation proves the worker crossed its start boundary.
         let mut read = channels.commands.read(7, "a", "raw", end).unwrap();
@@ -239,15 +341,33 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
         }
         assert_eq!(
             writes.load(Ordering::SeqCst),
-            usize::from(!stop_before_start)
+            usize::from(!cancelled),
+            "{stop:?} {write_result:?}"
         );
-        if fail_write {
+        if let Some(state) = stop.filter(|_| cancelled || write_result == LateSuccess) {
+            service.tick_recorded(|_| {}).unwrap();
+            let list = manage(json!({"action":"list"})).unwrap();
+            let controller = &list["instances"][0];
+            let (expected_state, expected_fault) = match state {
+                "shutdown" => ("fault", json!("shutdown")),
+                "stopped" => ("stopped", json!("component_stopped")),
+                _ => ("shadow", json!(null)),
+            };
+            assert_eq!(controller["state"], expected_state, "after {state}");
+            assert_eq!(controller["fault"], expected_fault, "after {state}");
+            assert_eq!(
+                manage(json!({"action":"outputs"})).unwrap()[0]["mode"],
+                "manual"
+            );
+        }
+        if write_result == Failure {
             let mut recorded = Vec::new();
             service.tick_recorded(|e| recorded.push(e.clone())).unwrap();
             assert_eq!(recorded.len(), 7);
             assert!(recorded.iter().all(|e| matches!(e, AggregatorEvent::Measurement { observation, .. } if observation.reading.is_err())));
             let list = manage(json!({"action":"list"})).unwrap();
             assert_eq!(list["instances"][0]["state"], "fault");
+            assert_eq!(list["instances"][0]["fault"], "output_failed");
             let outputs = manage(json!({"action":"outputs"})).unwrap();
             assert_eq!(outputs[0]["mode"], "manual");
             assert_eq!(outputs[0]["outcome_unknown"], true);
@@ -256,25 +376,86 @@ fn auto_uses_router_integer_output_and_stop_revokes_queued_commands() {
                 .unwrap();
             assert_eq!(writes.load(Ordering::SeqCst), 1);
         }
+        service.tick_recorded(|_| {}).unwrap();
+        if matches!(write_result, LateFailure | SuccessAfterTimeout) {
+            let list = manage(json!({"action":"list"})).unwrap();
+            assert_eq!(list["instances"][0]["state"], "fault");
+            assert_eq!(list["instances"][0]["fault"], "output_failed");
+            let output = &manage(json!({"action":"outputs"})).unwrap()[0];
+            assert_eq!(output["in_flight"], 0);
+            assert_eq!(output["outcome_unknown"], true);
+            assert_eq!(
+                router.authority().acquire("a/power", ("new".into(), 2)),
+                Err("output_fault")
+            );
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), usize::from(!cancelled));
         service.stop_controls();
         channels.commands.shutdown();
         join.join().unwrap();
         recorder.shutdown().unwrap();
         let c = database.connect();
+        let controller_events = c.prepare(
+            "SELECT kind FROM audit_events WHERE json_extract(context_json,'$.source')='controller' ORDER BY sequence"
+        ).unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let expected: &[&str] = if cancelled {
+            &["requested", "accepted", "cancelled", "controller_result"]
+        } else if write_result == SuccessAfterTimeout {
+            &[
+                "requested",
+                "accepted",
+                "started",
+                "controller_result",
+                "completed",
+            ]
+        } else {
+            &[
+                "requested",
+                "accepted",
+                "started",
+                "completed",
+                "controller_result",
+            ]
+        };
+        assert_eq!(controller_events, expected);
+        let status: String = c.query_row(
+            "SELECT json_extract(details_json,'$.status') FROM audit_events WHERE kind='controller_result'", [], |row| row.get(0)
+        ).unwrap();
         assert_eq!(
-            audit_db::scalar(
-                &c,
-                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.source')='controller' AND kind='accepted'"
-            ),
-            1
+            status,
+            if cancelled {
+                "cancelled"
+            } else if fail_write || write_result == SuccessAfterTimeout {
+                "error"
+            } else {
+                "ok"
+            }
         );
-        assert_eq!(
-            audit_db::scalar(
-                &c,
-                "SELECT count(*) FROM audit_events WHERE json_extract(context_json,'$.source')='controller' AND kind='completed'"
-            ),
-            i64::from(!stop_before_start)
-        );
+        if fail_write {
+            assert_eq!(
+                audit_db::scalar(
+                    &c,
+                    "SELECT count(*) FROM audit_events WHERE kind='completed' AND json_extract(details_json,'$.message')='write failed'"
+                ),
+                1
+            );
+        }
+        if write_result == SuccessAfterTimeout {
+            assert_eq!(
+                audit_db::scalar(
+                    &c,
+                    "SELECT count(*) FROM audit_events WHERE kind='controller_result' AND json_extract(details_json,'$.error')='outcome_unknown'"
+                ),
+                1
+            );
+            assert_eq!(
+                audit_db::scalar(
+                    &c,
+                    "SELECT count(*) FROM audit_events WHERE kind='completed' AND json_extract(details_json,'$.status')='ok'"
+                ),
+                1
+            );
+        }
         assert_eq!(
             audit_db::scalar(
                 &c,

@@ -11,6 +11,8 @@ use crate::device_registry::{Availability, DeviceRegistry};
 use crate::fanout::{ObservationFanout, ObservationReceiver};
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
+use crate::port_worker::{CommandError, StopReason};
+use crate::processing::State;
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
 mod diagnostics;
@@ -76,6 +78,22 @@ impl DeviceService {
                         }
                     }
                     Poll::Finished(result) => {
+                        let state = engine.state(name).filter(|(_, inc)| *inc == c.owner.1);
+                        // These results are only possible before a physical call. Once
+                        // Auto has been deliberately stopped, its queued write can no
+                        // longer fault the controller just because it failed to start.
+                        let ended_before_start = matches!(
+                            result,
+                            Completion::Timeout { .. }
+                                | Completion::Received {
+                                    value: Err(CommandError::RuntimeTimeout
+                                        | CommandError::PortStopped(StopReason::Shutdown)),
+                                    ..
+                                }
+                        );
+                        let expected_cancellation = ended_before_start
+                            && (matches!(state, Some((State::Stopped | State::Shadow, _)))
+                                || self.router.authority().ensure_admission().is_err());
                         if let Some(a) = c.audit.take() {
                             let error = match result {
                                 Completion::Received {
@@ -86,20 +104,25 @@ impl DeviceService {
                                 Completion::OutcomeUnknown { .. } => "outcome_unknown".into(),
                                 _ => unreachable!("success handled above"),
                             };
+                            let status = if expected_cancellation {
+                                "cancelled"
+                            } else {
+                                "error"
+                            };
                             a.event(
                                 "controller_result",
-                                serde_json::json!({"status": "error", "error": error}),
+                                serde_json::json!({"status": status, "error": error}),
                             );
                         }
 
-                        if engine.state(name).is_some_and(|(_, inc)| inc == c.owner.1) {
+                        if state.is_some() && !expected_cancellation {
                             engine.fault(name, "output_failed");
                         }
                         self.router.authority().release(&c.owner);
                     }
                 }
             }
-            if engine.state(name) != Some((crate::processing::State::Auto, c.owner.1)) {
+            if engine.state(name) != Some((State::Auto, c.owner.1)) {
                 self.router.authority().release(&c.owner);
             }
         }
