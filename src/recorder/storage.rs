@@ -322,7 +322,7 @@ fn validate_table(
             || column.primary_key != expected.primary_key
             || (expected.primary_key == 0 && column.not_null != expected.not_null)
             || column.hidden != 0
-            || (expected.has_non_null_default() && !column.has_non_null_default())
+            || (expected.default.is_some() && !column.has_compatible_default())
         {
             return Err(schema_error(format!(
                 "incompatible column {table}.{name}: expected {expected:?}, found {column:?}"
@@ -330,9 +330,15 @@ fn validate_table(
         }
     }
     for (name, column) in actual {
-        if column.hidden == 0 && column.not_null && !column.has_non_null_default() {
+        if column.hidden != 0 {
             return Err(schema_error(format!(
-                "extra required column {table}.{name} has no non-NULL default"
+                "extra generated column {table}.{name} is not supported"
+            )));
+        }
+        if !column.has_compatible_default() {
+            let required = if column.not_null { "required " } else { "" };
+            return Err(schema_error(format!(
+                "extra {required}column {table}.{name} requires a compatible literal DEFAULT"
             )));
         }
     }
@@ -349,13 +355,62 @@ struct Column {
 }
 
 impl Column {
-    fn has_non_null_default(&self) -> bool {
-        self.default.as_deref().is_some_and(|default| {
-            !default
-                .trim_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '(' | ')'))
-                .eq_ignore_ascii_case("NULL")
-        })
+    fn has_compatible_default(&self) -> bool {
+        let Some(default) = self.default.as_deref() else {
+            return !self.not_null;
+        };
+        let mut literal = default.trim();
+        while let Some(inner) = literal.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            literal = inner.trim();
+        }
+        if literal.eq_ignore_ascii_case("NULL") {
+            return !self.not_null;
+        }
+
+        // Classify literals without evaluating SQL from the existing database.
+        let literal_type = if is_quoted_literal(literal) {
+            "TEXT"
+        } else if literal.parse::<i64>().is_ok() {
+            "INTEGER"
+        } else if literal.parse::<f64>().is_ok_and(f64::is_finite) {
+            "REAL"
+        } else if literal
+            .strip_prefix("X'")
+            .or_else(|| literal.strip_prefix("x'"))
+            .and_then(|hex| hex.strip_suffix('\''))
+            .is_some_and(|hex| {
+                hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        {
+            "BLOB"
+        } else {
+            return false;
+        };
+        let column_type = self.data_type.to_ascii_uppercase();
+        column_type == literal_type
+            || matches!(
+                (column_type.as_str(), literal_type),
+                ("ANY", _) | ("INT" | "REAL" | "TEXT", "INTEGER") | ("TEXT", "REAL")
+            )
     }
+}
+
+fn is_quoted_literal(value: &str) -> bool {
+    ['\'', '"'].into_iter().any(|quote| {
+        let Some(mut text) = value
+            .strip_prefix(quote)
+            .and_then(|s| s.strip_suffix(quote))
+        else {
+            return false;
+        };
+        while let Some((_, after_quote)) = text.split_once(quote) {
+            let Some(after_escape) = after_quote.strip_prefix(quote) else {
+                return false;
+            };
+            text = after_escape;
+        }
+        true
+    })
 }
 
 fn table_columns(

@@ -820,6 +820,24 @@ fn v3_rejects_incompatible_audit_column_definitions_and_keys() {
             "extra required column audit_events.required",
         ),
         (
+            "kind TEXT NOT NULL",
+            "kind TEXT NOT NULL, extra TEXT NOT NULL DEFAULT (NULLIF(1,1))",
+            "",
+            "extra required column audit_events.extra",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind TEXT NOT NULL, extra TEXT GENERATED ALWAYS AS (NULL) STORED NOT NULL",
+            "",
+            "extra generated column audit_events.extra",
+        ),
+        (
+            "kind TEXT NOT NULL",
+            "kind TEXT NOT NULL, extra INTEGER DEFAULT 'not an integer'",
+            "",
+            "extra column audit_events.extra requires a compatible literal DEFAULT",
+        ),
+        (
             "UNIQUE(session_id, operation_id, sequence)",
             "CHECK(sequence > 0)",
             "",
@@ -849,7 +867,7 @@ fn v3_rejects_incompatible_audit_column_definitions_and_keys() {
         .unwrap();
         let error = Recorder::open(&db.0, 8)
             .err()
-            .expect("incompatible v3 table must fail at open");
+            .unwrap_or_else(|| panic!("incompatible v3 table must fail at open: {changed}"));
         assert!(error.to_string().contains(expected), "{error}");
         assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
     }
@@ -870,7 +888,10 @@ fn reopens_v3_and_records_audit_with_compatible_extra_columns() {
     let c = db.connect();
     c.execute_batch(
         "ALTER TABLE audit_events ADD COLUMN note TEXT;
-                     ALTER TABLE audit_events ADD COLUMN extension TEXT NOT NULL DEFAULT 'kept';",
+         ALTER TABLE audit_events ADD COLUMN extension TEXT NOT NULL DEFAULT 'kept';
+         ALTER TABLE audit_events ADD COLUMN count_hint INTEGER NOT NULL DEFAULT 17;
+         ALTER TABLE audit_events ADD COLUMN offset_hint REAL NOT NULL DEFAULT (-2.5);
+         ALTER TABLE audit_events ADD COLUMN tag BLOB NOT NULL DEFAULT X'00ff';",
     )
     .unwrap();
     let second = Recorder::with_options(&db.0, options).unwrap();
@@ -881,7 +902,8 @@ fn reopens_v3_and_records_audit_with_compatible_extra_columns() {
     assert_eq!(
         scalar(
             &c,
-            "SELECT count(*) FROM audit_events WHERE extension='kept' AND kind='accepted'"
+            "SELECT count(*) FROM audit_events WHERE extension='kept' AND kind='accepted'
+             AND note IS NULL AND count_hint=17 AND offset_hint=-2.5 AND tag=X'00ff'"
         ),
         2
     );
