@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub type Parameters = BTreeMap<String, Json>;
 pub type Inputs = BTreeMap<String, Observation>;
 pub type Calculation = BTreeMap<String, f64>;
+const MAX_COMPONENTS: usize = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,6 +64,13 @@ pub struct Registry {
     factories: BTreeMap<String, Box<dyn ComponentFactory>>,
 }
 impl Registry {
+    fn factory(&self, type_id: &str) -> Result<&dyn ComponentFactory, &'static str> {
+        self.factories
+            .get(type_id)
+            .map(Box::as_ref)
+            .ok_or("unknown_type")
+    }
+
     pub fn register(&mut self, factory: impl ComponentFactory + 'static) -> Result<(), String> {
         let d = factory.describe();
         if !identifier(&d.type_id)
@@ -334,15 +342,11 @@ impl Engine {
         self.check_revision(expected)?;
         if !identifier(&config.name)
             || self.nodes.contains_key(&config.name)
-            || self.nodes.len() >= 128
+            || self.nodes.len() >= MAX_COMPONENTS
         {
             return Err("invalid_instance".into());
         }
-        let factory = self
-            .registry
-            .factories
-            .get(&config.type_id)
-            .ok_or("unknown_type")?;
+        let factory = self.registry.factory(&config.type_id)?;
         let description = factory.describe();
         config.parameters = validate(&description, &config.parameters)?;
         let component = factory.create(&config.parameters)?;
@@ -439,55 +443,15 @@ impl Engine {
         config: &Configuration,
         desc: &TypeDescription,
     ) -> Result<Vec<String>, String> {
-        if config.max_age_ms == 0
-            || config.max_age_ms > 86_400_000
-            || config.inputs.keys().cloned().collect::<BTreeSet<_>>()
-                != desc.inputs.iter().cloned().collect()
-        {
-            return Err("invalid_inputs".into());
-        }
+        Self::validate_inputs(config, desc)?;
         let mut configs: BTreeMap<_, _> = self
             .nodes
             .iter()
-            .map(|(k, n)| (k.clone(), (&n.config, &n.description)))
+            .map(|(k, n)| (k.as_str(), (&n.config, &n.description)))
             .collect();
-        configs.insert(config.name.clone(), (config, desc));
-        let mut owners = HashMap::new();
-        for (name, (_, d)) in &configs {
-            for o in &d.outputs {
-                let key = signal(name, &o.name);
-                if self.physical.contains_key(&key) || owners.insert(key, name.clone()).is_some() {
-                    return Err("signal_collision".into());
-                }
-            }
-        }
-        let mut dependencies = BTreeMap::<String, BTreeSet<String>>::new();
-        for (name, (c, _)) in &configs {
-            let mut edges = BTreeSet::new();
-            for key in c.inputs.values() {
-                if let Some(owner) = owners.get(key) {
-                    edges.insert(owner.clone());
-                } else if !self.physical.get(key).is_some_and(|p| {
-                    !matches!(p.spec, Spec::Boolean) && p.default_poll_period.is_some()
-                }) {
-                    return Err("unknown_or_non_numeric_input".into());
-                }
-            }
-            dependencies.insert(name.clone(), edges);
-        }
-        let mut order = Vec::new();
-        while !dependencies.is_empty() {
-            let name = dependencies
-                .iter()
-                .find(|(_, e)| e.is_empty())
-                .map(|(n, _)| n.clone())
-                .ok_or("dependency_cycle")?;
-            dependencies.remove(&name);
-            for edges in dependencies.values_mut() {
-                edges.remove(&name);
-            }
-            order.push(name);
-        }
+        configs.insert(&config.name, (config, desc));
+        let order = self.graph_order(&configs).map_err(|(_, reason)| reason)?;
+
         // Reserve the existing v1 describe frame before accepting a larger graph.
         // 256 covers scalar bounds, poll period, field names and punctuation.
         let cost = |key: &str, unit: &str| {
@@ -521,6 +485,103 @@ impl Engine {
         }
         if bytes > self.catalog_budget {
             return Err("catalog_capacity".into());
+        }
+        Ok(order.into_iter().map(str::to_owned).collect())
+    }
+
+    /// Order a set of declarations before adding them through the usual create path.
+    pub(crate) fn startup_order<'a>(
+        &self,
+        configurations: impl IntoIterator<Item = &'a Configuration>,
+    ) -> Result<Vec<usize>, (&'a str, &'static str)> {
+        let mut components = BTreeMap::new();
+        for (index, config) in configurations.into_iter().enumerate() {
+            let name = config.name.as_str();
+            if !identifier(name)
+                || components.len() >= MAX_COMPONENTS
+                || components.contains_key(name)
+            {
+                return Err((name, "invalid_instance"));
+            }
+            let description = self
+                .registry
+                .factory(&config.type_id)
+                .map_err(|reason| (name, reason))?
+                .describe();
+            Self::validate_inputs(config, &description).map_err(|reason| (name, reason))?;
+            components.insert(name, (index, config, description));
+        }
+        let graph = components
+            .iter()
+            .map(|(&name, (_, config, description))| (name, (*config, description)))
+            .collect();
+        Ok(self
+            .graph_order(&graph)?
+            .into_iter()
+            .map(|name| components[name].0)
+            .collect())
+    }
+
+    fn validate_inputs(config: &Configuration, desc: &TypeDescription) -> Result<(), &'static str> {
+        if config.max_age_ms == 0
+            || config.max_age_ms > 86_400_000
+            || config.inputs.keys().cloned().collect::<BTreeSet<_>>()
+                != desc.inputs.iter().cloned().collect()
+        {
+            return Err("invalid_inputs");
+        }
+        Ok(())
+    }
+
+    fn graph_order<'a>(
+        &self,
+        configs: &BTreeMap<&'a str, (&Configuration, &TypeDescription)>,
+    ) -> Result<Vec<&'a str>, (&'a str, &'static str)> {
+        let mut owners = HashMap::new();
+        for (&name, (_, d)) in configs {
+            for o in &d.outputs {
+                let key = signal(name, &o.name);
+                if self.physical.contains_key(&key) || owners.insert(key, name).is_some() {
+                    return Err((name, "signal_collision"));
+                }
+            }
+        }
+        let mut dependencies = BTreeMap::new();
+        for (&name, (c, _)) in configs {
+            let mut edges = BTreeSet::new();
+            for key in c.inputs.values() {
+                if let Some(&owner) = owners.get(key) {
+                    edges.insert(owner);
+                } else if !self.physical.get(key).is_some_and(|p| {
+                    !matches!(p.spec, Spec::Boolean) && p.default_poll_period.is_some()
+                }) {
+                    return Err((name, "unknown_or_non_numeric_input"));
+                }
+            }
+            dependencies.insert(name, edges);
+        }
+        let mut order = Vec::new();
+        while !dependencies.is_empty() {
+            // BTreeMap iteration chooses the lexicographically first ready node.
+            let Some(name) = dependencies
+                .iter()
+                .find(|(_, e)| e.is_empty())
+                .map(|(&name, _)| name)
+            else {
+                // Follow the remaining edges to report a member of the cycle,
+                // even when the first blocked node only depends on it.
+                let mut visited = BTreeSet::new();
+                let mut name = *dependencies.first_key_value().unwrap().0;
+                while visited.insert(name) {
+                    name = *dependencies[name].first().unwrap();
+                }
+                return Err((name, "dependency_cycle"));
+            };
+            dependencies.remove(name);
+            for edges in dependencies.values_mut() {
+                edges.remove(name);
+            }
+            order.push(name);
         }
         Ok(order)
     }

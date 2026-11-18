@@ -289,9 +289,13 @@ fn configure_processing(
     let Some(processing) = &config.processing else {
         return Ok(audit);
     };
+    let order = service
+        .startup_processing_order(processing.components.iter().map(|c| &c.configuration))
+        .map_err(|(name, reason)| invalid_component(name, reason.into()))?;
     let audit_enabled = config.recording.as_ref().is_some_and(|r| r.audit_enabled);
     let mut revision = 0; // This service owns a fresh Engine; no clients exist yet.
-    for component in &processing.components {
+    for index in order {
+        let component = &processing.components[index];
         let configuration = &component.configuration;
         let mut apply = |command, revision: &mut u64| -> Result<(), ConfigError> {
             let context = audit_enabled.then(|| {
@@ -301,10 +305,7 @@ fn configure_processing(
             });
             let snapshot = service
                 .manage(command)
-                .map_err(|message| ConfigError::Validation {
-                    field: format!("processing component {:?}", configuration.name),
-                    message,
-                })?;
+                .map_err(|message| invalid_component(&configuration.name, message))?;
             let after = snapshot["revision"]
                 .as_u64()
                 .expect("component snapshot revision");
@@ -339,6 +340,13 @@ fn configure_processing(
         }
     }
     Ok(audit)
+}
+
+fn invalid_component(name: &str, message: String) -> ConfigError {
+    ConfigError::Validation {
+        field: format!("processing component {name:?}"),
+        message,
+    }
 }
 
 #[derive(Default)]

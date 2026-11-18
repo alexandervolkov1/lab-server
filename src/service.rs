@@ -623,6 +623,16 @@ impl DeviceService {
         }
     }
 
+    pub(crate) fn startup_processing_order<'a>(
+        &self,
+        configurations: impl IntoIterator<Item = &'a crate::processing::Configuration>,
+    ) -> Result<Vec<usize>, (&'a str, &'static str)> {
+        self.processing
+            .lock()
+            .unwrap()
+            .startup_order(configurations)
+    }
+
     fn physical_lineage(
         registry: &DeviceRegistry,
     ) -> HashMap<String, std::collections::BTreeSet<String>> {

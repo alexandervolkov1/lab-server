@@ -219,11 +219,42 @@ fn startup_graph_is_visible_processes_measurements_and_never_writes() {
 }
 
 #[test]
+fn startup_graph_is_identical_for_every_declaration_order() {
+    let mut config = config(GRAPH);
+    let processing = config.processing.as_mut().unwrap();
+    let mut independent = processing.components[0].clone();
+    independent.configuration.name = "independent".into();
+    processing.components.push(independent);
+    let components = processing.components.clone();
+    let mut expected = None;
+    for indices in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        config.processing.as_mut().unwrap().components =
+            indices.map(|i| components[i].clone()).into();
+        let server = start(&config, &Arc::default(), &Arc::default()).unwrap();
+        let snapshot = list(server.backend());
+        assert_eq!(snapshot["revision"], 4);
+        assert_eq!(snapshot["instances"][0]["incarnation"], 1); // independent
+        assert_eq!(snapshot["instances"][1]["incarnation"], 3); // loop
+        assert_eq!(snapshot["instances"][2]["incarnation"], 2); // smooth
+        let catalog = request(server.backend(), json!({"op":"describe"}));
+        let result = (snapshot, catalog);
+        if let Some(expected) = &expected {
+            assert_eq!(&result, expected);
+        } else {
+            expected = Some(result);
+        }
+    }
+}
+
+#[test]
 fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
-    let split = GRAPH
-        .find("\n[[processing.components]]\nname = \"loop\"")
-        .unwrap();
-    let reversed = format!("{}{}", &GRAPH[split..], &GRAPH[..split]);
     let cases = [
         (
             GRAPH.replace("\"ema\"", "\"missing\""),
@@ -275,7 +306,6 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
             "smooth",
             "invalid_inputs",
         ),
-        (reversed, "loop", "unknown_or_non_numeric_input"),
         (
             GRAPH.replace(
                 "target = \"furnace1/power\"",
