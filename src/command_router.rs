@@ -122,6 +122,10 @@ impl CommandRouter {
         &self.registry
     }
 
+    pub(crate) fn startup_registry_mut(&mut self) -> &mut DeviceRegistry {
+        Arc::get_mut(&mut self.registry).expect("startup registry is not shared yet")
+    }
+
     pub fn description(&self, global_key: &str) -> Result<&RegisteredParameter, RouteError> {
         self.registry
             .parameter(global_key)

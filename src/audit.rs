@@ -91,6 +91,29 @@ impl Operation {
         self.emit_locked(&mut s, "response", response);
     }
 }
+
+pub(crate) fn management_request(command: &crate::processing::Management) -> Value {
+    json!({"op":"components","command":command})
+}
+
+pub(crate) fn management_result(
+    operation: &Operation,
+    before: u64,
+    after: u64,
+    result: &Result<Value, String>,
+) {
+    let kind = if result.is_ok() || after != before {
+        operation.accepted();
+        "applied"
+    } else {
+        "rejected"
+    };
+    operation.event(
+        kind,
+        json!({"revision_before": before, "revision_after": after, "result": result}),
+    );
+}
+
 pub(crate) fn mutation(v: &Value) -> bool {
     matches!(v["op"].as_str(), Some("set" | "invoke_action"))
         || (v["op"] == "components"

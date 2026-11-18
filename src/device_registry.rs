@@ -1,9 +1,8 @@
 //! Logical catalog independent of physical port availability.
 //!
-//! Configure instances first, construct the worker, then register its handle and
-//! catalogs from PortWorker::devices() before starting it. Registration does not
-//! start workers or inspect hardware. The caller must associate each handle with
-//! its actual port and devices; a handle exposes no driver internals.
+//! Registration does not start workers or inspect hardware. Startup registers
+//! the catalog first, then attaches the outcome of opening each port. The caller
+//! must associate each handle with its actual port and devices.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -141,6 +140,16 @@ impl DeviceRegistry {
         reason: impl Into<String>,
     ) -> Result<(), RegistryError> {
         self.insert_port(id.into(), PortBinding::Unavailable(reason.into()))
+    }
+
+    pub(crate) fn set_port_open_result(&mut self, id: &str, result: Result<PortHandle, String>) {
+        self.ports
+            .get_mut(id)
+            .expect("port registered before open")
+            .binding = match result {
+            Ok(handle) => PortBinding::Running(handle),
+            Err(reason) => PortBinding::Unavailable(reason),
+        };
     }
 
     fn insert_port(&mut self, id: String, binding: PortBinding) -> Result<(), RegistryError> {

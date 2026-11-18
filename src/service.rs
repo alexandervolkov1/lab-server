@@ -11,7 +11,7 @@ use crate::device_registry::{Availability, DeviceRegistry};
 use crate::fanout::{ObservationFanout, ObservationReceiver};
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
-use crate::port_worker::{CommandError, StopReason};
+use crate::port_worker::{CommandError, PortHandle, StopReason};
 use crate::processing::State;
 use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
@@ -264,8 +264,7 @@ impl DeviceService {
         &self,
         command: crate::processing::Management,
     ) -> Result<serde_json::Value, String> {
-        let raw = serde_json::to_value(&command).expect("management serializes");
-        let request = serde_json::json!({"op":"components","command":raw});
+        let request = crate::audit::management_request(&command);
         let audit = self
             .audit
             .get()
@@ -286,22 +285,8 @@ impl DeviceService {
         let mut engine = self.processing.lock().expect("processing lock poisoned");
         let before = engine.revision;
         let result = self.manage_impl(&mut engine, command);
-        let after = engine.revision;
         if let Some(a) = audit {
-            if result.is_ok() || after != before {
-                a.accepted();
-            }
-            let kind = if result.is_ok() || after != before {
-                "applied"
-            } else {
-                "rejected"
-            };
-            a.event(
-                kind,
-                serde_json::json!({
-                    "revision_before": before, "revision_after": after, "result": result
-                }),
-            );
+            crate::audit::management_result(a, before, engine.revision, &result);
         }
         result
     }
@@ -403,18 +388,10 @@ impl DeviceService {
         self.reconcile_controls(engine);
         let invalid = engine.invalid_outputs();
         let catalog = engine.catalog();
-        let physical = self
-            .registry()
-            .parameters()
-            .map(|p| {
-                (
-                    p.global_key.clone(),
-                    std::collections::BTreeSet::from([p.port_id.clone()]),
-                )
-            })
-            .collect();
-        self.fanout
-            .update_keys(engine.lineage(&physical), &discontinued);
+        self.fanout.update_keys(
+            engine.lineage(&Self::physical_lineage(self.registry())),
+            &discontinued,
+        );
         self.latest
             .lock()
             .expect("cache lock poisoned")
@@ -628,18 +605,7 @@ impl DeviceService {
             })
             .sum::<usize>();
         let catalog_budget = (64 * 1024usize).saturating_sub(actions_bytes.saturating_add(1024));
-        let continuity = router
-            .registry()
-            .ports()
-            .filter_map(|p| {
-                p.handle().map(|h| {
-                    (
-                        p.id().to_owned(),
-                        crate::continuity::Continuity::new(h.source_instance()),
-                    )
-                })
-            })
-            .collect();
+        let continuity = Self::port_continuity(router.registry());
         Self {
             audit: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
@@ -655,6 +621,56 @@ impl DeviceService {
             latest: Mutex::new(HashMap::new()),
             fanout,
         }
+    }
+
+    fn physical_lineage(
+        registry: &DeviceRegistry,
+    ) -> HashMap<String, std::collections::BTreeSet<String>> {
+        registry
+            .parameters()
+            .map(|p| {
+                (
+                    p.global_key.clone(),
+                    std::collections::BTreeSet::from([p.port_id.clone()]),
+                )
+            })
+            .collect()
+    }
+
+    fn port_continuity(
+        registry: &DeviceRegistry,
+    ) -> HashMap<String, crate::continuity::Continuity> {
+        registry
+            .ports()
+            .filter_map(|p| {
+                p.handle().map(|h| {
+                    (
+                        p.id().to_owned(),
+                        crate::continuity::Continuity::new(h.source_instance()),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Attach I/O to the validated catalog while the service is still unshared.
+    pub(crate) fn attach_startup_ports(
+        &mut self,
+        ports: Vec<(String, Result<PortHandle, String>)>,
+        observation_capacity: usize,
+    ) {
+        let registry = self.router.startup_registry_mut();
+        for (id, result) in ports {
+            registry.set_port_open_result(&id, result);
+        }
+        *self.continuity.get_mut().unwrap() = Self::port_continuity(registry);
+        let fanout = ObservationFanout::routed(observation_capacity, registry);
+        let engine = self.processing.get_mut().unwrap();
+        fanout.update_keys(
+            engine.lineage(&Self::physical_lineage(registry)),
+            &Default::default(),
+        );
+        self.fanout = Arc::new(fanout);
     }
 
     pub fn registry(&self) -> &DeviceRegistry {

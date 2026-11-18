@@ -1,5 +1,5 @@
-//! TOML composition root. Validate every driver before touching hardware, then
-//! open each configured physical port once and retain catalogs on open failure.
+//! TOML composition root. Validate the complete configuration before opening
+//! resources, then retain the validated catalog even for unavailable ports.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -141,6 +141,10 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     let started_at = std::time::Instant::now();
     config.validate()?;
     let mut grouped = HashMap::<&str, (Vec<DeviceInstance>, Duration)>::new();
+    let mut registry = DeviceRegistry::new();
+    for port in &config.ports {
+        registry.register_unavailable_port(&port.id, "not opened")?;
+    }
     for (index, device) in config.devices.iter().enumerate() {
         let invalid = |message| ConfigError::Validation {
             field: format!("devices[{index}] ({:?})", device.id),
@@ -154,22 +158,24 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
                 .set_poll_period(parameter, Some(Duration::from_millis(*millis)))
                 .map_err(|error| invalid(format!("poll_periods_ms: {error}")))?;
         }
+        registry.register_device(&device.port, &instance)?;
         let (devices, delay) = grouped.entry(&device.port).or_default();
         devices.push(instance);
         *delay = (*delay).max(setup.post_open_delay);
     }
 
     let authority = Arc::new(crate::output::Authority::new(
-        grouped
-            .values()
-            .flat_map(|(devices, _)| devices.iter())
-            .flat_map(|d| {
-                d.parameters()
-                    .iter()
-                    .filter(|p| p.writable)
-                    .map(move |p| format!("{}/{}", d.id(), p.id))
-            }),
+        registry
+            .parameters()
+            .filter(|p| p.description.writable)
+            .map(|p| p.global_key.clone()),
     ));
+    let mut tcp = MultiDeviceTcp::new(
+        CommandRouter::with_authority(registry, authority.clone()),
+        OBSERVATION_QUEUE_CAPACITY,
+    );
+    let audit = configure_processing(config, &tcp)?;
+
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;
     listener.set_nonblocking(true)?;
@@ -187,7 +193,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     // recorder is mandatory; construction failure also releases the listener.
     let mut recording = Recording::open(config)?;
     let prepared_server = (|| -> StartupResult<_> {
-        let mut registry = DeviceRegistry::new();
+        let mut ports = Vec::with_capacity(config.ports.len());
         let mut prepared = Vec::new();
         let mut sources = Vec::new();
         for port in &config.ports {
@@ -201,62 +207,31 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
                         OBSERVATION_QUEUE_CAPACITY,
                         PortMode::Managed(authority.clone()),
                     )?;
-                    registry.register_port(&port.id, channels.commands.clone())?;
-                    for device in worker.devices() {
-                        registry.register_device(&port.id, device)?;
-                    }
+                    ports.push((port.id.clone(), Ok(channels.commands.clone())));
                     sources.push((port.id.clone(), channels.observations));
                     prepared.push((port.id.clone(), channels.commands, worker));
                 }
                 Err(error) => {
                     let reason = format!("cannot open {:?}: {error}", port.name);
                     eprintln!("Port {:?} unavailable: {reason}", port.id);
-                    registry.register_unavailable_port(&port.id, reason)?;
-                    for device in &devices {
-                        registry.register_device(&port.id, device)?;
-                    }
+                    ports.push((port.id.clone(), Err(reason)));
                 }
             }
         }
-        let tcp = Arc::new(MultiDeviceTcp::new(
-            CommandRouter::with_authority(registry, authority),
-            OBSERVATION_QUEUE_CAPACITY,
-        ));
+        tcp.attach_startup_ports(ports, OBSERVATION_QUEUE_CAPACITY);
         if let Some(handle) = &recording.handle {
             tcp.enable_audit(handle.clone());
-        }
-        if let Some(processing) = &config.processing {
-            let mut revision = 0; // This service owns a fresh Engine; no clients exist yet.
-            for component in &processing.components {
-                let configuration = &component.configuration;
-                let invalid = |message| ConfigError::Validation {
-                    field: format!("processing component {:?}", configuration.name),
-                    message,
-                };
-                let snapshot = tcp
-                    .manage(Management::Create {
-                        configuration: configuration.clone(),
-                        expected_revision: revision,
-                    })
-                    .map_err(invalid)?;
-                revision = snapshot["revision"]
-                    .as_u64()
-                    .expect("component snapshot revision");
-                if let Some(binding) = &component.binding {
-                    let snapshot = tcp
-                        .manage(Management::Bind {
-                            name: configuration.name.clone(),
-                            target: binding.target.clone(),
-                            command_timeout_ms: binding.command_timeout_ms,
-                            expected_revision: revision,
-                        })
-                        .map_err(invalid)?;
-                    revision = snapshot["revision"]
-                        .as_u64()
-                        .expect("component snapshot revision");
-                }
+            for entry in audit {
+                let operation = crate::audit::Operation::new(handle, entry.context);
+                crate::audit::management_result(
+                    &operation,
+                    entry.before,
+                    entry.after,
+                    &Ok(entry.snapshot),
+                );
             }
         }
+        let tcp = Arc::new(tcp);
         assert!(
             tcp.runtime
                 .set(crate::service::Runtime::new(
@@ -297,6 +272,73 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             Err(Box::new(errors))
         }
     }
+}
+
+struct StartupAudit {
+    context: serde_json::Value,
+    before: u64,
+    after: u64,
+    snapshot: serde_json::Value,
+}
+
+fn configure_processing(
+    config: &ServerConfig,
+    service: &MultiDeviceTcp,
+) -> Result<Vec<StartupAudit>, ConfigError> {
+    let mut audit = Vec::new();
+    let Some(processing) = &config.processing else {
+        return Ok(audit);
+    };
+    let audit_enabled = config.recording.as_ref().is_some_and(|r| r.audit_enabled);
+    let mut revision = 0; // This service owns a fresh Engine; no clients exist yet.
+    for component in &processing.components {
+        let configuration = &component.configuration;
+        let mut apply = |command, revision: &mut u64| -> Result<(), ConfigError> {
+            let context = audit_enabled.then(|| {
+                serde_json::json!({
+                    "source":"internal", "request":crate::audit::management_request(&command)
+                })
+            });
+            let snapshot = service
+                .manage(command)
+                .map_err(|message| ConfigError::Validation {
+                    field: format!("processing component {:?}", configuration.name),
+                    message,
+                })?;
+            let after = snapshot["revision"]
+                .as_u64()
+                .expect("component snapshot revision");
+            if let Some(context) = context {
+                audit.push(StartupAudit {
+                    context,
+                    before: *revision,
+                    after,
+                    snapshot,
+                });
+            }
+            *revision = after;
+            Ok(())
+        };
+        apply(
+            Management::Create {
+                configuration: configuration.clone(),
+                expected_revision: revision,
+            },
+            &mut revision,
+        )?;
+        if let Some(binding) = &component.binding {
+            apply(
+                Management::Bind {
+                    name: configuration.name.clone(),
+                    target: binding.target.clone(),
+                    command_timeout_ms: binding.command_timeout_ms,
+                    expected_revision: revision,
+                },
+                &mut revision,
+            )?;
+        }
+    }
+    Ok(audit)
 }
 
 #[derive(Default)]
