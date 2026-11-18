@@ -1,21 +1,27 @@
 use lab_server::{
-    config::ServerConfig,
+    config::{RecordingConfig, ServerConfig, WebSocketConfig},
     driver::{DeviceIo, Driver, DriverError},
-    model::{Observation, ParameterDescription, SourceMetadata, Spec, Value},
+    model::{ActionDescription, Observation, ParameterDescription, SourceMetadata, Spec, Value},
     observation_aggregator::AggregatorEvent,
+    recorder::Recorder,
     service::DeviceService,
     session::Session,
     startup::{DriverSetup, StartedServer, start_with},
 };
 use serde_json::{Value as Json, json};
 use std::{
-    io::{BufReader, Cursor},
+    io::{self, BufReader, Cursor},
+    net::TcpListener,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
+
+#[path = "support/recording_db.rs"]
+mod db;
+use db::{Database, scalar};
 
 const GRAPH: &str = r#"
 [[processing.components]]
@@ -96,17 +102,23 @@ fn start(
 ) -> Result<StartedServer, Box<dyn std::error::Error + Send + Sync>> {
     start_with(
         config,
-        |_| {
-            Ok(DriverSetup {
-                driver: Box::new(Source {
-                    reads: reads.clone(),
-                    writes: writes.clone(),
-                }),
-                post_open_delay: Duration::ZERO,
-            })
-        },
-        |_, _| Ok(BufReader::new(Cursor::new(Vec::<u8>::new()))),
+        |_| Ok(test_driver(reads, writes)),
+        |_, _| Ok(mock_port()),
     )
+}
+
+fn test_driver(reads: &Arc<AtomicUsize>, writes: &Arc<AtomicUsize>) -> DriverSetup {
+    DriverSetup {
+        driver: Box::new(Source {
+            reads: reads.clone(),
+            writes: writes.clone(),
+        }),
+        post_open_delay: Duration::ZERO,
+    }
+}
+
+fn mock_port() -> BufReader<Cursor<Vec<u8>>> {
+    BufReader::new(Cursor::new(Vec::new()))
 }
 
 fn request(service: &DeviceService, mut message: Json) -> Json {
@@ -254,7 +266,7 @@ fn startup_graph_is_identical_for_every_declaration_order() {
 }
 
 #[test]
-fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
+fn invalid_startup_aborts_before_open_and_reports_component_and_reason() {
     let cases = [
         (
             GRAPH.replace("\"ema\"", "\"missing\""),
@@ -297,6 +309,16 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
             "dependency_cycle",
         ),
         (
+            GRAPH.replace("furnace1/sample_temperature", "processing/loop/output"),
+            "loop",
+            "dependency_cycle",
+        ),
+        (
+            GRAPH.replace("processing/smooth/value", "processing/smooth/missing"),
+            "loop",
+            "unknown_or_non_numeric_input",
+        ),
+        (
             GRAPH.replace("input = \"furnace1", "typo = \"furnace1"),
             "smooth",
             "invalid_inputs",
@@ -330,6 +352,11 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
             "invalid_timeout",
         ),
         (
+            GRAPH.replace("command_timeout_ms = 1000", "command_timeout_ms = 10001"),
+            "loop",
+            "invalid_timeout",
+        ),
+        (
             GRAPH.replace("output_min = 0.0", "output_min = 100.0"),
             "loop",
             "invalid_limits",
@@ -341,9 +368,18 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
         ),
     ];
     for (graph, name, reason) in cases {
-        let reads = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::default();
         let writes = Arc::default();
-        let error = match start(&config(&graph), &reads, &writes) {
+        let mut opens = 0;
+        let result = start_with(
+            &config(&graph),
+            |_| Ok(test_driver(&reads, &writes)),
+            |_, _| {
+                opens += 1;
+                Ok(mock_port())
+            },
+        );
+        let error = match result {
             Ok(_) => panic!("accepted {name}: {reason}"),
             Err(error) => error.to_string(),
         };
@@ -351,6 +387,7 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
             error.contains(name) && error.contains(reason),
             "{name}: {reason}: {error}"
         );
+        assert_eq!(opens, 0, "{name}: {reason}");
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
@@ -359,12 +396,299 @@ fn invalid_startup_aborts_before_workers_and_reports_component_and_reason() {
 #[test]
 fn startup_uses_existing_instance_resource_limit() {
     let graph: String = (0..129).map(|i| format!("\n[[processing.components]]\nname='ema{i}'\ntype_id='ema'\nmax_age_ms=5000\n[processing.components.inputs]\ninput='furnace1/sample_temperature'\n")).collect();
-    let error = start(&config(&graph), &Arc::default(), &Arc::default())
-        .err()
-        .unwrap()
-        .to_string();
+    let mut opens = 0;
+    let error = start_with(
+        &config(&graph),
+        |_| Ok(test_driver(&Arc::default(), &Arc::default())),
+        |_, _| {
+            opens += 1;
+            Ok(mock_port())
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
     assert!(
         error.contains("ema128") && error.contains("invalid_instance"),
         "{error}"
     );
+    assert_eq!(opens, 0);
+}
+
+struct CatalogDriver {
+    parameters: Vec<ParameterDescription>,
+    actions: Vec<ActionDescription>,
+}
+
+impl Driver for CatalogDriver {
+    fn parameters(&self) -> Vec<ParameterDescription> {
+        self.parameters.clone()
+    }
+
+    fn actions(&self) -> Vec<ActionDescription> {
+        self.actions.clone()
+    }
+
+    fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
+        panic!("unexpected physical read");
+    }
+
+    fn write(&mut self, _: &str, _: &Value, _: &mut dyn DeviceIo) -> Result<(), DriverError> {
+        panic!("unexpected physical write");
+    }
+}
+
+#[test]
+fn startup_rejects_a_derived_signal_colliding_with_a_physical_key() {
+    let mut config = config(GRAPH);
+    config.devices[0].id = "processing".into();
+    let mut opens = 0;
+    let error = start_with(
+        &config,
+        |_| {
+            Ok(DriverSetup {
+                driver: Box::new(CatalogDriver {
+                    parameters: vec![ParameterDescription {
+                        id: "smooth/value".into(),
+                        spec: Spec::Boolean,
+                        unit: String::new(),
+                        writable: false,
+                        default_poll_period: None,
+                    }],
+                    actions: Vec::new(),
+                }),
+                post_open_delay: Duration::ZERO,
+            })
+        },
+        |_, _| {
+            opens += 1;
+            Ok(mock_port())
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        error.contains("smooth") && error.contains("signal_collision"),
+        "{error}"
+    );
+    assert_eq!(opens, 0);
+}
+
+#[test]
+fn physical_catalog_with_actions_must_fit_describe_even_without_components() {
+    let config = config("");
+    for (bytes, valid) in [(62 * 1024, true), (64 * 1024, false)] {
+        let mut opens = 0;
+        let result = start_with(
+            &config,
+            |_| {
+                Ok(DriverSetup {
+                    driver: Box::new(CatalogDriver {
+                        parameters: Vec::new(),
+                        actions: vec![ActionDescription {
+                            name: "reset".into(),
+                            description: "x".repeat(bytes),
+                        }],
+                    }),
+                    post_open_delay: Duration::ZERO,
+                })
+            },
+            |_, _| {
+                opens += 1;
+                Ok(mock_port())
+            },
+        );
+        if valid {
+            let server = result.unwrap();
+            let describe = request(server.backend(), json!({"op":"describe"}));
+            assert_eq!(describe["actions"][0]["key"], "furnace1/reset");
+            assert_eq!(opens, 1);
+        } else {
+            let error = result.err().unwrap().to_string();
+            assert!(
+                error.contains("describe catalog") && error.contains("catalog_capacity"),
+                "{error}"
+            );
+            assert_eq!(opens, 0);
+        }
+    }
+}
+
+#[test]
+fn valid_graph_is_ready_with_an_unavailable_port_and_no_early_io() {
+    let reads = Arc::default();
+    let writes = Arc::default();
+    let mut config = config(GRAPH);
+    let mut other = config.ports[0].clone();
+    other.id = "other_link".into();
+    other.name = "MOCK2".into();
+    config.ports.push(other);
+    config.ports.swap(0, 1);
+    let mut device = config.devices[0].clone();
+    device.id = "furnace2".into();
+    device.port = "other_link".into();
+    config.devices.push(device);
+    let mut opens = 0;
+    let server = start_with(
+        &config,
+        |_| Ok(test_driver(&reads, &writes)),
+        |port, _| {
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+            opens += 1;
+            if port.id == "other_link" {
+                Ok(mock_port())
+            } else {
+                Err(io::Error::other("mock port unavailable"))
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(opens, 2);
+    let service = server.backend();
+    assert_eq!(list(service)["revision"], 3);
+    assert_eq!(list(service)["instances"][0]["state"], "shadow");
+    let catalog = request(service, json!({"op":"describe"}));
+    for key in ["processing/loop/output", "furnace2/sample_temperature"] {
+        assert!(
+            catalog["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["key"] == key)
+        );
+    }
+    assert_eq!(
+        request(
+            service,
+            json!({"op":"get","key":"furnace1/sample_temperature"})
+        )["error"],
+        "runtime_unavailable"
+    );
+    drop(server);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+fn enable_recording(config: &mut ServerConfig, db: &Database) {
+    config.recording = Some(RecordingConfig {
+        enabled: true,
+        audit_enabled: true,
+        path: Some(db.0.clone()),
+        queue_capacity: None,
+        audit_queue_capacity: None,
+    });
+}
+
+#[test]
+fn invalid_graph_preserves_existing_database_and_leaves_tcp_and_websocket_addresses_free() {
+    let db = Database::new();
+    let session = Recorder::open(&db.0, 8)
+        .unwrap()
+        .shutdown()
+        .unwrap()
+        .session_id;
+    {
+        let c = db.connect();
+        c.execute(
+            "INSERT INTO measurements(session_id,port_id,global_key,local_source,completed_at_ns,unit,value_type,integer_value) VALUES (?1,'p','a/value','value',42,'','integer',17)",
+            [session],
+        ).unwrap();
+        c.execute(
+            "INSERT INTO audit_events(session_id,operation_id,sequence,registered_at_ns,kind,context_json,details_json) VALUES (?1,'1',1,42,'accepted','{}','{}')",
+            [session],
+        ).unwrap();
+    }
+    let original = std::fs::read(&db.0).unwrap();
+
+    // Create smooth successfully in memory, then fail the later binding.
+    let mut config = config(&GRAPH.replace("command_timeout_ms = 1000", "command_timeout_ms = 0"));
+    enable_recording(&mut config, &db);
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let websocket = TcpListener::bind("127.0.0.1:0").unwrap();
+    config.tcp.bind = tcp.local_addr().unwrap();
+    config.websocket = Some(WebSocketConfig {
+        enabled: true,
+        bind: Some(websocket.local_addr().unwrap()),
+        allowed_origins: Vec::new(),
+    });
+    // Even with the addresses occupied, validation must report the binding error.
+    let validate = || {
+        let error = start_with(
+            &config,
+            |_| Ok(test_driver(&Arc::default(), &Arc::default())),
+            |_, _| -> io::Result<BufReader<Cursor<Vec<u8>>>> {
+                panic!("invalid graph opened a physical port");
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("loop") && error.contains("invalid_timeout"),
+            "{error}"
+        );
+    };
+    validate();
+    drop((tcp, websocket));
+    validate();
+    let _tcp = TcpListener::bind(config.tcp.bind).unwrap();
+    let _websocket = TcpListener::bind(config.websocket.unwrap().bind.unwrap()).unwrap();
+    assert_eq!(std::fs::read(&db.0).unwrap(), original);
+    let c = db.connect();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM sessions"), 1);
+    assert_eq!(scalar(&c, "SELECT integer_value FROM measurements"), 17);
+    assert_eq!(scalar(&c, "SELECT registered_at_ns FROM audit_events"), 42);
+}
+
+#[test]
+fn successful_startup_audits_prepared_mutations_once_with_their_revisions() {
+    let db = Database::new();
+    let mut config = config(GRAPH);
+    config.processing.as_mut().unwrap().components.reverse();
+    enable_recording(&mut config, &db);
+    let server = start(&config, &Arc::default(), &Arc::default()).unwrap();
+    server.run_until(&AtomicBool::new(true)).unwrap();
+
+    let c = db.connect();
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sessions WHERE ended_at_ns IS NOT NULL"
+        ),
+        1
+    );
+    let mut statement = c.prepare(
+        "SELECT kind, json_extract(context_json, '$.request.command.action'),
+                json_extract(details_json, '$.revision_before'), json_extract(details_json, '$.revision_after')
+         FROM audit_events WHERE json_extract(context_json, '$.source')='internal'
+         AND json_extract(context_json, '$.request.op')='components' ORDER BY CAST(operation_id AS INTEGER), sequence"
+    ).unwrap();
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let expected = [("create", 0, 1), ("create", 1, 2), ("bind", 2, 3)]
+        .into_iter()
+        .flat_map(|(action, before, after)| {
+            [
+                ("accepted".to_owned(), action.to_owned(), None, None),
+                (
+                    "applied".to_owned(),
+                    action.to_owned(),
+                    Some(before),
+                    Some(after),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
 }

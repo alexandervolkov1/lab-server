@@ -604,7 +604,8 @@ impl DeviceService {
                     + 1
             })
             .sum::<usize>();
-        let catalog_budget = (64 * 1024usize).saturating_sub(actions_bytes.saturating_add(1024));
+        let catalog_budget =
+            crate::outbound::V1_OUTPUT_BYTES.saturating_sub(actions_bytes.saturating_add(1024));
         let continuity = Self::port_continuity(router.registry());
         Self {
             audit: std::sync::OnceLock::new(),
@@ -631,6 +632,16 @@ impl DeviceService {
             .lock()
             .unwrap()
             .startup_order(configurations)
+    }
+
+    pub(crate) fn validate_startup_catalog(&mut self) -> Result<(), &'static str> {
+        let catalog = self.processing.get_mut().unwrap().catalog();
+        let response = crate::session::describe_response(u64::MAX, &catalog, self.actions());
+        // Reserve the framing byte as the outbound queue does.
+        if response.len() >= crate::outbound::V1_OUTPUT_BYTES {
+            return Err("catalog_capacity");
+        }
+        Ok(())
     }
 
     fn physical_lineage(

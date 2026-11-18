@@ -2,6 +2,8 @@
 use std::collections::VecDeque;
 use std::io;
 
+pub(crate) const V1_OUTPUT_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum OutputError {
     InvalidLine,

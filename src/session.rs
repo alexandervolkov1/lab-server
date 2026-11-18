@@ -16,6 +16,50 @@ use requests::completion_json;
 pub use requests::{FinishedRequest, PendingRequests};
 pub use subscriptions::{SubscriptionChange, SubscriptionError, SubscriptionSet};
 
+pub(crate) fn describe_response(
+    id: u64,
+    catalog: &HashMap<String, ParameterDescription>,
+    mut actions: Vec<ActionDescription>,
+) -> String {
+    let mut descriptions: Vec<_> = catalog.values().collect();
+    descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+    let parameters: Vec<_> = descriptions
+        .into_iter()
+        .map(|description| {
+            let (kind, min, max, unit) = match &description.spec {
+                crate::model::Spec::Float { min, max } => {
+                    ("float", json!(min), json!(max), description.unit.as_str())
+                }
+                crate::model::Spec::Integer { min, max } => {
+                    ("integer", json!(min), json!(max), description.unit.as_str())
+                }
+                crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
+            };
+
+            json!({
+                "key": &description.id,
+                "type": kind,
+                "min": min,
+                "max": max,
+                "unit": unit,
+                "writable": description.writable,
+                "poll_period_ns": description
+                    .default_poll_period
+                    .map(|period| period.as_nanos())
+            })
+        })
+        .collect();
+
+    actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let actions: Vec<_> = actions
+        .into_iter()
+        .map(|action| json!({ "key": action.name, "description": action.description }))
+        .collect();
+
+    json!({"id": id, "status": "ok", "parameters": parameters, "actions": actions}).to_string()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnqueueError {
     Authority(&'static str),
@@ -334,57 +378,12 @@ impl<Input> SessionState<Input> {
         &mut self,
         id: u64,
         catalog: &HashMap<String, ParameterDescription>,
-        mut actions: Vec<ActionDescription>,
+        actions: Vec<ActionDescription>,
     ) -> io::Result<()> {
         if self.pending.contains_id(id) {
             return self.queue_error(id, "duplicate_id");
         }
-
-        let mut descriptions: Vec<_> = catalog.values().collect();
-        descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-
-        let parameters: Vec<_> = descriptions
-            .into_iter()
-            .map(|description| {
-                let (kind, min, max, unit) = match &description.spec {
-                    crate::model::Spec::Float { min, max } => {
-                        ("float", json!(min), json!(max), description.unit.as_str())
-                    }
-                    crate::model::Spec::Integer { min, max } => {
-                        ("integer", json!(min), json!(max), description.unit.as_str())
-                    }
-                    crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
-                };
-
-                json!({
-                    "key": &description.id,
-                    "type": kind,
-                    "min": min,
-                    "max": max,
-                    "unit": unit,
-                    "writable": description.writable,
-                    "poll_period_ns": description
-                        .default_poll_period
-                        .map(|period| period.as_nanos())
-                })
-            })
-            .collect();
-
-        actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        let actions: Vec<_> = actions
-            .into_iter()
-            .map(|action| json!({ "key": action.name, "description": action.description }))
-            .collect();
-
-        self.queue_response(
-            &json!({
-                "id": id,
-                "status": "ok",
-                "parameters": parameters,
-                "actions": actions
-            })
-            .to_string(),
-        )
+        self.queue_response(&describe_response(id, catalog, actions))
     }
 
     pub fn dispatch_subscription(

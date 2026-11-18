@@ -20,7 +20,7 @@ pub const PATH: &str = "/application/v1";
 pub const SUBPROTOCOL: &str = "lab-server.application.v1";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
-pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = crate::outbound::V1_OUTPUT_BYTES;
 // Largest Session text + frame header + reserved room for automatic control frames.
 pub const MAX_WRITE_BUFFER_BYTES: usize = MAX_OUTPUT_BYTES + 1024;
 pub const MAX_UPGRADE_BYTES: usize = 16 * 1024;

@@ -33,8 +33,9 @@ cargo run --release -- --config examples/arduino.toml
 
 ## Стартовые компоненты
 
-Необязательная секция `[[processing.components]]` задаёт экземпляры в порядке загрузки:
-сначала источник, затем его потребители. [examples/processing.toml](examples/processing.toml)
+Необязательная секция `[[processing.components]]` задаёт экземпляры в любом порядке.
+Сервер сначала создаёт источники, а затем их потребителей. Из готовых к созданию
+компонентов он выбирает первый по имени. [examples/processing.toml](examples/processing.toml)
 содержит EMA `smooth` (`tau = 2.0`) и PID `loop` с входом `processing/smooth/value`
 и привязкой к `furnace1/power`.
 
@@ -44,8 +45,8 @@ cargo run --release -- --config examples/processing.toml
 
 EMA начинает в Running, PID — в Shadow, физический выход остаётся Manual.
 Создание и binding не отправляют `set`, не обнуляют мощность и не включают Auto.
-Ошибочное объявление прерывает запуск с именем компонента и причиной до запуска
-workers и обслуживания клиентов. Открытие портов происходит на прежнем этапе подготовки.
+Ошибочное объявление прерывает запуск с именем компонента и причиной до открытия портов,
+привязки TCP/WebSocket и создания сеанса SQLite.
 Проверки выполняются обычными `Management::Create/Bind`; каждое успешное действие
 увеличивает ревизию (в примере итоговая ревизия 3). `expected_revision` и состояние
 в TOML не задаются. Компоненты видны через `components/list`, `describe`, `components/outputs`.

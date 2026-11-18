@@ -175,6 +175,11 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
         OBSERVATION_QUEUE_CAPACITY,
     );
     let audit = configure_processing(config, &tcp)?;
+    tcp.validate_startup_catalog()
+        .map_err(|reason| ConfigError::Validation {
+            field: "describe catalog".into(),
+            message: reason.into(),
+        })?;
 
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;

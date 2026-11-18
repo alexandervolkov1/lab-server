@@ -1,6 +1,7 @@
 //! TCP adapter for the shared multi-device service. No second backend or cache.
 use crate::connection::TcpConnection;
 use crate::fanout::ObservationReceiver;
+use crate::outbound::V1_OUTPUT_BYTES;
 use crate::service::DeviceService;
 use std::io;
 use std::net::TcpStream;
@@ -12,7 +13,7 @@ impl DeviceService {
     /// Run the configured server's TCP transport for one accepted socket.
     /// The listener owner must retain a ClientSlots permit for this connection.
     pub fn serve_connection(&self, stream: TcpStream) -> io::Result<()> {
-        let mut connection = TcpConnection::new(stream, 64, 64 * 1024)?;
+        let mut connection = TcpConnection::new(stream, 64, V1_OUTPUT_BYTES)?;
         let observations = self.register_client()?;
         loop {
             if self.drive_connection(&mut connection, &observations)? {
