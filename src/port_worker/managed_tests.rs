@@ -4,9 +4,15 @@ use crate::{
     device_registry::DeviceRegistry,
     output::Authority,
     pending::{Completion, Poll},
+    recorder::{Recorder, RecorderOptions},
+    recording_db,
+    service::DeviceService,
+    session::Session,
 };
+use serde_json::json;
 use std::io::{self, BufRead, Cursor, Read};
 use std::sync::{Barrier, atomic::AtomicUsize};
+use std::thread;
 
 const WAIT: Duration = Duration::from_secs(10);
 struct MemoryIo {
@@ -128,6 +134,157 @@ impl Fixture {
             _ => panic!("expected completed command"),
         }
     }
+}
+
+#[test]
+fn deadline_expires_while_waiting_for_output_permit() {
+    let mut f = Fixture::new(true, None);
+    let db = recording_db::Database::new();
+    let recorder = Recorder::with_options(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            measurements_enabled: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let service = DeviceService::new(f.router.clone(), 8);
+    service.enable_audit(recorder.handle());
+    let mut session = Session::new(8, 65536);
+    let request_at = Instant::now();
+    let deadline = request_at + Duration::from_secs(10); // Session's set timeout.
+    service
+        .receive_message(
+            &mut session,
+            r#"{"id":1,"op":"set","key":"a/power","value":3}"#,
+            request_at,
+        )
+        .unwrap();
+    let command = f.worker.commands.try_recv().unwrap();
+    thread::scope(|scope| {
+        let output = f.authority.hold_output("a/power");
+        let (notify, entered) = mpsc::channel();
+        let worker = &mut f.worker;
+        let execution = scope.spawn(move || {
+            crate::output::BEFORE_LEASES.set(Some(notify));
+            worker.execute(command);
+        });
+        // The worker has passed the initial deadline check and cannot acquire
+        // the output lease until this thread releases it.
+        assert!(entered.recv_timeout(WAIT).unwrap() < deadline);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(remaining);
+        }
+        drop(output);
+        execution.join().unwrap();
+    });
+
+    assert_eq!(f.bytes.load(Ordering::SeqCst), 0, "driver received write");
+    let snapshot = f.authority.snapshot();
+    let output = snapshot
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|slot| slot["key"] == "a/power")
+        .unwrap();
+    assert_eq!(output["in_flight"], 0);
+    assert_eq!(output["outcome_unknown"], false);
+    session.collect_ready(Instant::now()).unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+    assert_eq!(
+        reply,
+        json!({"id":1,"status":"error","error":"runtime_timeout"})
+    );
+
+    service
+        .receive_message(
+            &mut session,
+            r#"{"id":2,"op":"set","key":"a/power","value":4}"#,
+            Instant::now(),
+        )
+        .unwrap();
+    let next = f.worker.commands.try_recv().unwrap();
+    f.worker.execute(next);
+    assert_eq!(f.bytes.load(Ordering::SeqCst), 1);
+    session.collect_ready(Instant::now()).unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+    assert_eq!(reply, json!({"id":2,"status":"ok"}));
+    assert!(session.next_message().unwrap().is_none());
+
+    recorder.shutdown().unwrap();
+    let conn = db.connect();
+    let mut events = conn
+        .prepare(
+            "SELECT kind, json_extract(details_json, '$.error')
+             FROM audit_events WHERE json_extract(context_json, '$.request_id') = ?
+             ORDER BY sequence",
+        )
+        .unwrap();
+    let mut kinds = |id| {
+        events
+            .query_map([id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        kinds("1"),
+        [
+            ("accepted".into(), None),
+            ("cancelled".into(), None),
+            ("response".into(), Some("runtime_timeout".into())),
+        ]
+    );
+    assert_eq!(
+        kinds("2"),
+        [
+            ("accepted".into(), None),
+            ("started".into(), None),
+            ("completed".into(), None),
+            ("response".into(), None),
+        ]
+    );
+    assert_eq!(
+        recording_db::scalar(&conn, "SELECT audit_incomplete FROM sessions"),
+        0
+    );
+}
+
+#[test]
+fn output_permit_before_deadline_marks_write_in_flight() {
+    let (progress, driver) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let mut f = Fixture::new(true, Some(DriverGate { progress, resume }));
+    let pending = f
+        .router
+        .set(1, "a/power", Value::Integer(3), Instant::now() + WAIT)
+        .unwrap();
+
+    thread::scope(|scope| {
+        let worker = &mut f.worker;
+        let execution = scope.spawn(move || worker.execute(worker.commands.try_recv().unwrap()));
+        assert!(matches!(driver.recv_timeout(WAIT), Ok(Progress::Started)));
+        let in_flight = f
+            .authority
+            .snapshot()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|slot| slot["key"] == "a/power" && slot["in_flight"] == 1);
+        release.send(()).unwrap();
+        execution.join().unwrap();
+        assert!(in_flight);
+    });
+    assert!(matches!(
+        pending.poll(Instant::now()),
+        Poll::Finished(Completion::Received { value: Ok(()), .. })
+    ));
+    assert_eq!(f.bytes.load(Ordering::SeqCst), 1);
 }
 
 #[test]

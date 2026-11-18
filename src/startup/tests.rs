@@ -2,12 +2,10 @@ use super::*;
 use crate::driver::DriverError;
 use crate::model::{Observation, ParameterDescription, Spec, Value};
 use crate::recorder::{Hooks, RecorderError};
+use crate::recording_db::{Database, scalar};
 use std::io::{BufRead, Cursor, Write};
 use std::sync::atomic::AtomicU64;
 use std::time::{Instant, SystemTime};
-#[path = "../../tests/support/recording_db.rs"]
-mod db;
-use db::{Database, scalar};
 const WAIT: Duration = Duration::from_secs(10);
 
 fn wait_for(mut predicate: impl FnMut() -> bool) {

@@ -27,3 +27,7 @@ pub mod continuity;
 pub mod processing;
 
 pub mod output;
+
+#[cfg(test)]
+#[path = "../tests/support/recording_db.rs"]
+mod recording_db;

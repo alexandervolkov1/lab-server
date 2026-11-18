@@ -84,13 +84,11 @@ impl SetExecution {
         let mut state = self.state.lock().expect("execution lock poisoned");
         // Read the clock inside the lock: a waiter must not use a stale timestamp.
         if matches!(*state, ExecutionState::Queued) && Instant::now() < self.deadline {
-            if self
-                .permit
-                .lock()
-                .unwrap()
-                .as_mut()
-                .is_some_and(|p| !p.start())
-            {
+            let allowed = match self.permit.lock().unwrap().as_mut() {
+                Some(permit) => permit.start(self.deadline),
+                None => Instant::now() < self.deadline,
+            };
+            if !allowed {
                 return false;
             }
             *state = ExecutionState::Started;

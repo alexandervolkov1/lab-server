@@ -2,6 +2,13 @@
 use crate::model::{Spec, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static BEFORE_LEASES: std::cell::Cell<Option<std::sync::mpsc::Sender<Instant>>> = const { std::cell::Cell::new(None) };
+}
+
 pub type Owner = (String, u64);
 #[derive(Default)]
 struct State {
@@ -92,6 +99,10 @@ impl Authority {
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.slots.contains_key(key)
     }
+    #[cfg(test)]
+    pub(crate) fn hold_output(&self, key: &str) -> impl Drop + '_ {
+        self.slots[key].lock().unwrap()
+    }
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!(self.slots.iter().map(|(key,slot)|{let s=slot.lock().unwrap();serde_json::json!({"key":key,"mode":if s.owner.is_some(){"auto"}else{"manual"},"owner":s.owner,"generation":s.generation,"in_flight":s.active,"outcome_unknown":s.unknown})}).collect::<Vec<_>>())
     }
@@ -117,7 +128,7 @@ impl Permit {
         self.sources = sources;
         self
     }
-    pub(crate) fn start(&mut self) -> bool {
+    pub(crate) fn start(&mut self, deadline: Instant) -> bool {
         let _boundaries = self
             .sources
             .iter()
@@ -130,6 +141,12 @@ impl Permit {
         {
             return false;
         }
+        #[cfg(test)]
+        BEFORE_LEASES.with(|hook| {
+            if let Some(notify) = hook.take() {
+                notify.send(std::time::Instant::now()).unwrap();
+            }
+        });
         let mut states = self
             .leases
             .iter()
@@ -140,6 +157,10 @@ impl Permit {
             .zip(&self.leases)
             .any(|(s, (_, g))| s.generation != *g || (s.unknown && !self.manual) || s.active > 0)
         {
+            return false;
+        }
+        // Acquiring the source boundaries and output leases can outlast the deadline.
+        if Instant::now() >= deadline {
             return false;
         }
         for s in &mut states {
