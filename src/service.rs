@@ -18,6 +18,8 @@ use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 mod diagnostics;
 pub(crate) use diagnostics::Runtime;
 
+const COMPONENT_UNAVAILABLE: &str = "component_unavailable";
+
 struct Control {
     audit: Option<crate::audit::Operation>,
     owner: crate::output::Owner,
@@ -65,9 +67,10 @@ impl DeviceService {
             engine.fault(name, "shutdown");
         }
     }
-    fn reconcile_controls(&self, engine: &mut crate::processing::Engine) {
+    fn reconcile_controls(&self, engine: &mut crate::processing::Engine) -> bool {
         use crate::pending::{Completion, Poll};
         let mut controls = self.controls.lock().unwrap();
+        let mut invalidated = false;
         for (name, c) in controls.iter_mut() {
             if let Some(pending) = c.pending.take() {
                 match pending.poll(Instant::now()) {
@@ -117,6 +120,7 @@ impl DeviceService {
 
                         if state.is_some() && !expected_cancellation {
                             engine.fault(name, "output_failed");
+                            invalidated = true;
                         }
                         self.router.authority().release(&c.owner);
                     }
@@ -129,18 +133,20 @@ impl DeviceService {
         controls.retain(|name, c| {
             c.pending.is_some() || engine.state(name).is_some_and(|(_, inc)| inc == c.owner.1)
         });
+        invalidated
     }
-    fn submit_proposal(&self, name: &str, incarnation: u64, value: f64) {
+    /// An error means the submission faulted the controller and invalidated its outputs.
+    fn submit_proposal(&self, name: &str, incarnation: u64, value: f64) -> Result<(), String> {
         let mut engine = self.processing.lock().unwrap();
         if engine.state(name) != Some((crate::processing::State::Auto, incarnation)) {
-            return;
+            return Ok(());
         }
         let mut controls = self.controls.lock().unwrap();
         let Some(c) = controls.get_mut(name) else {
-            return;
+            return Ok(());
         };
         if c.owner.1 != incarnation || c.pending.is_some() {
-            return;
+            return Ok(());
         }
         let audit = self.audit.get().map(|recorder| {
             crate::audit::Operation::new(
@@ -212,6 +218,7 @@ impl DeviceService {
             Ok(p) => {
                 c.pending = Some(p);
                 c.audit = audit;
+                Ok(())
             }
             Err(reason) => {
                 if let Some(a) = audit {
@@ -219,6 +226,7 @@ impl DeviceService {
                 }
                 engine.fault(name, &reason);
                 self.router.authority().release(&c.owner);
+                Err(reason)
             }
         }
     }
@@ -481,11 +489,25 @@ impl DeviceService {
                 self.invalidate_cached(port, reason, &mut record)?;
             }
         }
-        self.reconcile_controls(&mut self.processing.lock().unwrap());
+        let mut invalidated = self.reconcile_controls(&mut self.processing.lock().unwrap());
         self.apply_physical_event(event)?;
-        for item in produced {
+
+        // Process proposals in graph order. A rejection faults dependent
+        // controllers before their proposals reach the admission check.
+        for item in &produced {
             if let Some((name, incarnation, value)) = &item.proposal {
-                self.submit_proposal(name, *incarnation, *value);
+                invalidated |= self.submit_proposal(name, *incarnation, *value).is_err();
+            }
+        }
+        let invalid = invalidated.then(|| self.processing.lock().unwrap().invalid_outputs());
+        for mut item in produced {
+            if invalid
+                .as_ref()
+                .is_some_and(|keys| keys.contains(&item.key))
+                && item.observation.reading.is_ok()
+            {
+                item.observation.reading = Err(COMPONENT_UNAVAILABLE.into());
+                item.observation.metadata = None;
             }
             let event = AggregatorEvent::Measurement {
                 port_id: "processing".into(),
@@ -500,6 +522,14 @@ impl DeviceService {
                 .unwrap()
                 .insert(item.key, observation.clone());
             self.fanout.publish(&observation)?;
+        }
+        if let Some(invalid) = invalid {
+            // Replace any older cached successes for signals absent from this batch.
+            self.invalidate_cached_matching(
+                |key| invalid.contains(key),
+                COMPONENT_UNAVAILABLE,
+                &mut record,
+            )?;
         }
         Ok(())
     }
@@ -523,13 +553,24 @@ impl DeviceService {
         let domains = engine.lineage(&physical);
         let invalid = engine.invalid_outputs();
         drop(engine);
+        self.invalidate_cached_matching(
+            |key| {
+                (port == "*" && invalid.contains(key))
+                    || domains.get(key).is_some_and(|d| d.contains(port))
+            },
+            reason,
+            record,
+        )
+    }
+    fn invalidate_cached_matching(
+        &self,
+        is_invalid: impl Fn(&str) -> bool,
+        reason: &str,
+        record: &mut impl FnMut(&AggregatorEvent),
+    ) -> io::Result<()> {
         let mut latest = self.latest.lock().unwrap();
         for (key, observation) in latest.iter_mut() {
-            if !self.catalog.contains_key(key)
-                && ((port == "*" && invalid.contains(key))
-                    || domains.get(key).is_some_and(|d| d.contains(port)))
-                && observation.reading.is_ok()
-            {
+            if !self.catalog.contains_key(key) && is_invalid(key) && observation.reading.is_ok() {
                 observation.reading = Err(reason.into());
                 observation.completed_at = std::time::SystemTime::now();
                 observation.metadata = None;
@@ -554,7 +595,7 @@ impl DeviceService {
             // A failed write may be the only event: do not wait for another
             // measurement to invalidate the controller's published diagnostics.
             let reason = if stale.is_empty() {
-                "component_unavailable"
+                COMPONENT_UNAVAILABLE
             } else {
                 "stale_input"
             };

@@ -142,6 +142,153 @@ fn create(f: &Fixture, name: &str, input: &str, revision: u64) {
 }
 
 #[test]
+fn rejected_controller_proposal_invalidates_the_batch_before_publication() {
+    use lab_server::pending::{Completion, Poll};
+    use lab_server::port_worker::StopReason;
+
+    let mut f = Fixture::new();
+    let database = audit_db::Database::new();
+    let recorder = Recorder::with_options(
+        &database.0,
+        RecorderOptions {
+            audit_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let recording = recorder.handle();
+    f.service.enable_audit(recording.clone());
+
+    let pid = |name, input| json!({"name":name,"type_id":"pid","inputs":{"input":input},"parameters":{"setpoint":150.,"output_max":200.},"max_age_ms":10000});
+    f.manage(json!({"action":"create","configuration":pid("root", "a/x"),"expected_revision":0}));
+    create(&f, "dependent_filter", "processing/root/output", 1);
+    f.manage(json!({"action":"create","configuration":pid("dependent", "processing/dependent_filter/value"),"expected_revision":2}));
+    create(&f, "independent", "a/x", 3);
+    f.manage(json!({"action":"bind","name":"root","target":"a/power","command_timeout_ms":10000,"expected_revision":4}));
+    f.manage(json!({"action":"bind","name":"dependent","target":"a/backup","command_timeout_ms":10000,"expected_revision":5}));
+    f.publish("a/x", 80.);
+    f.manage(json!({"action":"state","name":"root","state":"auto","expected_revision":6}));
+    f.manage(json!({"action":"state","name":"dependent","state":"auto","expected_revision":7}));
+
+    let keys = [
+        ("processing/root/p", false), // Computed before the proposal output.
+        ("processing/root/output", false),
+        ("processing/dependent_filter/value", false),
+        ("processing/dependent/output", false),
+        ("processing/independent/value", true),
+        ("a/x", true),
+    ];
+    let subscriptions = keys.map(|(key, _)| f.subscribe(key));
+    let mut recorded = Vec::new();
+    f.service
+        .apply_event_recorded(f.event("a/x", 20.), |event| {
+            recording.try_record(event.clone()).unwrap();
+            recorded.push(event.clone());
+        })
+        .unwrap();
+
+    let list = f.manage(json!({"action":"list"}));
+    for name in ["root", "dependent"] {
+        let controller = list["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["configuration"]["name"] == name)
+            .unwrap();
+        assert_eq!(controller["state"], "fault", "{name}");
+        assert_eq!(controller["fault"], "invalid_output", "{name}");
+    }
+    let mut session = Session::new(8, 65536);
+    for (index, ((key, valid), subscription)) in keys.into_iter().zip(subscriptions).enumerate() {
+        let recorded_sample = recorded
+            .iter()
+            .find_map(|event| match event {
+                AggregatorEvent::Measurement {
+                    global_key,
+                    observation,
+                    ..
+                } if global_key == key => Some(observation),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(recorded_sample.reading.is_ok(), valid, "recorded {key}");
+        let event = subscription.try_recv().unwrap();
+        assert_eq!(
+            event.observation.reading, recorded_sample.reading,
+            "subscription {key}"
+        );
+        assert!(matches!(subscription.try_recv(), Err(TryRecvError::Empty)));
+
+        f.service
+            .receive_message(
+                &mut session,
+                &json!({"id":index+1,"op":"get","key":key}).to_string(),
+                Instant::now(),
+            )
+            .unwrap();
+        let reply: Json = serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            reply["status"],
+            if valid { "ok" } else { "error" },
+            "get {key}"
+        );
+        if let Ok(Value::Float(value)) = recorded_sample.reading {
+            assert_eq!(reply["value"], value, "get {key}");
+        }
+    }
+
+    // A FIFO read behind the batch checks for attempted writes before shutdown.
+    // The fixture driver panics if either controller reaches write().
+    let port = &f.channels[0].commands;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut read = port.read(1, "a", "x", deadline).unwrap();
+    let worker = f._workers.remove(0);
+    let join = std::thread::spawn(move || worker.run());
+    loop {
+        match read.poll(Instant::now()) {
+            Poll::Waiting(pending) => {
+                read = pending;
+                std::thread::yield_now();
+            }
+            Poll::Finished(Completion::Received { value: Ok(_), .. }) => break,
+            _ => panic!("read behind rejected proposals failed"),
+        }
+    }
+    port.shutdown();
+    assert_eq!(join.join().unwrap(), StopReason::Shutdown);
+
+    recorder.shutdown().unwrap();
+    let db = database.connect();
+    let measures: Vec<(String, String)> = db
+        .prepare("SELECT global_key, value_type FROM measurements ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(measures.len(), recorded.len());
+    for (key, value_type) in measures {
+        assert_eq!(
+            value_type,
+            if matches!(key.as_str(), "a/x" | "processing/independent/value") {
+                "float"
+            } else {
+                "error"
+            },
+            "SQLite {key}"
+        );
+    }
+    let audit: Vec<(String, String, String)> = db.prepare(
+        "SELECT json_extract(context_json,'$.component'), kind, COALESCE(json_extract(details_json,'$.error'), '')
+         FROM audit_events WHERE json_extract(context_json,'$.source')='controller' ORDER BY id"
+    ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        audit,
+        [("root".into(), "rejected".into(), "invalid_output".into())]
+    );
+}
+
+#[test]
 fn stopping_controller_invalidates_its_graph_without_a_false_fault() {
     for auto in [false, true] {
         let f = Fixture::new();

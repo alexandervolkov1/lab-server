@@ -286,7 +286,49 @@ fn check_controller_writes(cases: &[(Option<&str>, WriteResult)]) {
                 )
                 .is_err()
         );
-        service.apply_event(event(2)).unwrap();
+        let successful_auto = stop.is_none() && write_result == Success;
+        let observations = successful_auto.then(|| {
+            let observations = service.register_client().unwrap();
+            observations
+                .interest
+                .set_keys(&["processing/loop/output".into()]);
+            observations
+        });
+        let mut recorded_output = None;
+        service
+            .apply_event_recorded(event(2), |event| {
+                if let AggregatorEvent::Measurement {
+                    global_key,
+                    observation,
+                    ..
+                } = event
+                    && global_key == "processing/loop/output"
+                {
+                    recorded_output = Some(observation.reading.clone());
+                }
+            })
+            .unwrap();
+        if let Some(observations) = observations {
+            // The physically rounded write is queued, and the worker has yet to start.
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+            assert_eq!(recorded_output, Some(Ok(Value::Float(2.5))));
+            assert_eq!(
+                observations.try_recv().unwrap().observation.reading,
+                Ok(Value::Float(2.5))
+            );
+            let mut session = Session::new(8, 65536);
+            service
+                .receive_message(
+                    &mut session,
+                    r#"{"id":1,"op":"get","key":"processing/loop/output"}"#,
+                    Instant::now(),
+                )
+                .unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+            assert_eq!(reply["status"], "ok");
+            assert_eq!(reply["value"], 2.5);
+        }
         let deadline = Instant::now() + Duration::from_millis(command_timeout);
         let stop_controller = || match stop {
             Some("shutdown") => service.stop_controls(),
