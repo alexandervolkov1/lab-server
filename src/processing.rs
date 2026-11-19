@@ -5,6 +5,8 @@ use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
+mod graph;
+
 pub type Parameters = BTreeMap<String, Json>;
 pub type Inputs = BTreeMap<String, Observation>;
 pub type Calculation = BTreeMap<String, f64>;
@@ -438,177 +440,6 @@ impl Engine {
         self.revision += 1;
         Ok(changed)
     }
-    fn validate_graph(
-        &self,
-        config: &Configuration,
-        desc: &TypeDescription,
-    ) -> Result<Vec<String>, String> {
-        Self::validate_inputs(config, desc)?;
-        let mut configs: BTreeMap<_, _> = self
-            .nodes
-            .iter()
-            .map(|(k, n)| (k.as_str(), (&n.config, &n.description)))
-            .collect();
-        configs.insert(&config.name, (config, desc));
-        let order = self.graph_order(&configs).map_err(|(_, reason)| reason)?;
-
-        // Reserve the existing v1 describe frame before accepting a larger graph.
-        // 256 covers scalar bounds, poll period, field names and punctuation.
-        let cost = |key: &str, unit: &str| {
-            256 + json!(key).to_string().len() + json!(unit).to_string().len()
-        };
-        let mut bytes = self
-            .physical
-            .values()
-            .map(|p| cost(&p.id, &p.unit))
-            .sum::<usize>();
-        let mut units = self
-            .physical
-            .iter()
-            .map(|(k, p)| (k.clone(), p.unit.clone()))
-            .collect::<HashMap<_, _>>();
-        for name in &order {
-            let (c, d) = configs[name];
-            let inherited = c
-                .inputs
-                .values()
-                .next()
-                .and_then(|k| units.get(k))
-                .cloned()
-                .unwrap_or_default();
-            for o in &d.outputs {
-                let key = signal(name, &o.name);
-                let unit = o.unit.clone().unwrap_or_else(|| inherited.clone());
-                bytes = bytes.saturating_add(cost(&key, &unit));
-                units.insert(key, unit);
-            }
-        }
-        if bytes > self.catalog_budget {
-            return Err("catalog_capacity".into());
-        }
-        Ok(order.into_iter().map(str::to_owned).collect())
-    }
-
-    /// Order a set of declarations before adding them through the usual create path.
-    pub(crate) fn startup_order<'a>(
-        &self,
-        configurations: impl IntoIterator<Item = &'a Configuration>,
-    ) -> Result<Vec<usize>, (&'a str, &'static str)> {
-        let mut components = BTreeMap::new();
-        for (index, config) in configurations.into_iter().enumerate() {
-            let name = config.name.as_str();
-            if !identifier(name)
-                || components.len() >= MAX_COMPONENTS
-                || components.contains_key(name)
-            {
-                return Err((name, "invalid_instance"));
-            }
-            let description = self
-                .registry
-                .factory(&config.type_id)
-                .map_err(|reason| (name, reason))?
-                .describe();
-            Self::validate_inputs(config, &description).map_err(|reason| (name, reason))?;
-            components.insert(name, (index, config, description));
-        }
-        let graph = components
-            .iter()
-            .map(|(&name, (_, config, description))| (name, (*config, description)))
-            .collect();
-        Ok(self
-            .graph_order(&graph)?
-            .into_iter()
-            .map(|name| components[name].0)
-            .collect())
-    }
-
-    fn validate_inputs(config: &Configuration, desc: &TypeDescription) -> Result<(), &'static str> {
-        if config.max_age_ms == 0
-            || config.max_age_ms > 86_400_000
-            || config.inputs.keys().cloned().collect::<BTreeSet<_>>()
-                != desc.inputs.iter().cloned().collect()
-        {
-            return Err("invalid_inputs");
-        }
-        Ok(())
-    }
-
-    fn graph_order<'a>(
-        &self,
-        configs: &BTreeMap<&'a str, (&Configuration, &TypeDescription)>,
-    ) -> Result<Vec<&'a str>, (&'a str, &'static str)> {
-        let mut owners = HashMap::new();
-        for (&name, (_, d)) in configs {
-            for o in &d.outputs {
-                let key = signal(name, &o.name);
-                if self.physical.contains_key(&key) || owners.insert(key, name).is_some() {
-                    return Err((name, "signal_collision"));
-                }
-            }
-        }
-        let mut dependencies = BTreeMap::new();
-        for (&name, (c, _)) in configs {
-            let mut edges = BTreeSet::new();
-            for key in c.inputs.values() {
-                if let Some(&owner) = owners.get(key) {
-                    edges.insert(owner);
-                } else if !self.physical.get(key).is_some_and(|p| {
-                    !matches!(p.spec, Spec::Boolean) && p.default_poll_period.is_some()
-                }) {
-                    return Err((name, "unknown_or_non_numeric_input"));
-                }
-            }
-            dependencies.insert(name, edges);
-        }
-        let mut order = Vec::new();
-        while !dependencies.is_empty() {
-            // BTreeMap iteration chooses the lexicographically first ready node.
-            let Some(name) = dependencies
-                .iter()
-                .find(|(_, e)| e.is_empty())
-                .map(|(&name, _)| name)
-            else {
-                // Follow the remaining edges to report a member of the cycle,
-                // even when the first blocked node only depends on it.
-                let mut visited = BTreeSet::new();
-                let mut name = *dependencies.first_key_value().unwrap().0;
-                while visited.insert(name) {
-                    name = *dependencies[name].first().unwrap();
-                }
-                return Err((name, "dependency_cycle"));
-            };
-            dependencies.remove(name);
-            for edges in dependencies.values_mut() {
-                edges.remove(name);
-            }
-            order.push(name);
-        }
-        Ok(order)
-    }
-    pub fn dependents(&self, name: &str) -> Vec<String> {
-        let mut names = BTreeSet::from([name.to_owned()]);
-        loop {
-            let before = names.len();
-            for (id, n) in &self.nodes {
-                if n.config.inputs.values().any(|key| {
-                    names.iter().any(|name| {
-                        self.nodes.get(name).is_some_and(|n| {
-                            n.description
-                                .outputs
-                                .iter()
-                                .any(|o| signal(name, &o.name) == *key)
-                        })
-                    })
-                }) {
-                    names.insert(id.clone());
-                }
-            }
-            if names.len() == before {
-                break;
-            }
-        }
-        names.into_iter().collect()
-    }
     pub fn remove(
         &mut self,
         name: &str,
@@ -698,27 +529,6 @@ impl Engine {
             }
         }
         catalog
-    }
-    pub fn lineage(
-        &self,
-        physical: &HashMap<String, BTreeSet<String>>,
-    ) -> HashMap<String, BTreeSet<String>> {
-        let mut domains = physical.clone();
-        for name in &self.order {
-            let n = &self.nodes[name];
-            let ports = n
-                .config
-                .inputs
-                .values()
-                .filter_map(|k| domains.get(k))
-                .flatten()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            for o in &n.description.outputs {
-                domains.insert(signal(name, &o.name), ports.clone());
-            }
-        }
-        domains
     }
     fn invalidate_nodes(&mut self, names: &[String], reason: &str, update: FaultUpdate) {
         let names: BTreeSet<_> = names.iter().flat_map(|n| self.dependents(n)).collect();
