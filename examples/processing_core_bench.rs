@@ -265,7 +265,42 @@ fn measure(shape: Shape, nodes: usize) {
     );
 }
 
+fn compare_dependents() {
+    println!("shape,nodes,position,reachable,calls_per_sample,median_us");
+    for shape in [Shape::Chain, Shape::Branching] {
+        for nodes in [8, 32, 128] {
+            let engine = make_engine(shape, nodes);
+            let middle = match shape {
+                Shape::Chain => nodes / 2,
+                Shape::Branching => nodes / 4,
+            };
+            let calls = (16_384 / (nodes * nodes)).clamp(24, 512);
+            for (position, index) in [("root", 0), ("intermediate", middle), ("leaf", nodes - 1)] {
+                let name = node_name(index);
+                let reachable = engine.dependents(&name).len();
+                match position {
+                    "root" => assert_eq!(reachable, nodes),
+                    "leaf" => assert_eq!(reachable, 1),
+                    _ => assert!((2..nodes).contains(&reachable)),
+                }
+                let median = steady(calls, || {
+                    black_box(engine.dependents(black_box(&name)));
+                });
+                println!(
+                    "{},{nodes},{position},{reachable},{calls},{median:.3}",
+                    shape.label()
+                );
+            }
+        }
+    }
+}
+
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("--dependents-comparison") => return compare_dependents(),
+        Some(argument) => panic!("unknown argument {argument}"),
+        None => {}
+    }
     println!(
         "shape,nodes,setup_us,first_process_us,process_us,components_us,catalog_us,lineage_us,dependents_us,configure_us"
     );

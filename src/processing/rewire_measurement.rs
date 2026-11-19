@@ -155,6 +155,17 @@ fn series(nodes: usize) -> Vec<Sample> {
     let summary = recorder.shutdown().unwrap();
     assert_eq!(summary.audit_records, (2 * (WARMUP + SAMPLES)) as u64);
     assert_eq!(summary.losses.dropped_audit_events, 0);
+    let db = db.connect();
+    let fault_transitions = crate::recording_db::scalar(
+        &db,
+        "SELECT count(*) FROM audit_events
+         WHERE kind='applied'
+           AND json_extract(context_json,'$.request.reason')='input_changed'
+           AND json_extract(details_json,'$.state_before')='shadow'
+           AND json_extract(details_json,'$.state_after')='fault'
+           AND json_extract(details_json,'$.revision_before')=json_extract(details_json,'$.revision_after')",
+    );
+    assert_eq!(fault_transitions, (WARMUP + SAMPLES) as i64);
     samples
 }
 
