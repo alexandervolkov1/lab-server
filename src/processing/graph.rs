@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::json;
 
-use super::{Configuration, Engine, MAX_COMPONENTS, TypeDescription, identifier, signal};
+use super::schema::identifier;
+use super::{Configuration, Engine, MAX_COMPONENTS, TypeDescription, signal};
 use crate::model::Spec;
 
 impl Engine {
