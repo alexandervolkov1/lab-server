@@ -59,7 +59,14 @@ impl Engine {
     }
 
     pub(super) fn invalidate_nodes(&mut self, names: &[String], reason: &str, update: FaultUpdate) {
-        let names: BTreeSet<_> = names.iter().flat_map(|n| self.dependents(n)).collect();
+        let names: BTreeSet<_> = {
+            #[cfg(test)]
+            let _span =
+                super::rewire_measurement::span(super::rewire_measurement::Phase::SecondDependents);
+            names.iter().flat_map(|n| self.dependents(n)).collect()
+        };
+        #[cfg(test)]
+        let _span = super::rewire_measurement::span(super::rewire_measurement::Phase::Invalidate);
         for name in names {
             self.invalidate_node(&name, reason, update);
         }

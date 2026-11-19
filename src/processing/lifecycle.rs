@@ -172,7 +172,16 @@ impl Engine {
         }
         let name = config.name.clone();
         let changed = if rewire {
-            self.dependents(&name)
+            let dependents = {
+                #[cfg(test)]
+                let _span = super::rewire_measurement::span(
+                    super::rewire_measurement::Phase::FirstDependents,
+                );
+                self.dependents(&name)
+            };
+            #[cfg(test)]
+            let _span = super::rewire_measurement::span(super::rewire_measurement::Phase::Changed);
+            dependents
                 .iter()
                 .flat_map(|name| {
                     self.nodes[name]

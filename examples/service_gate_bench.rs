@@ -560,9 +560,27 @@ fn print_row(scenario: Scenario, nodes: usize, repeat: usize, rounds: u64, metri
 }
 
 fn main() {
+    let comparison = match std::env::args().nth(1).as_deref() {
+        None => false,
+        Some("--rewire-comparison") => true,
+        Some(argument) => panic!("unknown argument {argument}"),
+    };
     println!(
         "scenario,nodes,repeat,rounds,operation,count,wait_p50_us,wait_p95_us,wait_p99_us,wait_max_us,total_wait_us,hold_p50_us,hold_p95_us,hold_p99_us,hold_max_us,total_hold_us"
     );
+    if comparison {
+        for nodes in [8, 32, 128] {
+            for scenario in [
+                Scenario::Baseline,
+                Scenario::Requests,
+                Scenario::Retune,
+                Scenario::Rewire,
+            ] {
+                run_case(scenario, nodes, 1);
+            }
+        }
+        return;
+    }
     for nodes in [1, 8, 32, 128] {
         for scenario in [
             Scenario::Baseline,
