@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::schema::identifier;
 use super::{Configuration, Engine, MAX_COMPONENTS, TypeDescription, signal};
-use crate::model::Spec;
+use crate::model::{ParameterDescription, Spec};
+use std::time::Duration;
 
 impl Engine {
     pub(super) fn validate_graph(
@@ -201,5 +202,37 @@ impl Engine {
             }
         }
         domains
+    }
+
+    pub fn catalog(&self) -> HashMap<String, ParameterDescription> {
+        let mut catalog = self.physical.clone();
+        for name in &self.order {
+            let node = &self.nodes[name];
+            let unit = node
+                .config
+                .inputs
+                .values()
+                .next()
+                .and_then(|k| catalog.get(k))
+                .map(|p| p.unit.clone())
+                .unwrap_or_default();
+            for output in &node.description.outputs {
+                let id = signal(name, &output.name);
+                catalog.insert(
+                    id.clone(),
+                    ParameterDescription {
+                        id,
+                        spec: Spec::Float {
+                            min: -f64::MAX,
+                            max: f64::MAX,
+                        },
+                        unit: output.unit.clone().unwrap_or_else(|| unit.clone()),
+                        writable: false,
+                        default_poll_period: Some(Duration::from_millis(1)),
+                    },
+                );
+            }
+        }
+        catalog
     }
 }

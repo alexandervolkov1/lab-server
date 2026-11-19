@@ -1,7 +1,8 @@
 //! Component configuration, state transitions and management snapshots.
 
+use super::execution::FaultUpdate;
 use super::schema::{identifier, validate};
-use super::{Configuration, Engine, FaultUpdate, Instance, Kind, MAX_COMPONENTS, State, signal};
+use super::{Configuration, Engine, Instance, Kind, MAX_COMPONENTS, State, signal};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeSet;
