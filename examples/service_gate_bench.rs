@@ -10,7 +10,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use lab_server::command_router::CommandRouter;
 use lab_server::device_registry::DeviceRegistry;
 use lab_server::driver::{DeviceIo, Driver, DriverError};
-use lab_server::model::{Observation, ParameterDescription, SourceMetadata, Spec, Value};
+use lab_server::model::{
+    ActionDescription, Observation, ParameterDescription, SourceMetadata, Spec, Value,
+};
 use lab_server::observation_aggregator::AggregatorEvent;
 use lab_server::port_worker::{DeviceInstance, PortChannels, PortWorker};
 use lab_server::processing::{Configuration, Management, Parameters, signal};
@@ -19,6 +21,9 @@ use lab_server::session::Session;
 use lab_server::websocket::{self, MAX_OUTPUT_BYTES, PATH, SUBPROTOCOL};
 use serde_json::{Value as Json, json};
 use tungstenite::{Message, WebSocket, client::IntoClientRequest};
+
+#[path = "service_gate_bench/session_requests.rs"]
+mod session_requests;
 
 const ROUNDS: u64 = 256;
 const NETWORK_ROUNDS: u64 = 64;
@@ -68,11 +73,13 @@ impl Scenario {
     }
 }
 
-struct Mock;
+struct Mock {
+    request_catalog: bool,
+}
 
 impl Driver for Mock {
     fn parameters(&self) -> Vec<ParameterDescription> {
-        vec![ParameterDescription {
+        let mut parameters = vec![ParameterDescription {
             id: "value".into(),
             spec: Spec::Float {
                 min: 0.0,
@@ -81,7 +88,27 @@ impl Driver for Mock {
             unit: "C".into(),
             writable: false,
             default_poll_period: Some(Duration::from_millis(10)),
-        }]
+        }];
+        if self.request_catalog {
+            parameters.push(ParameterDescription {
+                id: "unseeded".into(),
+                ..parameters[0].clone()
+            });
+        }
+        parameters
+    }
+
+    fn actions(&self) -> Vec<ActionDescription> {
+        if self.request_catalog {
+            ["z_reset", "a_reset"]
+                .map(|name| ActionDescription {
+                    name: name.into(),
+                    description: format!("Mock {name}"),
+                })
+                .into()
+        } else {
+            vec![]
+        }
     }
 
     fn read(&mut self, _: &str, _: &mut dyn DeviceIo) -> Result<Value, DriverError> {
@@ -123,7 +150,11 @@ struct IdlePort {
 
 impl Fixture {
     fn new(scenario: Scenario, nodes: usize) -> (Self, IdlePort) {
-        let device = DeviceInstance::new("device", Mock).unwrap();
+        Self::with_catalog(scenario, nodes, false)
+    }
+
+    fn with_catalog(scenario: Scenario, nodes: usize, request_catalog: bool) -> (Self, IdlePort) {
+        let device = DeviceInstance::new("device", Mock { request_catalog }).unwrap();
         let (worker, channels) =
             PortWorker::new(BufReader::new(Cursor::new(vec![])), vec![device], 8, 8).unwrap();
         let mut registry = DeviceRegistry::new();
@@ -358,6 +389,10 @@ impl Peer {
     }
 
     fn receive(&mut self) -> Json {
+        self.with_received_text(|text| serde_json::from_str(text).unwrap())
+    }
+
+    fn with_received_text<T>(&mut self, receive: impl FnOnce(&str) -> T) -> T {
         match self {
             Self::Tcp(stream) => {
                 let mut line = String::new();
@@ -365,13 +400,13 @@ impl Peer {
                     stream.read_line(&mut line).unwrap() > 0,
                     "unexpected TCP EOF"
                 );
-                serde_json::from_str(&line).unwrap()
+                receive(line.strip_suffix('\n').unwrap())
             }
             Self::WebSocket(socket) => {
                 let Message::Text(text) = socket.read().unwrap() else {
                     panic!("expected WebSocket text");
                 };
-                serde_json::from_str(&text).unwrap()
+                receive(&text)
             }
         }
     }
@@ -401,6 +436,18 @@ fn loopback_pair() -> (TcpStream, TcpStream) {
     (peer, server)
 }
 
+fn websocket_peer(stream: TcpStream) -> Peer {
+    let mut request = format!("ws://{}{PATH}", stream.peer_addr().unwrap())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().unwrap());
+    let (socket, reply) = tungstenite::client(request, stream).unwrap();
+    assert_eq!(reply.headers()["sec-websocket-protocol"], SUBPROTOCOL);
+    Peer::WebSocket(Box::new(socket))
+}
+
 fn network(fixture: &Fixture, subscribed: bool, offset: u64, rounds: u64) {
     let barrier = Barrier::new(3);
     let stop = AtomicBool::new(false);
@@ -412,18 +459,7 @@ fn network(fixture: &Fixture, subscribed: bool, offset: u64, rounds: u64) {
         scope.spawn(move || {
             websocket::serve_connection(ws_server, &fixture.service, &[], stop).unwrap()
         });
-        let mut request = format!("ws://{}{PATH}", ws_peer.peer_addr().unwrap())
-            .into_client_request()
-            .unwrap();
-        request
-            .headers_mut()
-            .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().unwrap());
-        let (socket, reply) = tungstenite::client(request, ws_peer).unwrap();
-        assert_eq!(reply.headers()["sec-websocket-protocol"], SUBPROTOCOL);
-        let mut peers = [
-            Peer::Tcp(BufReader::new(tcp_peer)),
-            Peer::WebSocket(Box::new(socket)),
-        ];
+        let mut peers = [Peer::Tcp(BufReader::new(tcp_peer)), websocket_peer(ws_peer)];
         if subscribed {
             for peer in &mut peers {
                 peer.send(json!({"id":1,"op":"subscribe","key":fixture.last_key}));
@@ -563,6 +599,8 @@ fn main() {
     let comparison = match std::env::args().nth(1).as_deref() {
         None => false,
         Some("--rewire-comparison") => true,
+        Some("--session-request-phases") => return session_requests::benchmark(),
+        Some("--session-request-calibration") => return session_requests::calibrate(),
         Some(argument) => panic!("unknown argument {argument}"),
     };
     println!(
