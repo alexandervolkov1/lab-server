@@ -194,6 +194,26 @@ fn compare_signal_lookup(engine: &Engine) {
 }
 
 #[test]
+fn signal_lookup_for_chain_tree_and_independent_branches_up_to_capacity() {
+    for size in [8, 32, 128] {
+        for shape in ["chain", "tree", "independent"] {
+            let mut engine = test_engine();
+            compare_signal_lookup(&engine);
+            for i in 0..size {
+                let input = if i == 0 || shape == "independent" {
+                    MAIN.into()
+                } else {
+                    let parent = if shape == "tree" { (i - 1) / 2 } else { i - 1 };
+                    signal(&format!("node{parent}"), "o0")
+                };
+                add(&mut engine, &format!("node{i}"), &[&input], 1);
+                compare_signal_lookup(&engine);
+            }
+        }
+    }
+}
+
+#[test]
 fn signal_lookup_preserves_exact_physical_keys_even_when_they_look_derived() {
     let mut physical = physical();
     for key in [
@@ -357,11 +377,13 @@ fn rewire_and_cascade_use_legacy_order_and_preserve_the_separate_branch() {
         })
         .collect();
     let before = engine.list();
+    compare_signal_lookup(&engine);
     assert_eq!(
         engine.remove("z_root", false, engine.revision),
         Err("has_dependents".into())
     );
     assert_eq!(engine.list(), before);
+    compare_signal_lookup(&engine);
 
     let changed = engine
         .configure_with_changes(
@@ -408,6 +430,7 @@ fn reachability_ignores_controller_state_and_watchdog_preserves_inactive_causes(
             .unwrap();
     }
     let now = Instant::now();
+    compare_signal_lookup(&engine); // Running and Shadow exist before any observation.
     engine.process(
         MAIN.into(),
         Observation {

@@ -20,6 +20,7 @@ enum Workload {
     GetPhysical,
     GetDerived,
     GetNoData,
+    GetDerivedNoData,
     GetUnknown,
     Describe,
     Mixed,
@@ -43,6 +44,7 @@ impl Workload {
             Self::GetPhysical => "get_physical",
             Self::GetDerived => "get_derived",
             Self::GetNoData => "get_no_data",
+            Self::GetDerivedNoData => "get_derived_no_data",
             Self::GetUnknown => "get_unknown_key",
             Self::Describe => "describe",
             Self::Mixed => "mixed",
@@ -64,7 +66,7 @@ impl Workload {
     fn key(self, fixture: &Fixture) -> &str {
         match self {
             Self::GetPhysical => PHYSICAL,
-            Self::GetDerived => &fixture.last_key,
+            Self::GetDerived | Self::GetDerivedNoData => &fixture.last_key,
             Self::GetNoData => UNSEEDED,
             Self::GetUnknown => MISSING,
             _ => unreachable!("only get needs a key"),
@@ -80,7 +82,7 @@ impl Workload {
         json.to_string()
     }
 
-    fn check(self, fixture: &Fixture, id: u64, raw: &str, extended: bool) {
+    fn check(self, fixture: &Fixture, id: u64, raw: &str, extended: bool) -> Option<u64> {
         let reply: Json = serde_json::from_str(raw).unwrap();
         assert_eq!(reply["id"], id, "{reply}");
         match self {
@@ -88,14 +90,24 @@ impl Workload {
                 reply,
                 json!({"id":id,"status":"error","error":"unknown_key"})
             ),
-            Self::GetNoData => {
-                assert_eq!(reply, json!({"id":id,"status":"no_data","key":UNSEEDED}))
+            Self::GetNoData | Self::GetDerivedNoData => {
+                assert_eq!(
+                    reply,
+                    json!({"id":id,"status":"no_data","key":self.key(fixture)})
+                )
             }
             Self::Ping => assert_eq!(reply, json!({"id":id,"status":"ok"})),
             Self::GetPhysical | Self::GetDerived => {
                 assert_eq!(reply["status"], "ok", "{reply}");
                 assert_eq!(reply["key"], self.key(fixture));
                 assert!(reply["value"].as_f64().is_some_and(f64::is_finite));
+                assert!((0.0..=99.0).contains(&reply["value"].as_f64().unwrap()));
+                if self == Self::GetPhysical {
+                    assert_eq!(
+                        reply["value"].as_f64().unwrap(),
+                        (reply["completed_at_unix_ms"].as_u64().unwrap() % 100) as f64
+                    );
+                }
             }
             Self::Describe => {
                 assert_eq!(reply["status"], "ok", "{reply}");
@@ -122,6 +134,7 @@ impl Workload {
             }
             Self::Mixed => unreachable!("mixed expands to individual requests"),
         }
+        reply["completed_at_unix_ms"].as_u64()
     }
 }
 
@@ -252,6 +265,7 @@ fn direct(
                 scope.spawn(move || {
                     let mut session = Session::new(1, MAX_OUTPUT_BYTES);
                     let mut replies = Replies::new();
+                    let mut previous = 0;
                     record(metrics, || {
                         each_round(start, rounds, |id| {
                             let op = workload.operation(mode, client, id);
@@ -261,7 +275,15 @@ fn direct(
                                 .receive_message(&mut session, &frame, Instant::now())
                                 .unwrap();
                             let response = session.next_message().unwrap().unwrap();
-                            op.check(fixture, id, &response, extended);
+                            if let Some(sequence) = op.check(fixture, id, &response, extended) {
+                                assert!(sequence >= previous);
+                                previous = sequence;
+                                if mode.produces() {
+                                    assert!((offset + id - 1..=offset + id).contains(&sequence));
+                                } else {
+                                    assert_eq!(sequence, 1);
+                                }
+                            }
                             assert!(session.next_message().unwrap().is_none());
                             replies.record(&response, fingerprint && op == Workload::Describe);
                         })
@@ -318,7 +340,9 @@ fn loopback(
             }
             peer.with_received_text(|response| {
                 rtts.push(sent.elapsed().as_nanos().try_into().unwrap());
-                workload.check(fixture, id, response, true);
+                if let Some(sequence) = workload.check(fixture, id, response, true) {
+                    assert_eq!(sequence, 1);
+                }
                 replies.record(response, fingerprint && workload == Workload::Describe);
             });
         }
@@ -401,7 +425,10 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, record
     };
     let (mut fixture, _port) =
         Fixture::with_catalog(Scenario::Requests, nodes, workload != Workload::Mixed);
-    fixture.produce(&Barrier::new(1), 0, 1);
+    let seeded = workload != Workload::GetDerivedNoData;
+    if seeded {
+        fixture.produce(&Barrier::new(1), 0, 1);
+    }
     if mode.network() {
         loopback(&fixture, workload, mode, WARMUP, None, false);
     } else {
@@ -460,11 +487,15 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, record
             "id":1,"op":"get","key":fixture.last_key
         }),
     );
-    assert_eq!(cached["status"], "ok");
-    assert_eq!(
-        cached["completed_at_unix_ms"],
-        offset + if mode.produces() { rounds } else { 0 }
-    );
+    if seeded {
+        assert_eq!(cached["status"], "ok");
+        assert_eq!(
+            cached["completed_at_unix_ms"],
+            offset + if mode.produces() { rounds } else { 0 }
+        );
+    } else {
+        assert_eq!(cached["status"], "no_data");
+    }
 
     let report = Report {
         nodes,
@@ -480,6 +511,28 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, record
     }
     if let Some(metrics) = metrics {
         let phases = metrics.snapshot();
+        let count = |name| {
+            phases
+                .iter()
+                .find(|m| m.phase == name)
+                .map_or(0, |m| m.count)
+        };
+        let operations = (0..mode.clients())
+            .flat_map(|client| (1..=rounds).map(move |id| workload.operation(mode, client, id)));
+        let gets = operations
+            .clone()
+            .filter(|op| {
+                !matches!(
+                    op,
+                    Workload::Ping | Workload::Describe | Workload::GetUnknown
+                )
+            })
+            .count() as u64;
+        assert_eq!(count("availability"), gets);
+        assert_eq!(
+            count("snapshot_build"),
+            operations.filter(|op| *op != Workload::Ping).count() as u64
+        );
         for expected in ["parse", "dispatch", "response"] {
             assert_eq!(
                 phases.iter().find(|m| m.phase == expected).unwrap().count,
@@ -574,6 +627,41 @@ pub(super) fn compare_describe(pair: usize) {
             }
             for mode in [Mode::Tcp, Mode::WebSocket] {
                 run_trial(nodes, workload, mode, pair, recording);
+            }
+        }
+    }
+}
+
+pub(super) fn compare_get(pair: usize) {
+    print_header(false);
+    for nodes in [8, 32, 128] {
+        for mode in [
+            Mode::Solo,
+            Mode::WithProducer,
+            Mode::Many,
+            Mode::Tcp,
+            Mode::WebSocket,
+        ] {
+            run_trial(nodes, Workload::GetDerived, mode, pair, Recording::Phases);
+        }
+        run_trial(
+            nodes,
+            Workload::GetDerivedNoData,
+            Mode::Solo,
+            pair,
+            Recording::Phases,
+        );
+        run_trial(
+            nodes,
+            Workload::GetUnknown,
+            Mode::Solo,
+            pair,
+            Recording::Phases,
+        );
+        run_trial(nodes, Workload::Mixed, Mode::Many, pair, Recording::Phases);
+        for workload in [Workload::GetPhysical, Workload::Ping, Workload::Describe] {
+            for mode in [Mode::Solo, Mode::Many] {
+                run_trial(nodes, workload, mode, pair, Recording::Phases);
             }
         }
     }

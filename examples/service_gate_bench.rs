@@ -232,7 +232,25 @@ impl Fixture {
                             }),
                         },
                     },
-                    |_| records += 1,
+                    |event| {
+                        records += 1;
+                        let AggregatorEvent::Measurement { observation, .. } = event else {
+                            panic!("unexpected invalidation");
+                        };
+                        let metadata = observation.metadata.as_ref().expect("SourceMetadata");
+                        assert_eq!(metadata.source_instance, self.source_instance);
+                        assert_eq!(metadata.sequence, sequence);
+                        assert_eq!(metadata.generation, 0);
+                        assert_eq!(metadata.acquired_at, at);
+                        assert_eq!(metadata.elapsed, at.duration_since(self.origin));
+                        assert_eq!(
+                            observation.completed_at,
+                            UNIX_EPOCH + Duration::from_millis(sequence)
+                        );
+                        assert!(
+                            matches!(observation.reading, Ok(Value::Float(v)) if v.is_finite())
+                        );
+                    },
                 )
                 .unwrap();
             assert_eq!(records, self.outputs + 1, "sample {sequence}");
@@ -602,7 +620,7 @@ fn main() {
         Some("--rewire-comparison") => true,
         Some("--session-request-phases") => return session_requests::benchmark(),
         Some("--session-request-calibration") => return session_requests::calibrate(),
-        Some("--describe-comparison") => {
+        Some(mode @ ("--describe-comparison" | "--get-comparison")) => {
             let pair = arguments
                 .next()
                 .map(|arg| {
@@ -611,7 +629,11 @@ fn main() {
                 })
                 .unwrap_or(1);
             assert!(pair > 0 && arguments.next().is_none());
-            return session_requests::compare_describe(pair);
+            return if mode == "--get-comparison" {
+                session_requests::compare_get(pair)
+            } else {
+                session_requests::compare_describe(pair)
+            };
         }
         Some(argument) => panic!("unknown argument {argument}"),
     };

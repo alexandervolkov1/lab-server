@@ -153,6 +153,110 @@ fn create(f: &Fixture, name: &str, input: &str, revision: u64) {
 }
 
 #[test]
+fn direct_session_checks_live_graph_after_snapshot_even_with_a_cached_value() {
+    use lab_server::session::{CommandBackend, EnqueueError, PendingRequests};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct PausedSnapshot<'a> {
+        service: &'a DeviceService,
+        barrier: &'a Barrier,
+        latest: &'a Mutex<HashMap<String, Observation>>,
+        calls: AtomicU64,
+        fallback: bool,
+    }
+    impl CommandBackend for PausedSnapshot<'_> {
+        fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
+            let snapshot = self.service.catalog_snapshot();
+            self.barrier.wait(); // A real snapshot has been obtained and its lock released.
+            self.barrier.wait(); // Delete commits before Session continues.
+            if self.fallback { None } else { snapshot }
+        }
+        fn available(&self, key: &str) -> bool {
+            assert!(matches!(
+                self.latest.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.service.available(key)
+        }
+        fn enqueue_read(
+            &self,
+            _: &mut PendingRequests,
+            _: u64,
+            _: Instant,
+            _: ParameterDescription,
+        ) -> Result<(), EnqueueError> {
+            panic!("cached Get must not enqueue I/O")
+        }
+        fn enqueue_set(
+            &self,
+            _: &mut PendingRequests,
+            _: u64,
+            _: Instant,
+            _: String,
+            _: Value,
+        ) -> Result<(), EnqueueError> {
+            panic!("Get must not enqueue I/O")
+        }
+    }
+    for fallback in [false, true] {
+        let f = Fixture::new();
+        create(&f, "smooth", "a/x", 0);
+        let key = "processing/smooth/value";
+        let receiver = f.subscribe(key);
+        f.publish("a/x", 17.);
+        // Public Session owns its own cache; this real published value outlives Delete.
+        let latest = Mutex::new(HashMap::from([(
+            key.into(),
+            receiver.try_recv().unwrap().observation,
+        )]));
+        let catalog = f.service.catalog_snapshot().unwrap();
+        let barrier = Barrier::new(2);
+        let backend = PausedSnapshot {
+            service: &f.service,
+            barrier: &barrier,
+            latest: &latest,
+            calls: AtomicU64::new(0),
+            fallback,
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                f.service
+                    .manage(
+                        serde_json::from_value(
+                            json!({"action":"delete","name":"smooth","expected_revision":1}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                barrier.wait();
+            });
+            let mut session = Session::new(1, 4096);
+            session
+                .receive_message(
+                    &json!({"id":u64::MAX,"op":"get","key":key}).to_string(),
+                    &backend,
+                    &catalog,
+                    &latest,
+                    Instant::now(),
+                )
+                .unwrap();
+            let reply: Json =
+                serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap();
+            assert_eq!(
+                reply,
+                json!({"id":u64::MAX,"status":"error","error":"runtime_unavailable"})
+            );
+            assert!(session.next_message().unwrap().is_none());
+        });
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.get(key)["error"], "unknown_key");
+    }
+}
+
+#[test]
 fn rejected_controller_proposal_invalidates_the_batch_before_publication() {
     use lab_server::pending::{Completion, Poll};
     use lab_server::port_worker::StopReason;
