@@ -219,17 +219,11 @@ struct Entry {
     event: AggregatorEvent,
     registered_at_ns: i64,
 }
-// Keep the bounded queue allocation-free per event; metadata makes Entry > 200 bytes.
-#[allow(clippy::large_enum_variant)]
-enum Message {
-    Event(Entry),
-    Wake,
-}
-
 #[derive(Clone)]
 pub struct RecorderHandle {
-    sender: mpsc::SyncSender<Message>,
+    sender: mpsc::SyncSender<Entry>,
     audit_sender: mpsc::SyncSender<crate::audit::Event>,
+    wake_sender: mpsc::SyncSender<()>,
     operations: Arc<std::sync::atomic::AtomicU64>,
     pub audit_enabled: bool,
     pub measurements_enabled: bool,
@@ -238,6 +232,12 @@ pub struct RecorderHandle {
 }
 
 impl RecorderHandle {
+    fn wake_writer(&self) {
+        // A full channel already holds a wakeup. A disconnected receiver
+        // means the writer has exited its loop and handles the outcome itself.
+        let _ = self.wake_sender.try_send(());
+    }
+
     pub(crate) fn next_operation(&self) -> u64 {
         self.operations
             .fetch_update(
@@ -265,6 +265,7 @@ impl RecorderHandle {
             c.losses.dropped_audit_events = c.losses.dropped_audit_events.saturating_add(1);
         } else {
             c.audit_pending = c.audit_pending.saturating_add(1);
+            self.wake_writer();
         }
     }
 
@@ -300,12 +301,15 @@ impl RecorderHandle {
                 shared.losses.rejected_invalid_data.saturating_add(1);
             SubmitError::InvalidData(error)
         })?;
-        match self.sender.try_send(Message::Event(Entry {
+        match self.sender.try_send(Entry {
             event,
             registered_at_ns,
-        })) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(Message::Event(entry))) => {
+        }) {
+            Ok(()) => {
+                self.wake_writer();
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(entry)) => {
                 shared.losses.record(&entry.event);
                 Err(SubmitError::Full)
             }
@@ -314,7 +318,6 @@ impl RecorderHandle {
                 shared.state = RecorderState::Failed(error.clone());
                 Err(SubmitError::Failed(error))
             }
-            Err(mpsc::TrySendError::Full(Message::Wake)) => unreachable!(),
         }
     }
 
@@ -373,6 +376,7 @@ impl Recorder {
         let path = path.to_owned();
         let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
         let (audit_sender, audit_receiver) = mpsc::sync_channel(options.audit_queue_capacity);
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
         let audit_enabled = options.audit_enabled;
         let measurements_enabled = options.measurements_enabled;
         let shared = Arc::new(Mutex::new(Control {
@@ -397,6 +401,7 @@ impl Recorder {
                         storage,
                         receiver,
                         audit_receiver,
+                        wake_receiver,
                         &writer_shared,
                         options,
                         &mut hooks,
@@ -431,6 +436,7 @@ impl Recorder {
                 handle: RecorderHandle {
                     sender,
                     audit_sender,
+                    wake_sender,
                     operations: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                     audit_enabled,
                     measurements_enabled,
@@ -466,8 +472,7 @@ impl Recorder {
             if shared.state == RecorderState::Running {
                 shared.state = RecorderState::Closing;
             }
-            // Wake an idle writer; a full queue already gives it work to drain.
-            let _ = self.handle.sender.try_send(Message::Wake);
+            self.handle.wake_writer();
         }
         self.writer
             .take()
@@ -506,10 +511,11 @@ fn duration_ns(duration: Duration, before_epoch: bool) -> Result<i64, DataError>
         .ok_or(DataError::TimestampOutOfRange)
 }
 
-// Test-only synchronization at the actual transaction boundary; no sleeps or
-// simulated substitute database on the production write path.
+// Test-only synchronization at the wait and transaction boundaries.
 #[derive(Default)]
 pub(crate) struct Hooks {
+    #[cfg(test)]
+    pub(crate) before_wait: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
     pub(crate) before_flush: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
@@ -518,6 +524,13 @@ pub(crate) struct Hooks {
     pub(crate) stopped: Option<mpsc::Sender<()>>,
 }
 impl Hooks {
+    fn before_wait(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = &mut self.before_wait {
+            hook();
+        }
+    }
+
     fn before_flush(&mut self) {
         #[cfg(test)]
         if let Some(hook) = &mut self.before_flush {
@@ -534,8 +547,9 @@ impl Hooks {
 
 fn write_loop(
     mut storage: Storage,
-    receiver: mpsc::Receiver<Message>,
+    receiver: mpsc::Receiver<Entry>,
     audit_receiver: mpsc::Receiver<crate::audit::Event>,
+    wake_receiver: mpsc::Receiver<()>,
     shared: &Shared,
     options: RecorderOptions,
     hooks: &mut Hooks,
@@ -549,35 +563,17 @@ fn write_loop(
     loop {
         let closing = control(shared).state == RecorderState::Closing;
         // One from each queue per turn: neither traffic class can starve the
-        // other. Idle audit waits at most flush_interval (excluding disk I/O).
+        // other. After Closing, no producer can enqueue behind either check.
         let audit_next = audit_receiver.try_recv().ok();
-        let audit_empty = audit_next.is_none();
+        let next = receiver.try_recv().ok();
+        let idle = audit_next.is_none() && next.is_none();
+        let drained = closing && idle;
         if let Some(event) = audit_next {
             audit_batch.push(event);
         }
-        let mut drained = false;
-        let next = if closing || !audit_empty {
-            match receiver.try_recv() {
-                Ok(message) => Some(message),
-                Err(_) => {
-                    drained = closing;
-                    None
-                }
-            }
-        } else {
-            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(message) => Some(message),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    drained = true;
-                    None
-                }
-            }
-        };
-        if let Some(Message::Event(entry)) = next {
+        if let Some(entry) = next {
             batch.push(entry);
         }
-        drained = drained && audit_empty;
         if batch.len() == options.batch_size
             || audit_batch.len() == options.batch_size
             || drained
@@ -606,6 +602,17 @@ fn write_loop(
             };
             storage.finish(persisted_loss.dropped_audit_events == 0)?;
             return Ok(summary);
+        }
+        if idle {
+            // Enqueues signal after publishing data. A signal racing with the
+            // empty checks stays pending until this wait, and every wake or
+            // timeout leads back to both queues and the flush deadline.
+            hooks.before_wait();
+            if wake_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                == Err(mpsc::RecvTimeoutError::Disconnected)
+            {
+                return Err(RecorderError::WriterDisconnected);
+            }
         }
     }
 }

@@ -155,6 +155,24 @@ fn first_flush_gate() -> Gate {
     (hooks, wait_entered, release, wait_flushed)
 }
 
+fn idle_writer_gate() -> Gate {
+    let (waiting, wait_entered) = mpsc::channel();
+    let (resume, wait_resume) = mpsc::channel();
+    let (flushed, wait_flushed) = mpsc::channel();
+    let hooks = Hooks {
+        before_wait: Some(Box::new(move || {
+            if waiting.send(()).is_ok() {
+                let _ = wait_resume.recv_timeout(WAIT);
+            }
+        })),
+        after_flush: Some(Box::new(move || {
+            let _ = flushed.send(());
+        })),
+        ..Hooks::default()
+    };
+    (hooks, wait_entered, resume, wait_flushed)
+}
+
 #[test]
 fn creates_versioned_schema_wal_and_completed_session() {
     let db = Database::new();
@@ -1481,6 +1499,274 @@ fn audit_queue_is_reserved_bounded_and_loss_survives_shutdown() {
         100
     );
     assert_eq!(scalar(&c, "SELECT count(*) FROM audit_events"), 2);
+}
+
+#[test]
+fn single_audit_event_wakes_a_writer_about_to_wait() {
+    let db = Database::new();
+    let (hooks, waiting, resume, flushed) = idle_writer_gate();
+    let recorder = Recorder::start(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            measurements_enabled: false,
+            flush_interval: Duration::from_secs(60),
+            ..options(1, 1)
+        },
+        hooks,
+    )
+    .unwrap();
+    let handle = recorder.handle();
+    waiting.recv_timeout(WAIT).unwrap();
+    let operation = crate::audit::Operation::new(&handle, serde_json::json!({}));
+    operation.accepted();
+    // Both queues were checked before the event arrived. The wait must see
+    // the pending wakeup even though the writer had not blocked yet.
+    drop(resume);
+    flushed.recv_timeout(WAIT).unwrap();
+    assert_eq!(
+        scalar(&db.connect(), "SELECT count(*) FROM audit_events"),
+        1
+    );
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.audit_records, 1);
+    assert_eq!(summary.accepted_records, 0);
+    assert_eq!(summary.losses, LossInfo::default());
+}
+
+#[test]
+fn audit_only_wakeup_frees_queue_space_without_flushing_a_partial_batch() {
+    let db = Database::new();
+    let (hooks, waiting, resume, flushed) = idle_writer_gate();
+    let recorder = Recorder::start(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            measurements_enabled: false,
+            audit_queue_capacity: 1,
+            flush_interval: Duration::from_secs(60),
+            ..options(1, 2)
+        },
+        hooks,
+    )
+    .unwrap();
+    let handle = recorder.handle();
+    let operation = crate::audit::Operation::new(&handle, serde_json::json!({}));
+
+    waiting.recv_timeout(WAIT).unwrap();
+    operation.accepted();
+    resume.send(()).unwrap();
+    waiting.recv_timeout(WAIT).unwrap();
+    assert!(matches!(flushed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(
+        scalar(&db.connect(), "SELECT count(*) FROM audit_events"),
+        0
+    );
+
+    // The first fact is now in the batch, leaving room in the one-slot queue.
+    operation.event("completed", serde_json::json!({}));
+    drop(resume);
+    flushed.recv_timeout(WAIT).unwrap();
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.audit_records, 2);
+    assert_eq!(summary.losses, LossInfo::default());
+    let c = db.connect();
+    let kinds: String = c
+        .query_row(
+            "SELECT group_concat(kind, ',') FROM (SELECT kind FROM audit_events ORDER BY id)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kinds, "accepted,completed");
+}
+
+#[test]
+fn coalesced_wakeup_drains_both_full_queues_one_item_per_turn() {
+    let db = Database::new();
+    let (mut hooks, waiting, resume, _) = idle_writer_gate();
+    let (first_flush, flushed) = mpsc::channel();
+    let path = db.0.clone();
+    let mut first = true;
+    hooks.after_flush = Some(Box::new(move || {
+        if std::mem::take(&mut first) {
+            let c = Connection::open(&path).unwrap();
+            first_flush
+                .send((
+                    scalar(&c, "SELECT count(*) FROM measurements"),
+                    scalar(&c, "SELECT count(*) FROM audit_events"),
+                ))
+                .unwrap();
+        }
+    }));
+    let recorder = Recorder::start(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            audit_queue_capacity: 2,
+            flush_interval: Duration::from_secs(60),
+            ..options(2, 1)
+        },
+        hooks,
+    )
+    .unwrap();
+    let handle = recorder.handle();
+    let operation = crate::audit::Operation::new(&handle, serde_json::json!({}));
+    waiting.recv_timeout(WAIT).unwrap();
+    operation.accepted();
+    handle.try_record(event(1)).unwrap();
+    operation.event("started", serde_json::json!({}));
+    handle.try_record(event(2)).unwrap();
+    operation.event("completed", serde_json::json!({}));
+    assert_eq!(handle.try_record(event(3)), Err(SubmitError::Full));
+
+    drop(resume);
+    assert_eq!(flushed.recv_timeout(WAIT).unwrap(), (1, 1));
+    let summary = recorder.shutdown().unwrap();
+    assert_eq!(summary.accepted_records, 2);
+    assert_eq!(summary.audit_records, 2);
+    assert_eq!(
+        summary.losses,
+        LossInfo {
+            dropped_events: 1,
+            dropped_audit_events: 1,
+            ..LossInfo::default()
+        }
+    );
+    let c = db.connect();
+    assert_eq!(scalar(&c, "SELECT count(*) FROM measurements"), 2);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM audit_events"), 2);
+    assert_eq!(scalar(&c, "SELECT audit_incomplete FROM sessions"), 1);
+}
+
+#[test]
+fn shutdown_wakes_idle_writer_and_drains_full_queues_with_live_handles() {
+    for (measurements, audit) in [(0, 0), (2, 0), (0, 2), (2, 2)] {
+        let db = Database::new();
+        let (hooks, waiting, resume, _) = idle_writer_gate();
+        let recorder = Recorder::start(
+            &db.0,
+            RecorderOptions {
+                audit_enabled: true,
+                audit_queue_capacity: 2,
+                flush_interval: Duration::from_secs(60),
+                ..options(2, 128)
+            },
+            hooks,
+        )
+        .unwrap();
+        let handle = recorder.handle();
+        let second_handle = handle.clone();
+        let operation = crate::audit::Operation::new(&handle, serde_json::json!({}));
+        waiting.recv_timeout(WAIT).unwrap();
+        for value in 0..measurements {
+            handle.try_record(event(value)).unwrap();
+        }
+        for _ in 0..audit {
+            operation.event("completed", serde_json::json!({}));
+        }
+        let (done, result) = mpsc::channel();
+        let join = thread::spawn(move || done.send(recorder.shutdown()).unwrap());
+        let deadline = Instant::now() + WAIT;
+        while handle.state() != RecorderState::Closing {
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not close admission"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            second_handle.try_record(event(99)),
+            Err(SubmitError::Closed)
+        );
+        drop(resume);
+        let summary = result.recv_timeout(WAIT).unwrap().unwrap();
+        join.join().unwrap();
+        assert_eq!(summary.accepted_records, measurements as u64);
+        assert_eq!(summary.audit_records, audit);
+        assert_eq!(summary.losses, LossInfo::default());
+        assert_eq!(handle.state(), RecorderState::Stopped);
+        assert_eq!(second_handle.state(), RecorderState::Stopped);
+        let c = db.connect();
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM measurements"),
+            measurements
+        );
+        assert_eq!(
+            scalar(&c, "SELECT count(*) FROM audit_events"),
+            audit as i64
+        );
+        assert_eq!(scalar(&c, "SELECT audit_incomplete FROM sessions"), 0);
+        assert_eq!(
+            scalar(
+                &c,
+                "SELECT count(*) FROM sessions WHERE ended_at_ns IS NOT NULL"
+            ),
+            1
+        );
+    }
+}
+
+#[test]
+fn failed_woken_batch_keeps_overflow_and_uncommitted_audit_losses() {
+    let db = Database::new();
+    let (mut hooks, waiting, resume, _) = idle_writer_gate();
+    let (stopped, wait_stopped) = mpsc::channel();
+    hooks.stopped = Some(stopped);
+    let recorder = Recorder::start(
+        &db.0,
+        RecorderOptions {
+            audit_enabled: true,
+            audit_queue_capacity: 2,
+            flush_interval: Duration::from_secs(60),
+            ..options(1, 1)
+        },
+        hooks,
+    )
+    .unwrap();
+    let handle = recorder.handle();
+    let operation = crate::audit::Operation::new(&handle, serde_json::json!({}));
+    waiting.recv_timeout(WAIT).unwrap();
+    let c = db.connect();
+    c.execute_batch(
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_events
+         BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+    )
+    .unwrap();
+    handle.try_record(event(1)).unwrap();
+    assert_eq!(handle.try_record(event(2)), Err(SubmitError::Full));
+    operation.accepted();
+    operation.event("started", serde_json::json!({}));
+    operation.event("completed", serde_json::json!({}));
+    assert_eq!(handle.losses().dropped_audit_events, 1);
+
+    drop(resume);
+    wait_stopped.recv_timeout(WAIT).unwrap();
+    let RecorderState::Failed(error) = handle.state() else {
+        panic!("writer failure was not published");
+    };
+    assert!(matches!(
+        &error,
+        RecorderError::Sqlite {
+            operation: "insert audit",
+            ..
+        }
+    ));
+    assert_eq!(handle.losses().dropped_audit_events, 3);
+    assert_eq!(handle.losses().dropped_events, 1);
+    operation.event("completed", serde_json::json!({}));
+    assert_eq!(handle.losses().dropped_audit_events, 4);
+    assert_eq!(recorder.shutdown(), Err(error));
+    assert_eq!(scalar(&c, "SELECT count(*) FROM measurements"), 0);
+    assert_eq!(scalar(&c, "SELECT count(*) FROM audit_events"), 0);
+    assert_eq!(scalar(&c, "SELECT audit_incomplete FROM sessions"), 1);
+    assert_eq!(
+        scalar(
+            &c,
+            "SELECT count(*) FROM sessions WHERE ended_at_ns IS NULL"
+        ),
+        1
+    );
 }
 
 #[test]
