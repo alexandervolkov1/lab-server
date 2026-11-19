@@ -215,6 +215,56 @@ fn validation_and_duplicate_requests_never_write() {
         0
     );
 }
+
+#[test]
+fn duplicate_invalid_set_does_not_take_the_pending_mutation_response() {
+    let f = fixture();
+    let mut session = Session::new(8, 65536);
+    let join = thread::spawn(move || f.worker.run());
+    let id = u64::MAX;
+    send(
+        &f.service,
+        &mut session,
+        json!({"id":id,"op":"set","key":"a/value","value":true}),
+    );
+    f.entered.recv_timeout(WAIT).unwrap();
+
+    let frame = format!(r#"{{"id":{id},"op":"set","key":"a/value","value":null}}"#);
+    f.service
+        .receive_message(&mut session, &frame, Instant::now())
+        .unwrap();
+    let duplicate = json!({"status":"error","error":"duplicate_id"});
+    assert_eq!(response(&mut session), duplicate);
+    assert!(!session.pending.is_empty());
+    f.resume.send(true).unwrap();
+    let success = json!({"id":id,"status":"ok"});
+    assert_eq!(response(&mut session), success);
+    assert!(session.pending.is_empty());
+
+    f.channels.commands.shutdown();
+    join.join().unwrap();
+    session.collect_ready(Instant::now()).unwrap();
+    assert!(session.next_message().unwrap().is_none());
+    f.recorder.shutdown().unwrap();
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for (kind, context, details) in events(&f.database) {
+        assert_eq!(context["request_id"], id.to_string());
+        if context["invalid_frame"].is_null() {
+            if kind == "response" {
+                assert_eq!(details, success);
+            }
+            accepted.push(kind);
+        } else {
+            assert_eq!(context["invalid_frame"], frame);
+            assert_eq!(details, duplicate);
+            rejected.push(kind);
+        }
+    }
+    assert_eq!(accepted, ["accepted", "started", "completed", "response"]);
+    assert_eq!(rejected, ["rejected", "response"]);
+}
+
 #[test]
 fn cancellation_before_start_prevents_driver_and_records_one_response() {
     let f = fixture();

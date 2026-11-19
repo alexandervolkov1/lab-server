@@ -1,6 +1,7 @@
 //! Scripted command admission for session tests, compiled only with the test module.
 //! Uses the production pending/execution boundary; no worker, driver or physical I/O.
 
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ pub(super) struct TestBackend {
     commands: mpsc::SyncSender<TestCommand>,
     /// Attempts to reach the command queue, including full/closed failures.
     pub submit_attempts: Cell<usize>,
+    pub catalog_snapshots: Cell<usize>,
 }
 
 impl TestBackend {
@@ -53,6 +55,7 @@ impl TestBackend {
             Self {
                 commands,
                 submit_attempts: Cell::new(0),
+                catalog_snapshots: Cell::new(0),
             },
             receiver,
         )
@@ -70,6 +73,11 @@ impl TestBackend {
 }
 
 impl CommandBackend for TestBackend {
+    fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
+        self.catalog_snapshots.set(self.catalog_snapshots.get() + 1);
+        None
+    }
+
     fn enqueue_read(
         &self,
         requests: &mut PendingRequests,

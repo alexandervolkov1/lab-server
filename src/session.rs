@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{Value as Json, json};
 
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::outbound::{OutboundBuffer, is_output_error};
@@ -156,6 +156,49 @@ impl ParsedMessage {
                 frame: text.to_owned(),
                 error,
             },
+        }
+    }
+
+    fn id(&self) -> Option<u64> {
+        match self {
+            Self::Request(
+                Request::ServerStatus { id }
+                | Request::Components { id, .. }
+                | Request::Hello { id }
+                | Request::Describe { id }
+                | Request::Ping { id }
+                | Request::Get { id, .. }
+                | Request::Set { id, .. }
+                | Request::InvokeAction { id, .. }
+                | Request::Subscribe { id, .. }
+                | Request::Unsubscribe { id, .. },
+            ) => Some(*id),
+            Self::InvalidRequest { frame, .. } => crate::protocol::parse_json_object(frame)
+                .ok()
+                .and_then(|object| object.get("id").and_then(Json::as_u64))
+                .filter(|id| *id > 0),
+        }
+    }
+
+    fn audit_request(&self) -> (Json, Option<&str>) {
+        match self {
+            Self::Request(Request::Set { id, key, value }) => (
+                json!({"id":id,"op":"set","key":key,"value":crate::audit::value(value)}),
+                None,
+            ),
+            Self::Request(Request::InvokeAction { id, key }) => {
+                (json!({"id":id,"op":"invoke_action","key":key}), None)
+            }
+            Self::Request(Request::Components { id, command }) => {
+                (json!({"id":id,"op":"components","command":command}), None)
+            }
+            // Keep the audit representation for rejected mutations, including
+            // frames with duplicate keys. ID validation uses the strict parser.
+            Self::InvalidRequest { frame, .. } => (
+                serde_json::from_str(frame).unwrap_or(Json::Null),
+                Some(frame),
+            ),
+            _ => (Json::Null, None),
         }
     }
 }
@@ -446,65 +489,19 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
-        // Diagnostics never needs the (potentially much larger) signal catalog.
-        let snapshot = if matches!(
-            incoming,
-            ParsedMessage::Request(Request::ServerStatus { .. })
-        ) {
-            None
-        } else {
-            commands.catalog_snapshot()
-        };
-        let catalog = snapshot.as_ref().unwrap_or(catalog);
-        let id = match &incoming {
-            ParsedMessage::Request(
-                Request::ServerStatus { id }
-                | Request::Components { id, .. }
-                | Request::Hello { id }
-                | Request::Describe { id }
-                | Request::Ping { id }
-                | Request::Get { id, .. }
-                | Request::Set { id, .. }
-                | Request::InvokeAction { id, .. }
-                | Request::Subscribe { id, .. }
-                | Request::Unsubscribe { id, .. },
-            ) => Some(*id),
-            ParsedMessage::InvalidRequest { frame, .. } => {
-                crate::protocol::parse_json_object(frame)
-                    .ok()
-                    .and_then(|object| object.get("id").and_then(serde_json::Value::as_u64))
-                    .filter(|id| *id > 0)
-            }
-        };
-        let audit = commands.audit_recorder().and_then(|r| {
-            let raw = match &incoming {
-                ParsedMessage::Request(Request::Set { id, key, value }) => {
-                    json!({"id":id,"op":"set","key":key,"value":crate::audit::value(value)})
-                }
-                ParsedMessage::Request(Request::InvokeAction { id, key }) => {
-                    json!({"id":id,"op":"invoke_action","key":key})
-                }
-                ParsedMessage::Request(Request::Components { id, command }) => {
-                    json!({"id":id,"op":"components","command":command})
-                }
-                ParsedMessage::InvalidRequest { frame, .. } => {
-                    serde_json::from_str(frame).unwrap_or(serde_json::Value::Null)
-                }
-                _ => serde_json::Value::Null,
-            };
-            crate::audit::mutation(&raw).then(|| {
+        let id = incoming.id();
+        let audit = commands.audit_recorder().and_then(|recorder| {
+            let (request, invalid_frame) = incoming.audit_request();
+            crate::audit::mutation(&request).then(|| {
                 crate::audit::Operation::new(
-                    &r,
+                    &recorder,
                     json!({
-                            "source": self.audit_source,
-                            "connection_id": self.connection_id.to_string(),
-                            "request_id": id.map(|v| v.to_string()),
-                            "request": raw,
-                    "invalid_frame": match &incoming {
-                        ParsedMessage::InvalidRequest { frame, .. } => Some(frame.as_str()),
-                        _ => None,
-                    }
-                        }),
+                        "source": self.audit_source,
+                        "connection_id": self.connection_id.to_string(),
+                        "request_id": id.map(|v| v.to_string()),
+                        "request": request,
+                        "invalid_frame": invalid_frame
+                    }),
                 )
             })
         });
@@ -513,87 +510,85 @@ impl<Input> SessionState<Input> {
                 if let Some(a) = audit {
                     a.response(json!({"status":"error","error":"duplicate_id"}));
                 }
-                self.queue_response(
-                    &json!({"status":"error", "error":"duplicate_id"}).to_string(),
-                )?;
-                return Ok(());
+                return self.queue_error(id, "duplicate_id");
             }
             self.last_request_id = id;
         }
 
         self.pending.audit = audit.clone();
-        if let (Some(id), Some(a)) = (id, audit.clone()) {
-            self.audits.insert(id, a);
+        if let (Some(id), Some(a)) = (id, audit.as_ref()) {
+            self.audits.insert(id, a.clone());
         }
         let result = match incoming {
-            ParsedMessage::Request(Request::ServerStatus { id }) => {
-                match commands.server_status() {
+            ParsedMessage::Request(request) => {
+                self.dispatch_request(request, commands, catalog, latest, now, audit.as_ref())
+            }
+            ParsedMessage::InvalidRequest { error, .. } => {
+                self.dispatch_invalid_request(id, error, audit.as_ref())
+            }
+        };
+        self.pending.audit = None;
+        result
+    }
+
+    fn dispatch_request(
+        &mut self,
+        request: Request,
+        commands: &impl CommandBackend,
+        catalog: &HashMap<String, ParameterDescription>,
+        latest: &Mutex<HashMap<String, Observation>>,
+        now: Instant,
+        audit: Option<&crate::audit::Operation>,
+    ) -> io::Result<()> {
+        let snapshot = match request {
+            Request::Describe { .. }
+            | Request::Get { .. }
+            | Request::Set { .. }
+            | Request::Subscribe { .. }
+            | Request::Unsubscribe { .. } => commands.catalog_snapshot(),
+            _ => None,
+        };
+        let catalog = snapshot.as_ref().unwrap_or(catalog);
+
+        match request {
+            Request::ServerStatus { id } => match commands.server_status() {
+                Ok(data) => {
+                    self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
+                }
+                Err(error) => self.queue_error(id, &error),
+            },
+            Request::Components { id, command } => {
+                match commands.components_audited(command, audit) {
                     Ok(data) => {
                         self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
                     }
                     Err(error) => self.queue_error(id, &error),
                 }
             }
-            ParsedMessage::Request(Request::Components { id, command }) => {
-                match commands.components_audited(command, audit.as_ref()) {
-                    Ok(data) => {
-                        self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
-                    }
-                    Err(error) => self.queue_error(id, &error),
-                }
+            Request::Subscribe { id, keys } => {
+                self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)
             }
-            ParsedMessage::Request(Request::Subscribe { id, keys }) => {
-                self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)?;
-                Ok(())
+            Request::Unsubscribe { id, keys } => {
+                self.dispatch_subscription(id, SubscriptionChange::Unsubscribe, keys, catalog)
             }
-
-            ParsedMessage::Request(Request::Unsubscribe { id, keys }) => {
-                self.dispatch_subscription(id, SubscriptionChange::Unsubscribe, keys, catalog)?;
-                Ok(())
+            Request::Describe { id } => self.describe_with_actions(id, catalog, commands.actions()),
+            Request::Hello { id } => self.queue_response(
+                &json!({
+                    "id": id,
+                    "status": "ok",
+                    "protocol": "lab-server",
+                    "version": 1
+                })
+                .to_string(),
+            ),
+            Request::Ping { id } => {
+                self.queue_response(&json!({"id":id,"status":"ok"}).to_string())
             }
-
-            ParsedMessage::Request(Request::Describe { id }) => {
-                self.describe_with_actions(id, catalog, commands.actions())?;
-                Ok(())
+            Request::Get { id, key } => self.dispatch_get(id, key, commands, catalog, latest, now),
+            Request::Set { id, key, value } => {
+                self.dispatch_set(id, key, value, commands, catalog, now)
             }
-
-            ParsedMessage::Request(Request::Hello { id }) => {
-                self.queue_response(
-                    &json!({
-                        "id": id,
-                        "status": "ok",
-                        "protocol": "lab-server",
-                        "version": 1
-                    })
-                    .to_string(),
-                )?;
-
-                Ok(())
-            }
-
-            ParsedMessage::Request(Request::Ping { id }) => {
-                self.queue_response(
-                    &json!({
-                        "id": id,
-                        "status": "ok"
-                    })
-                    .to_string(),
-                )?;
-
-                Ok(())
-            }
-
-            ParsedMessage::Request(Request::Get { id, key }) => {
-                self.dispatch_get(id, key, commands, catalog, latest, now)?;
-                Ok(())
-            }
-
-            ParsedMessage::Request(Request::Set { id, key, value }) => {
-                self.dispatch_set(id, key, value, commands, catalog, now)?;
-                Ok(())
-            }
-
-            ParsedMessage::Request(Request::InvokeAction { id, key }) => {
+            Request::InvokeAction { id, key } => {
                 match commands.enqueue_action(
                     &mut self.pending,
                     id,
@@ -604,47 +599,36 @@ impl<Input> SessionState<Input> {
                     Err(error) => self.queue_error(id, error.code()),
                 }
             }
+        }
+    }
 
-            ParsedMessage::InvalidRequest { frame, error } => {
-                use crate::protocol::{JsonError, RequestError};
+    fn dispatch_invalid_request(
+        &mut self,
+        id: Option<u64>,
+        error: ParseError,
+        audit: Option<&crate::audit::Operation>,
+    ) -> io::Result<()> {
+        use crate::protocol::{JsonError, RequestError};
 
-                let code = match error {
-                    ParseError::Json(JsonError::InvalidJson) => "invalid_json",
-                    ParseError::Json(JsonError::ExpectedObject) => "expected_object",
-                    ParseError::Json(JsonError::DuplicateKey) => "duplicate_key",
+        let code = match error {
+            ParseError::Json(JsonError::InvalidJson) => "invalid_json",
+            ParseError::Json(JsonError::ExpectedObject) => "expected_object",
+            ParseError::Json(JsonError::DuplicateKey) => "duplicate_key",
 
-                    ParseError::Request(RequestError::InvalidId) => "invalid_id",
-                    ParseError::Request(RequestError::UnsupportedOp) => "unsupported_op",
-                    ParseError::Request(RequestError::InvalidKey) => "invalid_key",
-                    ParseError::Request(RequestError::InvalidValue) => "invalid_value",
-                    ParseError::Request(RequestError::InvalidKeys) => "invalid_keys",
-                };
-
-                let mut response = json!({
-                    "status": "error",
-                    "error": code
-                });
-
-                if let Ok(object) = crate::protocol::parse_json_object(&frame)
-                    && let Some(id) = object
-                        .get("id")
-                        .and_then(serde_json::Value::as_u64)
-                        .filter(|id| *id > 0)
-                {
-                    response["id"] = json!(id);
-                }
-
-                if id.is_none()
-                    && let Some(a) = &audit
-                {
-                    a.response(response.clone());
-                }
-                self.queue_response(&response.to_string())?;
-                Ok(())
-            }
+            ParseError::Request(RequestError::InvalidId) => "invalid_id",
+            ParseError::Request(RequestError::UnsupportedOp) => "unsupported_op",
+            ParseError::Request(RequestError::InvalidKey) => "invalid_key",
+            ParseError::Request(RequestError::InvalidValue) => "invalid_value",
+            ParseError::Request(RequestError::InvalidKeys) => "invalid_keys",
         };
-        self.pending.audit = None;
-        result
+
+        let mut response = json!({"status":"error","error":code});
+        if let Some(id) = id {
+            response["id"] = json!(id);
+        } else if let Some(a) = audit {
+            a.response(response.clone());
+        }
+        self.queue_response(&response.to_string())
     }
 
     pub fn collect_ready(&mut self, now: Instant) -> io::Result<()> {

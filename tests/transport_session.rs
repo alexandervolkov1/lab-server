@@ -257,6 +257,60 @@ fn complete_json_text_has_no_ndjson_dependency_and_uses_the_existing_parser() {
 }
 
 #[test]
+fn one_session_uses_the_current_catalog_after_component_creation_and_deletion() {
+    let context = Context::new();
+    let mut session = Session::new(8, 64 * 1024);
+    let now = Instant::now();
+    let mut request = |request: Json| {
+        context.send(&mut session, &request.to_string(), now);
+        let [reply]: [Json; 1] = messages(&mut session).try_into().unwrap();
+        reply
+    };
+    let key = "processing/smooth/value";
+    let create = json!({
+        "action":"create",
+        "expected_revision":0,
+        "configuration":{
+            "name":"smooth","type_id":"ema",
+            "inputs":{"input":"furnace1/temperature"},
+            "parameters":{},"max_age_ms":1000
+        }
+    });
+    let delete = json!({"action":"delete","name":"smooth","expected_revision":1});
+
+    for (id, command, present) in [(1, create, true), (5, delete, false)] {
+        assert_eq!(
+            request(json!({"id":id,"op":"components","command":command}))["status"],
+            "ok"
+        );
+        let catalog = request(json!({"id":id+1,"op":"describe"}));
+        assert_eq!(
+            catalog["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["key"] == key),
+            present
+        );
+        let get = request(json!({"id":id+2,"op":"get","key":key}));
+        let subscribe = request(json!({"id":id+3,"op":"subscribe","keys":[key]}));
+        if present {
+            assert_eq!(get, json!({"id":id+2,"status":"no_data","key":key}));
+            assert_eq!(subscribe, json!({"id":id+3,"status":"ok","keys":[key]}));
+        } else {
+            assert_eq!(
+                get,
+                json!({"id":id+2,"status":"error","error":"unknown_key"})
+            );
+            assert_eq!(
+                subscribe,
+                json!({"id":id+3,"status":"error","error":"unknown_key","key":key})
+            );
+        }
+    }
+}
+
+#[test]
 fn message_queue_keeps_utf8_boundaries_and_the_exact_64k_lf_budget() {
     let mut queue = OutboundBuffer::new(64 * 1024);
     let text = format!("\"{}\"", "я".repeat(32766)); // 65534 UTF-8 bytes

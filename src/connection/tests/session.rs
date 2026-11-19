@@ -3,6 +3,69 @@ use super::*;
 use crate::port_worker::{CommandError, DeviceObservation};
 
 #[test]
+fn only_catalog_operations_with_admitted_ids_request_a_snapshot() {
+    let (backend, commands) = TestBackend::new(2);
+    let mut session = crate::session::Session::new(2, 4096);
+    let mut catalog = get_catalog();
+    catalog.extend(power_catalog());
+    let latest = Mutex::new(HashMap::new());
+    let now = Instant::now();
+
+    for (frame, snapshots) in [
+        (r#"{"id":1,"op":"hello"}"#, 0),
+        (r#"{"id":2,"op":"ping"}"#, 0),
+        (r#"{"id":3,"op":"server_status"}"#, 0),
+        (
+            r#"{"id":4,"op":"components","command":{"action":"list"}}"#,
+            0,
+        ),
+        (r#"{"id":5,"op":"invoke_action","key":"reset"}"#, 0),
+        (r#"{"id":6,"op":"describe"}"#, 1),
+        (r#"{"id":7,"op":"get","key":"sample_temperature"}"#, 2),
+        (r#"{"id":8,"op":"set","key":"power","value":20}"#, 3),
+        (
+            r#"{"id":9,"op":"subscribe","keys":["sample_temperature"]}"#,
+            4,
+        ),
+        (
+            r#"{"id":10,"op":"unsubscribe","keys":["sample_temperature"]}"#,
+            5,
+        ),
+        (r#"{"id":11,"op":"set","key":"power","value":null}"#, 5),
+        (r#"{"id":11,"op":"describe"}"#, 5),
+        (r#"{"id":8,"op":"set","key":"power","value":30}"#, 5),
+        (r#"{"id":0,"op":"get","key":"sample_temperature"}"#, 5),
+        (r#"{"id":12,"op":"unsupported"}"#, 5),
+        (r#"{"id":13,"op":"subscribe","keys":false}"#, 5),
+        (r#"{"id":14,"id":15,"op":"describe"}"#, 5),
+        ("{", 5),
+    ] {
+        session
+            .receive_message(frame, &backend, &catalog, &latest, now)
+            .unwrap();
+        assert_eq!(backend.catalog_snapshots.get(), snapshots, "{frame}");
+    }
+
+    // The backend returned None, so the handlers used the base catalog.
+    let mut replies = HashMap::new();
+    while let Some(message) = session.next_message().unwrap() {
+        let reply: serde_json::Value = serde_json::from_str(&message).unwrap();
+        if let Some(id) = reply["id"].as_u64() {
+            replies.insert(id, reply);
+        }
+    }
+    assert_eq!(replies[&6]["parameters"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[&7]["status"], "no_data");
+    assert_eq!(replies[&9]["keys"], json!(["sample_temperature"]));
+    assert_eq!(replies[&10]["keys"], json!([]));
+    let TestCommand::Set(command) = commands.try_recv().unwrap() else {
+        panic!("expected one admitted set");
+    };
+    assert_eq!(command.value, Value::Integer(20));
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
 fn ids_are_monotonic_across_operations_and_invalid_requests() {
     let now = Instant::now();
     for duplicate in [

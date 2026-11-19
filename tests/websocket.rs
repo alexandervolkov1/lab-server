@@ -1494,6 +1494,111 @@ fn websocket_and_tcp_audit_keep_connections_distinct() {
 }
 
 #[test]
+fn tcp_and_websocket_preserve_strict_ids_and_audit_invalid_mutation_frames() {
+    let database = db::Database::new();
+    let mut config = configuration();
+    config.recording = Some(lab_server::config::RecordingConfig {
+        enabled: false,
+        audit_enabled: true,
+        audit_queue_capacity: None,
+        path: Some(database.0.clone()),
+        queue_capacity: None,
+    });
+    let mut server = Running::with_config(config);
+    let mut tcp = server.tcp();
+    let mut ws = server.connect();
+    let mut assert_replies = |frame: &str, expected: &Json| {
+        writeln!(tcp.get_mut(), "{frame}").unwrap();
+        ws.send(Message::Text(frame.into())).unwrap();
+        assert_eq!(&tcp_receive(&mut tcp), expected, "TCP {frame}");
+        assert_eq!(&receive(&mut ws), expected, "WebSocket {frame}");
+    };
+    let high_id = 9_007_199_254_740_993_u64;
+    let duplicate_key = json!({"status":"error","error":"duplicate_key"});
+    let invalid_mutations = [
+        (
+            r#"{"id":18446744073709551614,"id":18446744073709551615,"op":"set","key":"a/enabled","value":false}"#,
+            Json::Null,
+            duplicate_key.clone(),
+        ),
+        (
+            r#"{"id":18446744073709551615,"op":"set","key":"a/enabled","extra":[{"n":1,"n":2}],"value":false}"#,
+            Json::Null,
+            duplicate_key,
+        ),
+        (
+            r#" {"id":9007199254740993,"op":"set","key":"a/enabled","value":null} "#,
+            json!(high_id.to_string()),
+            json!({"id":high_id,"status":"error","error":"invalid_value"}),
+        ),
+    ];
+    for (frame, _, reply) in &invalid_mutations {
+        assert_replies(frame, reply);
+    }
+    for id in ["18446744073709551616", "-1", "0", "1.0", "\"9\""] {
+        assert_replies(
+            &format!(r#"{{"id":{id},"op":"ping"}}"#),
+            &json!({"status":"error","error":"invalid_id"}),
+        );
+    }
+    let duplicate = json!({"status":"error","error":"duplicate_id"});
+    for id in [high_id, high_id - 1] {
+        assert_replies(&format!(r#"{{"id":{id},"op":"ping"}}"#), &duplicate);
+    }
+    let max_ping = r#"{"id":18446744073709551615,"op":"ping"}"#;
+    assert_replies(max_ping, &json!({"id":u64::MAX,"status":"ok"}));
+    assert_replies(max_ping, &duplicate);
+    drop(tcp);
+    drop(ws);
+    server.stop();
+
+    let sql = database.connect();
+    let mut query = sql
+        .prepare(
+            "SELECT kind, context_json, details_json FROM audit_events
+         WHERE json_extract(context_json,'$.source')=? ORDER BY id",
+        )
+        .unwrap();
+    let mut connection_ids = Vec::new();
+    for source in ["tcp", "websocket"] {
+        let events = query
+            .query_map([source], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<Json>(&row.get::<_, String>(1)?).unwrap(),
+                    serde_json::from_str::<Json>(&row.get::<_, String>(2)?).unwrap(),
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 2 * invalid_mutations.len());
+        let connection_id = events[0].1["connection_id"].as_str().unwrap();
+        for (pair, (frame, id, reply)) in events.chunks_exact(2).zip(&invalid_mutations) {
+            assert_eq!(pair[0].0, "rejected");
+            assert_eq!(pair[1].0, "response");
+            for (_, context, details) in pair {
+                assert_eq!(context["source"], source);
+                assert_eq!(context["connection_id"], connection_id);
+                assert_eq!(&context["request_id"], id);
+                assert_eq!(context["invalid_frame"], *frame);
+                assert_eq!(
+                    context["request"],
+                    serde_json::from_str::<Json>(frame).unwrap()
+                );
+                assert_eq!(details, reply);
+            }
+        }
+        connection_ids.push(connection_id.to_owned());
+    }
+    assert_ne!(connection_ids[0], connection_ids[1]);
+    assert_eq!(
+        db::scalar(&sql, "SELECT count(*) FROM audit_events"),
+        (4 * invalid_mutations.len()) as i64
+    );
+}
+
+#[test]
 fn shutdown_rejects_tcp_and_websocket_mutations_but_keeps_reads_available() {
     use lab_server::processing::Management;
 
