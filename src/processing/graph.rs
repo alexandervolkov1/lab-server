@@ -249,3 +249,6 @@ impl Engine {
         catalog
     }
 }
+
+#[cfg(test)]
+mod tests;
