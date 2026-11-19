@@ -198,3 +198,6 @@ fn upper_bound(bucket: usize) -> u64 {
     let width = (base / SUB_BUCKETS as u64).max(1);
     base + ((offset % SUB_BUCKETS + 1) as u64 * width - 1)
 }
+
+#[cfg(test)]
+mod tests;
