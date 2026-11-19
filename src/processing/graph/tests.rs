@@ -137,6 +137,7 @@ fn add(engine: &mut Engine, name: &str, inputs: &[&str], outputs: usize) {
 }
 
 fn compare_all(engine: &Engine) {
+    compare_signal_lookup(engine);
     for seed in engine.nodes.keys().map(String::as_str).chain(["missing"]) {
         assert_eq!(
             engine.dependents(seed),
@@ -145,6 +146,100 @@ fn compare_all(engine: &Engine) {
             engine.nodes.len()
         );
     }
+}
+
+fn compare_signal_lookup(engine: &Engine) {
+    let catalog = engine.catalog();
+    let mut candidates: Vec<String> = [
+        "",
+        "processing",
+        "processing/",
+        "processing//",
+        "processing///",
+        "processing/missing/value",
+        "processing/root/missing",
+        "processing//value",
+        "processing/root/",
+        "processing/root/value/extra",
+        "Processing/root/value",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for key in catalog.keys() {
+        assert!(engine.contains_signal(key), "missing {key}");
+        candidates.extend([
+            key.clone(),
+            format!("{key}/"),
+            format!("{key}/extra"),
+            format!("/{key}"),
+            format!("{key}x"),
+            key[..key.len() - 1].into(),
+        ]);
+    }
+    for name in engine.nodes.keys() {
+        candidates.extend([
+            signal(name, "missing"),
+            signal(name, ""),
+            signal(&format!("{name}x"), "o0"),
+        ]);
+    }
+    for key in candidates {
+        assert_eq!(
+            engine.contains_signal(&key),
+            catalog.contains_key(&key),
+            "{key:?}"
+        );
+    }
+}
+
+#[test]
+fn signal_lookup_preserves_exact_physical_keys_even_when_they_look_derived() {
+    let mut physical = physical();
+    for key in [
+        "processing/raw/value",
+        "processing//value",
+        "processing/raw/value/extra",
+    ] {
+        let mut description = physical[MAIN].clone();
+        description.id = key.into();
+        physical.insert(key.into(), description);
+    }
+    let mut engine = Engine::new(builtins(), physical);
+    compare_signal_lookup(&engine);
+    let configuration = Configuration {
+        name: "root".into(),
+        type_id: "ema".into(),
+        inputs: [("input".into(), MAIN.into())].into(),
+        parameters: Parameters::new(),
+        max_age_ms: 1000,
+    };
+    engine
+        .create(configuration.clone(), engine.revision)
+        .unwrap();
+    compare_signal_lookup(&engine);
+    engine
+        .configure(configuration.clone(), engine.revision)
+        .unwrap();
+    compare_signal_lookup(&engine);
+    engine
+        .parameter_set("root", "tau".into(), json!(2.), Some(engine.revision))
+        .unwrap();
+    compare_signal_lookup(&engine);
+    let mut changed = configuration;
+    changed.inputs.insert("input".into(), OTHER.into());
+    engine.configure(changed.clone(), engine.revision).unwrap();
+    compare_signal_lookup(&engine);
+    let before = engine.list();
+    changed
+        .inputs
+        .insert("input".into(), signal("root", "value"));
+    assert!(engine.configure(changed, engine.revision).is_err());
+    assert_eq!(engine.list(), before);
+    compare_signal_lookup(&engine);
+    engine.remove("root", false, engine.revision).unwrap();
+    assert!(!engine.contains_signal("processing/root/value"));
+    compare_signal_lookup(&engine);
 }
 
 fn diamond() -> Engine {
