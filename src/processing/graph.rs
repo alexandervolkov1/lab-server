@@ -1,6 +1,6 @@
 //! Dependency validation, ordering and traversal for processing components.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::json;
 
@@ -171,28 +171,43 @@ impl Engine {
         Ok(order)
     }
     pub fn dependents(&self, name: &str) -> Vec<String> {
-        let mut names = BTreeSet::from([name.to_owned()]);
-        loop {
-            let before = names.len();
-            for (id, n) in &self.nodes {
-                if n.config.inputs.values().any(|key| {
-                    names.iter().any(|name| {
-                        self.nodes.get(name).is_some_and(|n| {
-                            n.description
-                                .outputs
-                                .iter()
-                                .any(|o| signal(name, &o.name) == *key)
-                        })
-                    })
-                }) {
-                    names.insert(id.clone());
-                }
-            }
-            if names.len() == before {
-                break;
+        let mut names = vec![name.to_owned()];
+        let Some(source) = self.nodes.get(name) else {
+            return names;
+        };
+        let mut reachable: HashSet<_> = source
+            .description
+            .outputs
+            .iter()
+            .map(|output| signal(name, &output.name))
+            .collect();
+
+        // All consumers of a reachable signal follow its producer in this order.
+        for id in self
+            .order
+            .iter()
+            .skip_while(|id| id.as_str() != name)
+            .skip(1)
+        {
+            let node = &self.nodes[id];
+            if node
+                .config
+                .inputs
+                .values()
+                .any(|key| reachable.contains(key))
+            {
+                names.push(id.clone());
+                reachable.extend(
+                    node.description
+                        .outputs
+                        .iter()
+                        .map(|output| signal(id, &output.name)),
+                );
             }
         }
-        names.into_iter().collect()
+        // Invalidation and audit use lexical order, independent of graph order.
+        names.sort_unstable();
+        names
     }
 
     pub fn lineage(
