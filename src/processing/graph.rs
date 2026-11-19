@@ -10,6 +10,25 @@ use crate::model::{ParameterDescription, Spec};
 use std::time::Duration;
 
 impl Engine {
+    /// Test membership in the current graph without constructing descriptions.
+    pub(crate) fn contains_signal(&self, key: &str) -> bool {
+        if self.physical.contains_key(key) {
+            return true;
+        }
+        let Some((component, output)) = key
+            .strip_prefix("processing/")
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return false;
+        };
+        if component.is_empty() || output.is_empty() || output.contains('/') {
+            return false;
+        }
+        self.nodes
+            .get(component)
+            .is_some_and(|node| node.description.outputs.iter().any(|o| o.name == output))
+    }
+
     pub(super) fn validate_graph(
         &self,
         config: &Configuration,

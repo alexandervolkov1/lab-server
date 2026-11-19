@@ -690,8 +690,7 @@ impl CommandBackend for DeviceService {
     fn available(&self, key: &str) -> bool {
         if !self.catalog.contains_key(key) {
             let engine = self.processing.lock().expect("processing lock poisoned");
-            let catalog = request_phase!(AvailabilityBuild, engine.catalog());
-            return catalog.contains_key(key);
+            return engine.contains_signal(key);
         }
         self.registry().parameter(key).is_some_and(|p| {
             self.fanout.port_usable(&p.port_id)

@@ -15,7 +15,6 @@ pub(crate) enum Phase {
     SnapshotBuild,
     Get,
     Availability,
-    AvailabilityBuild,
     GetValue,
     Actions,
     Describe,
@@ -25,14 +24,13 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    const ALL: [(Self, &'static str); 13] = [
+    const ALL: [(Self, &'static str); 12] = [
         (Self::Parse, "parse"),
         (Self::Dispatch, "dispatch"),
         (Self::Catalog, "catalog"),
         (Self::SnapshotBuild, "snapshot_build"),
         (Self::Get, "get"),
         (Self::Availability, "availability"),
-        (Self::AvailabilityBuild, "availability_build"),
         (Self::GetValue, "get_value"),
         (Self::Actions, "actions"),
         (Self::Describe, "describe"),

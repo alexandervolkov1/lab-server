@@ -351,7 +351,6 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
                 .total_ns
         };
         assert!(total("catalog") >= total("snapshot_build"));
-        assert!(total("availability") >= total("availability_build"));
         assert!(total("get") >= total("availability") + total("get_value"));
         assert!(total("describe") >= total("describe_sort") + total("describe_serialize"));
         reply
@@ -363,8 +362,7 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
         ("availability", 1),
         ("get_value", 1),
     ];
-    let mut derived = physical.to_vec();
-    derived.push(("availability_build", 1));
+    let derived = physical.to_vec();
     let physical_get = r#"{"id":1,"op":"get","key":"furnace1/temperature"}"#;
     let derived_get = r#"{"id":1,"op":"get","key":"processing/smooth/value"}"#;
     assert_eq!(
