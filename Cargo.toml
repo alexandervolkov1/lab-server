@@ -6,6 +6,10 @@ edition = "2024"
 [features]
 gate-metrics = []
 
+[[example]]
+name = "service_gate_bench"
+required-features = ["gate-metrics"]
+
 [dependencies]
 ctrlc = "3.5.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
