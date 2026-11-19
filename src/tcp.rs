@@ -2,7 +2,7 @@
 use crate::connection::TcpConnection;
 use crate::fanout::ObservationReceiver;
 use crate::outbound::V1_OUTPUT_BYTES;
-use crate::service::DeviceService;
+use crate::service::{DeviceService, GateOperation};
 use std::io;
 use std::net::TcpStream;
 
@@ -28,7 +28,7 @@ impl DeviceService {
         connection: &mut TcpConnection,
         observations: &ObservationReceiver,
     ) -> io::Result<bool> {
-        let _gate = self.lock_service();
+        let _gate = self.lock_service(GateOperation::TcpDrive);
         connection.drive_once_with_observations(self, &self.catalog, &self.latest, observations)
     }
 }

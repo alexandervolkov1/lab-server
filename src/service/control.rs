@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::DeviceService;
+use super::{DeviceService, GateOperation};
 use crate::pending::{Completion, Pending, Poll};
 use crate::port_worker::{CommandError, StopReason};
 use crate::processing::{Engine, State};
@@ -18,7 +18,7 @@ pub(super) struct Control {
 impl DeviceService {
     /// Permanently close mutation admission while leaving reads and completions available.
     pub fn stop_controls(&self) {
-        let _gate = self.lock_service();
+        let _gate = self.lock_service(GateOperation::StopControls);
         // Serialize the transition with direct CommandBackend management calls too.
         let mut engine = self.processing.lock().unwrap();
         let authority = self.router.authority();

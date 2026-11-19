@@ -3,6 +3,9 @@ name = "lab-server"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+gate-metrics = []
+
 [dependencies]
 ctrlc = "3.5.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

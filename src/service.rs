@@ -16,9 +16,27 @@ use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
 mod control;
 mod diagnostics;
+#[cfg(feature = "gate-metrics")]
+mod gate_metrics;
 
 use control::Control;
 pub(crate) use diagnostics::Runtime;
+#[cfg(feature = "gate-metrics")]
+use gate_metrics::GateGuard;
+#[cfg(feature = "gate-metrics")]
+pub use gate_metrics::{GateMetric, GateTiming};
+#[cfg(not(feature = "gate-metrics"))]
+type GateGuard<'a> = std::sync::MutexGuard<'a, ()>;
+
+#[derive(Clone, Copy)]
+pub(crate) enum GateOperation {
+    Manage,
+    ApplyEvent,
+    Tick,
+    ReceiveMessage,
+    StopControls,
+    TcpDrive,
+}
 
 const COMPONENT_UNAVAILABLE: &str = "component_unavailable";
 
@@ -27,6 +45,8 @@ pub struct DeviceService {
     pub(crate) runtime: std::sync::OnceLock<Runtime>,
     controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
+    #[cfg(feature = "gate-metrics")]
+    gate_metrics: gate_metrics::GateMetrics,
     processing: Mutex<crate::processing::Engine>,
     continuity: Mutex<HashMap<String, crate::continuity::Continuity>>,
     router: CommandRouter,
@@ -47,14 +67,18 @@ impl DeviceService {
         }
     }
 
-    pub(crate) fn lock_service(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.gate.lock().expect("service lock poisoned")
+    pub(crate) fn lock_service(&self, _operation: GateOperation) -> GateGuard<'_> {
+        let acquire = || self.gate.lock().expect("service lock poisoned");
+        #[cfg(feature = "gate-metrics")]
+        return self.gate_metrics.measure(_operation, acquire);
+        #[cfg(not(feature = "gate-metrics"))]
+        acquire()
     }
     pub fn manage(
         &self,
         command: crate::processing::Management,
     ) -> Result<serde_json::Value, String> {
-        let _gate = self.lock_service();
+        let _gate = self.lock_service(GateOperation::Manage);
         self.manage_inner(command)
     }
     pub(crate) fn manage_inner(
@@ -163,7 +187,7 @@ impl DeviceService {
         event: AggregatorEvent,
         mut record: impl FnMut(&AggregatorEvent),
     ) -> io::Result<()> {
-        let _gate = self.lock_service();
+        let _gate = self.lock_service(GateOperation::ApplyEvent);
         record(&event);
         let mut produced = Vec::new();
         match &event {
@@ -318,7 +342,7 @@ impl DeviceService {
         Ok(())
     }
     pub fn tick_recorded(&self, mut record: impl FnMut(&AggregatorEvent)) -> io::Result<()> {
-        let _gate = self.lock_service();
+        let _gate = self.lock_service(GateOperation::Tick);
         let mut engine = self.processing.lock().unwrap();
         let stale = engine.tick(Instant::now());
         self.reconcile_controls(&mut engine);
@@ -368,6 +392,8 @@ impl DeviceService {
             runtime: std::sync::OnceLock::new(),
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
+            #[cfg(feature = "gate-metrics")]
+            gate_metrics: gate_metrics::GateMetrics::default(),
             processing: Mutex::new(
                 crate::processing::Engine::new(crate::processing::builtins(), catalog.clone())
                     .with_catalog_budget(catalog_budget),
@@ -465,7 +491,7 @@ impl DeviceService {
         text: &str,
         now: Instant,
     ) -> io::Result<()> {
-        let _gate = self.gate.lock().expect("service lock poisoned");
+        let _gate = self.lock_service(GateOperation::ReceiveMessage);
         session.receive_message(text, self, &self.catalog, &self.latest, now)
     }
 
