@@ -125,7 +125,7 @@ struct OperationMetrics {
     hold: Histogram,
 }
 
-struct Histogram {
+pub(crate) struct Histogram {
     buckets: [AtomicU64; BUCKETS],
     max: AtomicU64,
     total: AtomicU64,
@@ -142,14 +142,14 @@ impl Default for Histogram {
 }
 
 impl Histogram {
-    fn record(&self, duration: Duration) {
+    pub(crate) fn record(&self, duration: Duration) {
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         self.buckets[bucket(ns)].fetch_add(1, Relaxed);
         self.max.fetch_max(ns, Relaxed);
         self.total.fetch_add(ns, Relaxed);
     }
 
-    fn snapshot(&self, count: u64) -> GateTiming {
+    pub(crate) fn snapshot(&self, count: u64) -> GateTiming {
         if count == 0 {
             return GateTiming::default();
         }

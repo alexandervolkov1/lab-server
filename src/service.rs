@@ -12,7 +12,7 @@ use crate::fanout::{ObservationFanout, ObservationReceiver};
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::PortHandle;
-use crate::session::{CommandBackend, EnqueueError, PendingRequests};
+use crate::session::{CommandBackend, EnqueueError, PendingRequests, request_phase};
 
 mod control;
 mod diagnostics;
@@ -23,6 +23,8 @@ use control::Control;
 pub(crate) use diagnostics::Runtime;
 #[cfg(feature = "gate-metrics")]
 use gate_metrics::GateGuard;
+#[cfg(feature = "gate-metrics")]
+pub(crate) use gate_metrics::Histogram;
 #[cfg(feature = "gate-metrics")]
 pub use gate_metrics::{GateMetric, GateTiming};
 #[cfg(not(feature = "gate-metrics"))]
@@ -624,12 +626,8 @@ impl CommandBackend for DeviceService {
         )
     }
     fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
-        Some(
-            self.processing
-                .lock()
-                .expect("processing lock poisoned")
-                .catalog(),
-        )
+        let engine = self.processing.lock().expect("processing lock poisoned");
+        Some(request_phase!(SnapshotBuild, engine.catalog()))
     }
     fn actions(&self) -> Vec<ActionDescription> {
         self.registry()
@@ -691,12 +689,9 @@ impl CommandBackend for DeviceService {
     }
     fn available(&self, key: &str) -> bool {
         if !self.catalog.contains_key(key) {
-            return self
-                .processing
-                .lock()
-                .expect("processing lock poisoned")
-                .catalog()
-                .contains_key(key);
+            let engine = self.processing.lock().expect("processing lock poisoned");
+            let catalog = request_phase!(AvailabilityBuild, engine.catalog());
+            return catalog.contains_key(key);
         }
         self.registry().parameter(key).is_some_and(|p| {
             self.fanout.port_usable(&p.port_id)

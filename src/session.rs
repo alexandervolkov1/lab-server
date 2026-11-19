@@ -9,6 +9,8 @@ use serde_json::{Value as Json, json};
 
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::outbound::{OutboundBuffer, is_output_error};
+#[cfg(feature = "gate-metrics")]
+pub mod metrics;
 mod requests;
 mod subscriptions;
 use crate::protocol::{ParseError, Request, parse_request};
@@ -16,48 +18,70 @@ use requests::completion_json;
 pub use requests::{FinishedRequest, PendingRequests};
 pub use subscriptions::{SubscriptionChange, SubscriptionError, SubscriptionSet};
 
+macro_rules! request_phase {
+    ($phase:ident, $body:expr) => {{
+        #[cfg(feature = "gate-metrics")]
+        let _span = $crate::session::metrics::span($crate::session::metrics::Phase::$phase);
+        $body
+    }};
+}
+pub(crate) use request_phase;
+
 pub(crate) fn describe_response(
     id: u64,
     catalog: &HashMap<String, ParameterDescription>,
     mut actions: Vec<ActionDescription>,
 ) -> String {
-    let mut descriptions: Vec<_> = catalog.values().collect();
-    descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    #[cfg(feature = "gate-metrics")]
+    let _describe = metrics::span(metrics::Phase::Describe);
+    let descriptions = request_phase!(DescribeSort, {
+        let mut descriptions: Vec<_> = catalog.values().collect();
+        descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        descriptions
+    });
 
-    let parameters: Vec<_> = descriptions
-        .into_iter()
-        .map(|description| {
-            let (kind, min, max, unit) = match &description.spec {
-                crate::model::Spec::Float { min, max } => {
-                    ("float", json!(min), json!(max), description.unit.as_str())
-                }
-                crate::model::Spec::Integer { min, max } => {
-                    ("integer", json!(min), json!(max), description.unit.as_str())
-                }
-                crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
-            };
+    let parameters: Vec<_> = request_phase!(
+        DescribeJson,
+        descriptions
+            .into_iter()
+            .map(|description| {
+                let (kind, min, max, unit) = match &description.spec {
+                    crate::model::Spec::Float { min, max } => {
+                        ("float", json!(min), json!(max), description.unit.as_str())
+                    }
+                    crate::model::Spec::Integer { min, max } => {
+                        ("integer", json!(min), json!(max), description.unit.as_str())
+                    }
+                    crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
+                };
 
-            json!({
-                "key": &description.id,
-                "type": kind,
-                "min": min,
-                "max": max,
-                "unit": unit,
-                "writable": description.writable,
-                "poll_period_ns": description
-                    .default_poll_period
-                    .map(|period| period.as_nanos())
+                json!({
+                    "key": &description.id,
+                    "type": kind,
+                    "min": min,
+                    "max": max,
+                    "unit": unit,
+                    "writable": description.writable,
+                    "poll_period_ns": description
+                        .default_poll_period
+                        .map(|period| period.as_nanos())
+                })
             })
-        })
-        .collect();
+            .collect()
+    );
 
-    actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    let actions: Vec<_> = actions
-        .into_iter()
-        .map(|action| json!({ "key": action.name, "description": action.description }))
-        .collect();
-
-    json!({"id": id, "status": "ok", "parameters": parameters, "actions": actions}).to_string()
+    request_phase!(
+        DescribeSort,
+        actions.sort_unstable_by(|left, right| left.name.cmp(&right.name))
+    );
+    let response = request_phase!(DescribeJson, {
+        let actions: Vec<_> = actions
+            .into_iter()
+            .map(|action| json!({ "key": action.name, "description": action.description }))
+            .collect();
+        json!({"id": id, "status": "ok", "parameters": parameters, "actions": actions})
+    });
+    request_phase!(DescribeSerialize, response.to_string())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,6 +174,8 @@ pub(crate) enum ParsedMessage {
 
 impl ParsedMessage {
     pub(crate) fn parse(text: &str) -> Self {
+        #[cfg(feature = "gate-metrics")]
+        let _parse = metrics::span(metrics::Phase::Parse);
         match parse_request(text) {
             Ok(request) => Self::Request(request),
             Err(error) => Self::InvalidRequest {
@@ -287,6 +313,8 @@ impl<Input> SessionState<Input> {
     }
 
     pub(crate) fn queue_response(&mut self, response: &str) -> io::Result<()> {
+        #[cfg(feature = "gate-metrics")]
+        let _response = metrics::span(metrics::Phase::Response);
         if !self.audits.is_empty()
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(response)
             && let Some(id) = v["id"].as_u64()
@@ -360,6 +388,8 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
+        #[cfg(feature = "gate-metrics")]
+        let _get = metrics::span(metrics::Phase::Get);
         if self.pending.contains_id(id) {
             return self.queue_error(id, "duplicate_id");
         }
@@ -374,20 +404,23 @@ impl<Input> SessionState<Input> {
                     .lock()
                     .map_err(|_| io::Error::other("observation lock poisoned"))?;
 
-                if !commands.available(&key) {
+                if !request_phase!(Availability, commands.available(&key)) {
                     return self.queue_error(id, "runtime_unavailable");
                 }
 
-                match guard.get(&key) {
-                    Some(observation) => crate::observation_json(Some(id), observation)?,
+                request_phase!(
+                    GetValue,
+                    match guard.get(&key) {
+                        Some(observation) => crate::observation_json(Some(id), observation)?,
 
-                    None => json!({
-                        "id": id,
-                        "status": "no_data",
-                        "key": key
-                    })
-                    .to_string(),
-                }
+                        None => json!({
+                            "id": id,
+                            "status": "no_data",
+                            "key": key
+                        })
+                        .to_string(),
+                    }
+                )
             };
 
             return self.queue_response(&response);
@@ -489,6 +522,8 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
+        #[cfg(feature = "gate-metrics")]
+        let dispatch = metrics::span(metrics::Phase::Dispatch);
         let id = incoming.id();
         let audit = commands.audit_recorder().and_then(|recorder| {
             let (request, invalid_frame) = incoming.audit_request();
@@ -510,6 +545,8 @@ impl<Input> SessionState<Input> {
                 if let Some(a) = audit {
                     a.response(json!({"status":"error","error":"duplicate_id"}));
                 }
+                #[cfg(feature = "gate-metrics")]
+                drop(dispatch);
                 return self.queue_error(id, "duplicate_id");
             }
             self.last_request_id = id;
@@ -519,6 +556,8 @@ impl<Input> SessionState<Input> {
         if let (Some(id), Some(a)) = (id, audit.as_ref()) {
             self.audits.insert(id, a.clone());
         }
+        #[cfg(feature = "gate-metrics")]
+        drop(dispatch);
         let result = match incoming {
             ParsedMessage::Request(request) => {
                 self.dispatch_request(request, commands, catalog, latest, now, audit.as_ref())
@@ -545,7 +584,7 @@ impl<Input> SessionState<Input> {
             | Request::Get { .. }
             | Request::Set { .. }
             | Request::Subscribe { .. }
-            | Request::Unsubscribe { .. } => commands.catalog_snapshot(),
+            | Request::Unsubscribe { .. } => request_phase!(Catalog, commands.catalog_snapshot()),
             _ => None,
         };
         let catalog = snapshot.as_ref().unwrap_or(catalog);
@@ -571,7 +610,9 @@ impl<Input> SessionState<Input> {
             Request::Unsubscribe { id, keys } => {
                 self.dispatch_subscription(id, SubscriptionChange::Unsubscribe, keys, catalog)
             }
-            Request::Describe { id } => self.describe_with_actions(id, catalog, commands.actions()),
+            Request::Describe { id } => {
+                self.describe_with_actions(id, catalog, request_phase!(Actions, commands.actions()))
+            }
             Request::Hello { id } => self.queue_response(
                 &json!({
                     "id": id,
