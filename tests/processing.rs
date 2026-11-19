@@ -2,6 +2,7 @@ use lab_server::model::{Observation, ParameterDescription, SourceMetadata, Spec,
 use lab_server::processing::*;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 #[derive(Clone)]
 struct Gain(f64);
@@ -65,6 +66,144 @@ fn config(name: &str, input: &str) -> Configuration {
         max_age_ms: 1000,
     }
 }
+
+#[derive(Clone)]
+struct ResetTrace {
+    label: String,
+    resets: Arc<Mutex<Vec<String>>>,
+}
+
+impl Component for ResetTrace {
+    fn process(&mut self, inputs: &Inputs) -> Result<Calculation, String> {
+        let value = number(inputs, "input")?;
+        Ok([("value".into(), value), ("extra".into(), value)].into())
+    }
+
+    fn reset(&mut self) {
+        self.resets.lock().unwrap().push(self.label.clone());
+    }
+
+    fn reconfigure(&self, _: &Parameters) -> Result<Box<dyn Component>, String> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+struct ResetFactory {
+    join: bool,
+    resets: Arc<Mutex<Vec<String>>>,
+}
+
+impl ComponentFactory for ResetFactory {
+    fn describe(&self) -> TypeDescription {
+        let mut description = Factory.describe();
+        description.type_id = if self.join { "join" } else { "trace" }.into();
+        if self.join {
+            description.inputs.push("other".into());
+        }
+        description.outputs.push(Output {
+            name: "extra".into(),
+            unit: None,
+        });
+        description.parameters = vec![ParameterSchema {
+            name: "label".into(),
+            unit: String::new(),
+            value_type: ParameterType::Choice {
+                values: ["root", "a", "b", "c", "source", "spare"]
+                    .map(str::to_owned)
+                    .into(),
+            },
+            default: json!("root"),
+        }];
+        description
+    }
+
+    fn create(&self, params: &Parameters) -> Result<Box<dyn Component>, String> {
+        Ok(Box::new(ResetTrace {
+            label: params["label"].as_str().unwrap().into(),
+            resets: self.resets.clone(),
+        }))
+    }
+}
+
+#[test]
+fn rewire_preserves_transitive_dependents_and_invalidates_in_name_order() {
+    type InputLinks = (&'static str, &'static str, Option<&'static str>);
+    let shapes: &[(&[InputLinks], &[&str])] = &[
+        (
+            &[
+                ("a", "processing/root/value", None),
+                ("b", "processing/a/value", None),
+            ],
+            &["a", "b", "root"],
+        ),
+        (
+            &[
+                ("a", "processing/root/value", None),
+                ("b", "processing/root/extra", None),
+                ("c", "processing/b/value", None),
+            ],
+            &["a", "b", "c", "root"],
+        ),
+        (
+            &[
+                ("a", "processing/root/value", None),
+                ("b", "processing/root/extra", None),
+                ("c", "processing/a/value", Some("processing/b/value")),
+            ],
+            &["a", "b", "c", "root"],
+        ),
+        (&[], &["root"]),
+    ];
+    for &(links, names) in shapes {
+        let resets = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::default();
+        for join in [false, true] {
+            registry
+                .register(ResetFactory {
+                    join,
+                    resets: resets.clone(),
+                })
+                .unwrap();
+        }
+        let mut e = Engine::new(registry, engine().catalog());
+        let trace = |name, input, other: Option<&str>| {
+            let mut c = config(name, input);
+            c.type_id = if other.is_some() { "join" } else { "trace" }.into();
+            if let Some(other) = other {
+                c.inputs.insert("other".into(), other.into());
+            }
+            c.parameters.insert("label".into(), json!(name));
+            c
+        };
+        for (name, input, other) in [
+            ("source", "a/raw", None),
+            ("spare", "processing/source/value", None),
+            ("root", "a/raw", None),
+        ]
+        .into_iter()
+        .chain(links.iter().copied())
+        {
+            e.create(trace(name, input, other), e.revision).unwrap();
+        }
+        let expected: Vec<_> = names.iter().map(|name| name.to_string()).collect();
+        let before = e.dependents("root");
+        assert_eq!(before, expected);
+        for input in ["processing/source/extra", "a/raw"] {
+            e.configure(trace("root", input, None), e.revision).unwrap();
+            assert_eq!(e.dependents("root"), before);
+            // The first reset stages the replacement. Each installed node is
+            // then invalidated once, including the shared diamond descendant.
+            let expected_resets: Vec<_> = std::iter::once("root".to_owned())
+                .chain(expected.iter().cloned())
+                .collect();
+            assert_eq!(
+                std::mem::take(&mut *resets.lock().unwrap()),
+                expected_resets
+            );
+        }
+    }
+}
+
 #[test]
 fn custom_factory_chain_atomic_configuration_cycles_and_deletion() {
     let mut e = engine();

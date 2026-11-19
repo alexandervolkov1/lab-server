@@ -131,6 +131,17 @@ impl Fixture {
     fn publish(&self, key: &str, value: f64) {
         self.service.apply_event(self.event(key, value)).unwrap();
     }
+    fn get(&self, key: &str) -> Json {
+        let mut session = Session::new(1, 4096);
+        self.service
+            .receive_message(
+                &mut session,
+                &json!({"id":1,"op":"get","key":key}).to_string(),
+                Instant::now(),
+            )
+            .unwrap();
+        serde_json::from_str(&session.next_message().unwrap().unwrap()).unwrap()
+    }
 }
 fn config(name: &str, input: &str) -> Json {
     json!({"name":name,"type_id":"ema","inputs":{"input":input},"parameters":{"tau":1.},"max_age_ms":10000})
@@ -678,6 +689,209 @@ fn dynamic_filter_replacement_requires_explicit_controller_recovery() {
     join.join().unwrap();
 }
 
+fn audited_fixture(database: &audit_db::Database) -> (Fixture, Recorder) {
+    let f = Fixture::new();
+    let recorder = Recorder::with_options(
+        &database.0,
+        RecorderOptions {
+            audit_enabled: true,
+            measurements_enabled: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f.service.enable_audit(recorder.handle());
+    (f, recorder)
+}
+
+fn pid_config(name: &str, input: &str) -> Json {
+    let mut c = config(name, input);
+    c["type_id"] = json!("pid");
+    c["parameters"] = json!({});
+    c
+}
+
+#[test]
+fn rejected_rewires_preserve_history_subscriptions_bindings_and_audit_state() {
+    let database = audit_db::Database::new();
+    let (f, recorder) = audited_fixture(&database);
+    const ROOT: &str = "processing/smooth/value";
+    const CHILD: &str = "processing/child/value";
+    create(&f, "smooth", "a/x", 0);
+    create(&f, "child", ROOT, 1);
+    for (revision, name, input) in [(2, "loop", "a/y"), (3, "standby", ROOT)] {
+        f.manage(json!({"action":"create","configuration":pid_config(name,input),"expected_revision":revision}));
+    }
+    f.manage(json!({"action":"bind","name":"loop","target":"a/power","command_timeout_ms":1000,"expected_revision":4}));
+    let subscription = f.subscribe(CHILD);
+    let start = Instant::now();
+    let publish = |at, value| {
+        let mut event = f.event("a/x", value);
+        let AggregatorEvent::Measurement { observation, .. } = &mut event else {
+            unreachable!();
+        };
+        observation.metadata.as_mut().unwrap().acquired_at = at;
+        f.service.apply_event(event).unwrap();
+    };
+    publish(start, 0.);
+    f.publish("a/y", 10.);
+    f.manage(json!({"action":"state","name":"loop","state":"auto","expected_revision":5}));
+    let before = f.manage(json!({"action":"list"}));
+    let owners = f.manage(json!({"action":"outputs"}));
+    let cache = [ROOT, CHILD].map(|key| f.get(key));
+    assert!(
+        cache
+            .iter()
+            .all(|item| item["status"] == "ok" && item["value"] == 0.)
+    );
+    assert_eq!(
+        subscription.try_recv().unwrap().observation.reading,
+        Ok(Value::Float(0.))
+    );
+
+    let mut invalid_parameters = config("smooth", "b/y");
+    invalid_parameters["parameters"]["tau"] = json!(-1.);
+    let mut rejected_replacement = pid_config("standby", "b/y");
+    rejected_replacement["parameters"] = json!({"output_min":10.,"output_max":0.});
+    for (configuration, revision, error) in [
+        (config("smooth", CHILD), 6, "dependency_cycle"),
+        (
+            config("smooth", "missing/value"),
+            6,
+            "unknown_or_non_numeric_input",
+        ),
+        (invalid_parameters, 6, "invalid_parameter:tau"),
+        (config("smooth", "b/y"), 5, "revision_conflict"),
+        (pid_config("loop", "b/y"), 6, "stop_before_configure"),
+        (rejected_replacement, 6, "invalid_limits"),
+    ] {
+        let command = json!({"action":"configure","configuration":configuration,"expected_revision":revision});
+        assert_eq!(
+            f.service.manage(serde_json::from_value(command).unwrap()),
+            Err(error.into())
+        );
+        assert_eq!(f.manage(json!({"action":"list"})), before);
+        assert_eq!(f.manage(json!({"action":"outputs"})), owners);
+        assert_eq!([ROOT, CHILD].map(|key| f.get(key)), cache);
+        assert!(matches!(subscription.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    publish(start + Duration::from_secs(1), 10.);
+    let root = -(-1_f64).exp_m1() * 10.;
+    let child = -(-1_f64).exp_m1() * root;
+    assert_eq!(f.get(ROOT)["value"], root);
+    assert_eq!(f.get(CHILD)["value"], child);
+    assert_eq!(
+        subscription.try_recv().unwrap().observation.reading,
+        Ok(Value::Float(child))
+    );
+    recorder.shutdown().unwrap();
+    let db = database.connect();
+    assert_eq!(
+        audit_db::scalar(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE kind='rejected'
+         AND json_extract(context_json,'$.request.command.action')='configure'
+         AND json_extract(details_json,'$.revision_before')=6
+         AND json_extract(details_json,'$.revision_after')=6"
+        ),
+        6
+    );
+    assert_eq!(
+        audit_db::scalar(
+            &db,
+            "SELECT count(*) FROM audit_events WHERE json_extract(details_json,'$.state_after')='fault'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn successful_rewire_audits_active_descendants_in_name_order_only() {
+    let database = audit_db::Database::new();
+    let (f, recorder) = audited_fixture(&database);
+    create(&f, "root", "a/x", 0);
+    for (index, name) in ["delta", "bravo", "charlie", "alpha", "shadow"]
+        .into_iter()
+        .enumerate()
+    {
+        let input = if name == "shadow" {
+            "b/x"
+        } else {
+            "processing/root/value"
+        };
+        f.manage(json!({"action":"create","configuration":pid_config(name,input),"expected_revision":index+1}));
+    }
+    f.publish("a/x", 10.);
+    f.manage(json!({"action":"state","name":"charlie","state":"stopped","expected_revision":6}));
+    f.service
+        .apply_event(AggregatorEvent::DataLost {
+            port_id: "a".into(),
+            loss_epoch: 1,
+        })
+        .unwrap();
+    for (revision, name) in [(7, "alpha"), (8, "delta")] {
+        f.manage(
+            json!({"action":"state","name":name,"state":"shadow","expected_revision":revision}),
+        );
+    }
+    let page = f.manage(
+        json!({"action":"configure","configuration":config("root","b/y"),"expected_revision":9}),
+    );
+    assert_eq!(page["revision"], 10);
+    for (name, state, reason) in [
+        ("alpha", "fault", json!("input_changed")),
+        ("bravo", "fault", json!("source_data_lost")),
+        ("charlie", "stopped", json!("component_stopped")),
+        ("delta", "fault", json!("input_changed")),
+        ("shadow", "shadow", Json::Null),
+    ] {
+        let node = page["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["configuration"]["name"] == name)
+            .unwrap();
+        assert_eq!(node["state"], state);
+        assert_eq!(node["fault"], reason);
+    }
+
+    recorder.shutdown().unwrap();
+    let db = database.connect();
+    let mut query = db.prepare(
+        "SELECT COALESCE(json_extract(context_json,'$.component'),'configure'), kind,
+                json_extract(details_json,'$.revision_before'), json_extract(details_json,'$.revision_after')
+         FROM audit_events
+         WHERE json_extract(context_json,'$.request.reason')='input_changed'
+            OR json_extract(context_json,'$.request.command.action')='configure'
+         ORDER BY id",
+    ).unwrap();
+    let actual = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let expected = [
+        ("alpha", "accepted", None, None),
+        ("alpha", "applied", Some(9), Some(9)),
+        ("delta", "accepted", None, None),
+        ("delta", "applied", Some(9), Some(9)),
+        ("configure", "accepted", None, None),
+        ("configure", "applied", Some(9), Some(10)),
+    ];
+    assert_eq!(
+        actual,
+        expected.map(|(name, kind, before, after)| (name.into(), kind.into(), before, after))
+    );
+}
+
 #[test]
 fn rewire_closes_only_affected_histories_on_same_or_different_port() {
     for target in ["a/y", "b/y"] {
@@ -689,10 +903,14 @@ fn rewire_closes_only_affected_histories_on_same_or_different_port() {
         let child = f.subscribe("processing/child/value");
         let independent = f.subscribe("processing/independent/value");
         f.publish("a/x", 10.);
+        assert_eq!(f.get("processing/child/value")["value"], 10.);
         // Keep queued old observations; they may drain, but no replacement value may follow.
         f.manage(json!({"action":"configure","configuration":config("smooth",target),"expected_revision":3}));
+        assert_eq!(f.get("processing/smooth/value")["status"], "no_data");
+        assert_eq!(f.get("processing/child/value")["status"], "no_data");
         let new = f.subscribe("processing/child/value");
         f.publish(target, 20.);
+        assert_eq!(f.get("processing/child/value")["value"], 20.);
         f.publish("a/y", 30.);
         for r in [&old, &child] {
             assert_eq!(
@@ -712,6 +930,25 @@ fn rewire_closes_only_affected_histories_on_same_or_different_port() {
         );
         assert!(!independent.terminal_when_inactive());
         assert!(independent.try_recv().unwrap().observation.reading.is_ok());
+        if target == "b/y" {
+            f.service
+                .apply_event(AggregatorEvent::DataLost {
+                    port_id: "a".into(),
+                    loss_epoch: 1,
+                })
+                .unwrap();
+            assert!(matches!(new.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(f.get("processing/child/value")["value"], 20.);
+            f.service
+                .apply_event(AggregatorEvent::DataLost {
+                    port_id: "b".into(),
+                    loss_epoch: 1,
+                })
+                .unwrap();
+            assert!(matches!(new.try_recv(), Err(TryRecvError::Disconnected)));
+            assert_eq!(new.closed_error(), "observation_data_lost");
+            assert_eq!(f.get("processing/child/value")["status"], "error");
+        }
     }
 }
 
