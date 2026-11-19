@@ -146,7 +146,7 @@ fn series(nodes: usize) -> Vec<Sample> {
         let sample = measure(|| {
             black_box(engine.configure_with_changes(configuration, revision)).unwrap();
         });
-        assert_eq!(sample.map(|t| t.calls), [1, 1, 1, 1]);
+        assert_eq!(sample.map(|t| t.calls), [1, 1, 0, 1]);
         assert_eq!(engine.state(&last).unwrap().0, State::Fault);
         if index >= WARMUP {
             samples.push(sample);
@@ -164,19 +164,17 @@ fn measure_rewire_phases() {
     println!("nodes,phase,calls,median_us");
     for nodes in [8, 32, 128] {
         let samples = series(nodes);
-        for (index, phase) in [
-            "first_dependents",
-            "changed",
-            "second_dependents",
-            "invalidate",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (phase, label) in [
+            (Phase::FirstDependents, "first_dependents"),
+            (Phase::Changed, "changed"),
+            (Phase::SecondDependents, "second_dependents"),
+            (Phase::Invalidate, "invalidate"),
+        ] {
+            let index = phase as usize;
             let mut times: Vec<_> = samples.iter().map(|s| s[index].elapsed).collect();
             times.sort_unstable();
             let median_us = times[times.len() / 2].as_secs_f64() * 1e6;
-            println!("{nodes},{phase},{},{median_us:.3}", samples[0][index].calls);
+            println!("{nodes},{label},{},{median_us:.3}", samples[0][index].calls);
         }
     }
 }

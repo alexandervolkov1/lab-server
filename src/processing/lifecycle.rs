@@ -171,7 +171,9 @@ impl Engine {
             replacement.reset();
         }
         let name = config.name.clone();
-        let changed = if rewire {
+        let (affected, changed) = if rewire {
+            // Only edges entering this node change. A path from it to a
+            // descendant cannot use such an edge in either validated DAG.
             let dependents = {
                 #[cfg(test)]
                 let _span = super::rewire_measurement::span(
@@ -181,7 +183,7 @@ impl Engine {
             };
             #[cfg(test)]
             let _span = super::rewire_measurement::span(super::rewire_measurement::Phase::Changed);
-            dependents
+            let changed = dependents
                 .iter()
                 .flat_map(|name| {
                     self.nodes[name]
@@ -190,15 +192,22 @@ impl Engine {
                         .iter()
                         .map(move |o| signal(name, &o.name))
                 })
-                .collect()
+                .collect();
+            (dependents, changed)
         } else {
-            BTreeSet::new()
+            (Vec::new(), BTreeSet::new())
         };
         let node = self.nodes.get_mut(&name).unwrap();
         node.config = config;
         node.component = replacement;
         if rewire {
-            self.invalidate_nodes(&[name], "input_changed", FaultUpdate::PreserveInactive);
+            #[cfg(test)]
+            let _span =
+                super::rewire_measurement::span(super::rewire_measurement::Phase::Invalidate);
+            // dependents() yields unique names in lexicographic order.
+            for name in affected {
+                self.invalidate_node(&name, "input_changed", FaultUpdate::PreserveInactive);
+            }
         }
         self.install_graph(plan);
         self.revision += 1;
