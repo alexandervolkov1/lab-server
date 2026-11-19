@@ -361,6 +361,47 @@ fn output_overflow_makes_session_terminal() {
 }
 
 #[test]
+fn describe_fills_the_v1_buffer_then_overflow_preserves_queued_responses() {
+    use crate::outbound::{OutputError, V1_OUTPUT_BYTES};
+    use crate::session::describe_response;
+
+    let ping_reply = r#"{"id":1,"status":"ok"}"#;
+    let mut catalog = get_catalog();
+    let base_bytes = describe_response(2, &catalog, vec![]).len();
+    let extra = V1_OUTPUT_BYTES - base_bytes - ping_reply.len() - 2;
+    let description = catalog.get_mut("sample_temperature").unwrap();
+    description.unit.push_str(&"я".repeat(extra / 2));
+    description.unit.push_str(&"x".repeat(extra % 2));
+    let describe_reply = describe_response(2, &catalog, vec![]);
+
+    let (backend, _commands) = TestBackend::new(1);
+    let latest = Mutex::new(HashMap::new());
+    let now = Instant::now();
+    let mut session = ClientSession::new(1, V1_OUTPUT_BYTES);
+    let mut dispatch = |frame: &[u8]| {
+        for event in session.receive(frame) {
+            session.dispatch_incoming(event, &backend, &catalog, &latest, now)?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    dispatch(b"{\"id\":1,\"op\":\"ping\"}\n{\"id\":2,\"op\":\"describe\"}\n").unwrap();
+    let error = dispatch(b"{\"id\":3,\"op\":\"describe\"}\n").unwrap_err();
+    assert_eq!(
+        error.get_ref().unwrap().downcast_ref::<OutputError>(),
+        Some(&OutputError::Full)
+    );
+    assert!(session.is_terminal());
+    assert!(!session.is_finished());
+    assert_eq!(session.outbound.queued_bytes(), V1_OUTPUT_BYTES);
+    assert!(session.receive(b"{\"id\":4,\"op\":\"ping\"}\n").is_empty());
+
+    let mut wire = Vec::new();
+    session.outbound.flush_to(&mut wire).unwrap();
+    assert_eq!(wire, format!("{ping_reply}\n{describe_reply}\n").as_bytes());
+    assert!(session.is_finished());
+}
+
+#[test]
 fn validates_set_spec_before_queueing() {
     for (writable, spec, value, expected) in [
         (

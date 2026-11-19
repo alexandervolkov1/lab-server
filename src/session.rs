@@ -9,6 +9,8 @@ use serde_json::{Value as Json, json};
 
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::outbound::{OutboundBuffer, is_output_error};
+#[cfg(test)]
+mod describe_tests;
 #[cfg(feature = "gate-metrics")]
 pub mod metrics;
 mod requests;

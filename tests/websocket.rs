@@ -1130,6 +1130,27 @@ fn actions_catalog_commands_ids_and_subscriptions_match_tcp_and_ws() {
 }
 
 #[test]
+fn describe_sends_identical_utf8_bodies_over_tcp_and_websocket() {
+    let server = Running::new();
+    let mut tcp = server.tcp();
+    let mut ws = server.connect();
+    let request = r#"{"id":18446744073709551615,"op":"describe"}"#;
+    writeln!(tcp.get_mut(), "{request}").unwrap();
+    ws.send(Message::Text(request.into())).unwrap();
+
+    let mut wire = String::new();
+    tcp.read_line(&mut wire).unwrap();
+    let Message::Text(message) = ws.read().unwrap() else {
+        panic!("expected describe text");
+    };
+    assert_eq!(wire.strip_suffix('\n').unwrap(), message.as_str());
+    assert!(!message.contains('\n'));
+    let reply: Json = serde_json::from_str(&message).unwrap();
+    assert_eq!(reply["id"], u64::MAX);
+    assert_eq!(reply["status"], "ok");
+}
+
+#[test]
 fn actions_timeout_disconnect_and_other_port_progress_on_both_transports() {
     for use_ws in [false, true] {
         let database = db::Database::new();
