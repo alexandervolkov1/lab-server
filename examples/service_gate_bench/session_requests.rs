@@ -1,5 +1,7 @@
 //! Session request and loopback scenarios sharing the service gate fixture.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use super::{
     AtomicBool, Barrier, BufReader, Fixture, Instant, Json, MAX_OUTPUT_BYTES, Message, PHYSICAL,
     Peer, REPEATS, ROUNDS, Scenario, Session, WARMUP, Write, each_round, json, loopback_pair,
@@ -184,6 +186,46 @@ impl Sizes {
     }
 }
 
+struct Replies {
+    all: Sizes,
+    describe: Sizes,
+    describe_digest: u64,
+}
+
+impl Replies {
+    fn new() -> Self {
+        Self {
+            all: Sizes::new(),
+            describe: Sizes::new(),
+            describe_digest: 0,
+        }
+    }
+
+    fn record(&mut self, body: &str, fingerprint: bool) {
+        self.all.record(body.len());
+        if fingerprint {
+            let mut hasher = DefaultHasher::new();
+            body.hash(&mut hasher);
+            // Merge the same replies from concurrent clients regardless of arrival order.
+            self.describe_digest = self.describe_digest.wrapping_add(hasher.finish());
+            self.describe.record(body.len());
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.all.merge(other.all);
+        self.describe.merge(other.describe);
+        self.describe_digest = self.describe_digest.wrapping_add(other.describe_digest);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recording {
+    GateOnly,
+    Phases,
+    DescribeComparison,
+}
+
 fn record<R>(metrics: Option<&RequestMetrics>, run: impl FnOnce() -> R) -> R {
     if let Some(metrics) = metrics {
         metrics.record_on_thread(run)
@@ -199,7 +241,8 @@ fn direct(
     offset: u64,
     rounds: u64,
     metrics: Option<&RequestMetrics>,
-) -> Sizes {
+    fingerprint: bool,
+) -> Replies {
     let start = Barrier::new(mode.clients() + usize::from(mode.produces()));
     let start = &start;
     let extended = workload != Workload::Mixed;
@@ -208,7 +251,7 @@ fn direct(
             .map(|client| {
                 scope.spawn(move || {
                     let mut session = Session::new(1, MAX_OUTPUT_BYTES);
-                    let mut sizes = Sizes::new();
+                    let mut replies = Replies::new();
                     record(metrics, || {
                         each_round(start, rounds, |id| {
                             let op = workload.operation(mode, client, id);
@@ -220,21 +263,21 @@ fn direct(
                             let response = session.next_message().unwrap().unwrap();
                             op.check(fixture, id, &response, extended);
                             assert!(session.next_message().unwrap().is_none());
-                            sizes.record(response.len());
+                            replies.record(&response, fingerprint && op == Workload::Describe);
                         })
                     });
-                    sizes
+                    replies
                 })
             })
             .collect();
         if mode.produces() {
             fixture.produce(start, offset, rounds);
         }
-        let mut sizes = Sizes::new();
+        let mut replies = Replies::new();
         for join in clients {
-            sizes.merge(join.join().unwrap());
+            replies.merge(join.join().unwrap());
         }
-        sizes
+        replies
     })
 }
 
@@ -244,7 +287,8 @@ fn loopback(
     mode: Mode,
     rounds: u64,
     metrics: Option<&RequestMetrics>,
-) -> (Sizes, Vec<u64>) {
+    fingerprint: bool,
+) -> (Replies, Vec<u64>) {
     let (client, server) = loopback_pair();
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
@@ -263,7 +307,7 @@ fn loopback(
         } else {
             websocket_peer(client)
         };
-        let mut sizes = Sizes::new();
+        let mut replies = Replies::new();
         let mut rtts = Vec::with_capacity(rounds as usize);
         for id in 1..=rounds {
             let frame = workload.frame(fixture, id);
@@ -275,11 +319,11 @@ fn loopback(
             peer.with_received_text(|response| {
                 rtts.push(sent.elapsed().as_nanos().try_into().unwrap());
                 workload.check(fixture, id, response, true);
-                sizes.record(response.len());
+                replies.record(response, fingerprint && workload == Workload::Describe);
             });
         }
         peer.close();
-        (sizes, rtts)
+        (replies, rtts)
     })
 }
 
@@ -301,7 +345,7 @@ struct Report {
     mode: Mode,
     repeat: usize,
     rounds: u64,
-    instrumented: bool,
+    recording: Recording,
 }
 
 impl Report {
@@ -314,7 +358,7 @@ impl Report {
             self.repeat,
             self.mode.clients(),
             self.rounds,
-            self.instrumented
+            self.recording != Recording::GateOnly
         );
     }
 
@@ -329,16 +373,27 @@ impl Report {
         ] {
             print!(",{:.3}", ns as f64 / 1000.0);
         }
-        println!(",,");
+        print!(",,");
+        if self.recording == Recording::DescribeComparison {
+            print!(",");
+        }
+        println!();
     }
 
-    fn sizes(&self, sizes: Sizes) {
-        self.prefix("client", "payload", sizes.count);
-        println!(",,,,,,{},{}", sizes.min, sizes.max);
+    fn sizes(&self, metric: &str, sizes: Sizes, digest: Option<u64>) {
+        self.prefix("client", metric, sizes.count);
+        print!(",,,,,,{},{}", sizes.min, sizes.max);
+        if self.recording == Recording::DescribeComparison {
+            print!(",");
+            if let Some(digest) = digest {
+                print!("{digest:016x}");
+            }
+        }
+        println!();
     }
 }
 
-fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, instrumented: bool) {
+fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, recording: Recording) {
     let rounds = if mode.network() {
         NETWORK_REQUESTS
     } else {
@@ -348,23 +403,39 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, instru
         Fixture::with_catalog(Scenario::Requests, nodes, workload != Workload::Mixed);
     fixture.produce(&Barrier::new(1), 0, 1);
     if mode.network() {
-        loopback(&fixture, workload, mode, WARMUP, None);
+        loopback(&fixture, workload, mode, WARMUP, None, false);
     } else {
-        direct(&fixture, workload, mode, 1, WARMUP, None);
+        direct(&fixture, workload, mode, 1, WARMUP, None, false);
     }
     fixture.service.reset_gate_metrics();
-    let metrics = instrumented.then(RequestMetrics::default);
+    let metrics = (recording != Recording::GateOnly).then(RequestMetrics::default);
+    let fingerprint = recording == Recording::DescribeComparison;
     let offset = 1 + if mode.produces() { WARMUP } else { 0 };
-    let (sizes, mut rtts) = if mode.network() {
-        loopback(&fixture, workload, mode, rounds, metrics.as_ref())
+    let (replies, mut rtts) = if mode.network() {
+        loopback(
+            &fixture,
+            workload,
+            mode,
+            rounds,
+            metrics.as_ref(),
+            fingerprint,
+        )
     } else {
         (
-            direct(&fixture, workload, mode, offset, rounds, metrics.as_ref()),
+            direct(
+                &fixture,
+                workload,
+                mode,
+                offset,
+                rounds,
+                metrics.as_ref(),
+                fingerprint,
+            ),
             vec![],
         )
     };
     let requests = rounds * mode.clients() as u64;
-    assert_eq!(sizes.count, requests);
+    assert_eq!(replies.all.count, requests);
     let gate = fixture.service.gate_metrics();
     let count = |operation| {
         gate.iter()
@@ -401,7 +472,7 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, instru
         mode,
         repeat,
         rounds,
-        instrumented,
+        recording,
     };
     for m in gate.into_iter().filter(|m| m.count != 0) {
         report.timing("gate_wait", m.operation, m.count, m.wait);
@@ -415,6 +486,12 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, instru
                 requests
             );
         }
+        if fingerprint {
+            assert_eq!(
+                phases.iter().find(|m| m.phase == "describe").unwrap().count,
+                replies.describe.count
+            );
+        }
         for m in phases.into_iter().filter(|m| m.count != 0) {
             report.timing("phase", m.phase, m.count, m.timing);
         }
@@ -422,29 +499,40 @@ fn run_trial(nodes: usize, workload: Workload, mode: Mode, repeat: usize, instru
     if !rtts.is_empty() {
         report.timing("client", "rtt", requests, rtt_timing(&mut rtts));
     }
-    report.sizes(sizes);
+    report.sizes("payload", replies.all, None);
+    if replies.describe.count != 0 {
+        report.sizes(
+            "describe_payload",
+            replies.describe,
+            Some(replies.describe_digest),
+        );
+    }
 }
 
-fn print_header() {
-    println!(
+fn print_header(comparison: bool) {
+    print!(
         "nodes,workload,mode,repeat,clients,rounds,instrumented,kind,metric,count,p50_us,p95_us,p99_us,max_us,total_us,min_bytes,max_bytes"
     );
+    if comparison {
+        print!(",digest");
+    }
+    println!();
 }
 
 pub(super) fn benchmark() {
-    print_header();
+    print_header(false);
     for nodes in [1, 8, 32, 128] {
         for workload in Workload::ALL {
             for mode in [Mode::Solo, Mode::WithProducer, Mode::Many] {
                 for repeat in 1..=REPEATS {
-                    run_trial(nodes, workload, mode, repeat, true);
+                    run_trial(nodes, workload, mode, repeat, Recording::Phases);
                 }
             }
         }
         for workload in Workload::NETWORK {
             for mode in [Mode::Tcp, Mode::WebSocket] {
                 for repeat in 1..=REPEATS {
-                    run_trial(nodes, workload, mode, repeat, true);
+                    run_trial(nodes, workload, mode, repeat, Recording::Phases);
                 }
             }
         }
@@ -452,14 +540,40 @@ pub(super) fn benchmark() {
 }
 
 pub(super) fn calibrate() {
-    print_header();
+    print_header(false);
     for nodes in [1, 128] {
         for workload in Workload::NETWORK {
             for repeat in 1..=REPEATS {
                 let first = repeat.is_multiple_of(2);
                 for instrumented in [first, !first] {
-                    run_trial(nodes, workload, Mode::Solo, repeat, instrumented);
+                    let recording = if instrumented {
+                        Recording::Phases
+                    } else {
+                        Recording::GateOnly
+                    };
+                    run_trial(nodes, workload, Mode::Solo, repeat, recording);
                 }
+            }
+        }
+    }
+}
+
+pub(super) fn compare_describe(pair: usize) {
+    print_header(true);
+    let recording = Recording::DescribeComparison;
+    for nodes in [8, 32, 128] {
+        for mode in [Mode::Solo, Mode::WithProducer, Mode::Many] {
+            run_trial(nodes, Workload::Describe, mode, pair, recording);
+        }
+        run_trial(nodes, Workload::Mixed, Mode::Many, pair, recording);
+        for workload in Workload::NETWORK {
+            if workload != Workload::Describe {
+                for mode in [Mode::Solo, Mode::Many] {
+                    run_trial(nodes, workload, mode, pair, recording);
+                }
+            }
+            for mode in [Mode::Tcp, Mode::WebSocket] {
+                run_trial(nodes, workload, mode, pair, recording);
             }
         }
     }

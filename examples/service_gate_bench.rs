@@ -596,11 +596,23 @@ fn print_row(scenario: Scenario, nodes: usize, repeat: usize, rounds: u64, metri
 }
 
 fn main() {
-    let comparison = match std::env::args().nth(1).as_deref() {
+    let mut arguments = std::env::args().skip(1);
+    let comparison = match arguments.next().as_deref() {
         None => false,
         Some("--rewire-comparison") => true,
         Some("--session-request-phases") => return session_requests::benchmark(),
         Some("--session-request-calibration") => return session_requests::calibrate(),
+        Some("--describe-comparison") => {
+            let pair = arguments
+                .next()
+                .map(|arg| {
+                    arg.parse::<usize>()
+                        .expect("expected a positive pair number")
+                })
+                .unwrap_or(1);
+            assert!(pair > 0 && arguments.next().is_none());
+            return session_requests::compare_describe(pair);
+        }
         Some(argument) => panic!("unknown argument {argument}"),
     };
     println!(
