@@ -267,6 +267,17 @@ fn startup_graph_is_identical_for_every_declaration_order() {
 
 #[test]
 fn invalid_startup_aborts_before_open_and_reports_component_and_reason() {
+    let circular = GRAPH.replace("furnace1/sample_temperature", "processing/loop/output");
+    let blocked_by_cycle = format!(
+        "{circular}
+[[processing.components]]
+name = 'blocked'
+type_id = 'ema'
+max_age_ms = 5000
+[processing.components.inputs]
+input = 'processing/loop/output'
+"
+    );
     let cases = [
         (
             GRAPH.replace("\"ema\"", "\"missing\""),
@@ -308,11 +319,8 @@ fn invalid_startup_aborts_before_open_and_reports_component_and_reason() {
             "smooth",
             "dependency_cycle",
         ),
-        (
-            GRAPH.replace("furnace1/sample_temperature", "processing/loop/output"),
-            "loop",
-            "dependency_cycle",
-        ),
+        (circular, "loop", "dependency_cycle"),
+        (blocked_by_cycle, "loop", "dependency_cycle"),
         (
             GRAPH.replace("processing/smooth/value", "processing/smooth/missing"),
             "loop",

@@ -1,7 +1,7 @@
 use lab_server::model::{Observation, ParameterDescription, SourceMetadata, Spec, Value};
 use lab_server::processing::*;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 #[derive(Clone)]
 struct Gain(f64);
@@ -381,6 +381,18 @@ fn multi_input_fresh_trigger_cannot_hide_old_ancestor_from_controller_watchdog()
     controller.type_id = "pid".into();
     controller.max_age_ms = 1000;
     e.create(controller, 1).unwrap();
+    let lineage = e.lineage(&HashMap::from([
+        ("a/raw".into(), BTreeSet::from(["port-a".into()])),
+        ("b/raw".into(), BTreeSet::from(["port-b".into()])),
+    ]));
+    let both_ports = BTreeSet::from(["port-a".to_owned(), "port-b".to_owned()]);
+    assert_eq!(lineage["processing/pair/value"], both_ports);
+    assert_eq!(lineage["processing/loop/output"], both_ports);
+    let catalog = e.catalog();
+    assert_eq!(catalog["processing/pair/value"].unit, "C");
+    assert_eq!(catalog["processing/loop/setpoint"].unit, "C");
+    assert_eq!(catalog["processing/loop/output"].unit, "");
+
     let now = Instant::now();
     let sample = |at| Observation {
         source: "raw".into(),
