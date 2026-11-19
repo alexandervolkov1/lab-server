@@ -126,7 +126,6 @@ impl Engine {
         }
         self.latest.insert(key.clone(), observation.clone());
         let mut changed = BTreeSet::from([key]);
-        let catalog = self.catalog();
         let mut produced = Vec::new();
         for name in &self.order {
             let node = self.nodes.get_mut(name).unwrap();
@@ -200,7 +199,7 @@ impl Engine {
                     .map_err(Clone::clone);
                 let mut sample = observation.clone();
                 sample.source = output.name.clone();
-                sample.unit = catalog[&key].unit.clone();
+                sample.unit = output.unit.as_ref().unwrap_or(&node.inherited_unit).clone();
                 sample.reading = reading;
                 let proposal = if node.state == State::Auto
                     && node.description.proposal.as_ref() == Some(&output.name)

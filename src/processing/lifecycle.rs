@@ -106,7 +106,7 @@ impl Engine {
         let description = factory.describe();
         config.parameters = validate(&description, &config.parameters)?;
         let component = factory.create(&config.parameters)?;
-        let order = self.validate_graph(&config, &description)?;
+        let plan = self.validate_graph(&config, &description)?;
         let state = if description.kind == Kind::Filter {
             State::Running
         } else {
@@ -117,6 +117,7 @@ impl Engine {
             Instance {
                 config,
                 description,
+                inherited_unit: String::new(),
                 component,
                 incarnation: self.next_incarnation,
                 state,
@@ -125,7 +126,7 @@ impl Engine {
         );
         self.next_incarnation += 1;
         self.revision += 1;
-        self.order = order;
+        self.install_graph(plan);
         Ok(())
     }
     pub fn configure(&mut self, config: Configuration, expected: u64) -> Result<(), String> {
@@ -163,7 +164,7 @@ impl Engine {
         }
         let description = node.description.clone();
         config.parameters = validate(&description, &config.parameters)?;
-        let order = self.validate_graph(&config, &description)?;
+        let plan = self.validate_graph(&config, &description)?;
         let mut replacement = node.component.reconfigure(&config.parameters)?;
         let rewire = config.inputs != node.config.inputs;
         if rewire {
@@ -190,7 +191,7 @@ impl Engine {
         if rewire {
             self.invalidate_nodes(&[name], "input_changed", FaultUpdate::PreserveInactive);
         }
-        self.order = order;
+        self.install_graph(plan);
         self.revision += 1;
         Ok(changed)
     }
@@ -218,6 +219,7 @@ impl Engine {
                 keys.push(key);
             }
         }
+        // Every dependent was removed, so the remaining units are still valid.
         self.order.retain(|n| !names.contains(n));
         self.revision += 1;
         Ok(keys)

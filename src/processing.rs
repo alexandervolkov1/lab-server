@@ -51,6 +51,7 @@ impl State {
 struct Instance {
     config: Configuration,
     description: TypeDescription,
+    inherited_unit: String,
     incarnation: u64,
     component: Box<dyn Component>,
     state: State,

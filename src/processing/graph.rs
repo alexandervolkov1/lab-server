@@ -14,7 +14,7 @@ impl Engine {
         &self,
         config: &Configuration,
         desc: &TypeDescription,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(String, String)>, String> {
         Self::validate_inputs(config, desc)?;
         let mut configs: BTreeMap<_, _> = self
             .nodes
@@ -39,7 +39,9 @@ impl Engine {
             .iter()
             .map(|(k, p)| (k.clone(), p.unit.clone()))
             .collect::<HashMap<_, _>>();
-        for name in &order {
+        // Carry the units resolved during budget validation into the committed graph.
+        let mut plan = Vec::with_capacity(order.len());
+        for name in order {
             let (c, d) = configs[name];
             let inherited = c
                 .inputs
@@ -54,11 +56,22 @@ impl Engine {
                 bytes = bytes.saturating_add(cost(&key, &unit));
                 units.insert(key, unit);
             }
+            plan.push((name.to_owned(), inherited));
         }
         if bytes > self.catalog_budget {
             return Err("catalog_capacity".into());
         }
-        Ok(order.into_iter().map(str::to_owned).collect())
+        Ok(plan)
+    }
+
+    pub(super) fn install_graph(&mut self, plan: Vec<(String, String)>) {
+        self.order = plan
+            .into_iter()
+            .map(|(name, unit)| {
+                self.nodes.get_mut(&name).unwrap().inherited_unit = unit;
+                name
+            })
+            .collect();
     }
 
     /// Order a set of declarations before adding them through the usual create path.
