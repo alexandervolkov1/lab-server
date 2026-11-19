@@ -105,6 +105,119 @@ fn custom_factory_chain_atomic_configuration_cycles_and_deletion() {
     assert_eq!(e.state("one").unwrap().1, 3);
 }
 #[test]
+fn emitted_units_and_order_follow_only_committed_graph_changes() {
+    let mut physical = engine().catalog();
+    let mut alternate = physical["a/raw"].clone();
+    alternate.id = "b/raw".into();
+    alternate.unit = "K".into();
+    physical.insert(alternate.id.clone(), alternate);
+    let mut engine = Engine::new(builtins(), physical);
+    let ema = |name, input| Configuration {
+        type_id: "ema".into(),
+        max_age_ms: 10_000,
+        ..config(name, input)
+    };
+    let root = "processing/root/value";
+    let downstream = "processing/downstream/value";
+    let branch = "processing/branch/value";
+    engine.create(ema("root", "a/raw"), 0).unwrap();
+    engine.create(ema("downstream", root), 1).unwrap();
+    engine.create(ema("branch", "a/raw"), 2).unwrap();
+
+    let start = Instant::now();
+    let readings = |engine: &mut Engine, key: &str, seconds, value| {
+        let elapsed = Duration::from_secs(seconds);
+        let now = start + elapsed;
+        engine
+            .process(
+                key.into(),
+                Observation {
+                    source: "raw".into(),
+                    unit: "sample unit".into(),
+                    completed_at: SystemTime::UNIX_EPOCH,
+                    metadata: Some(SourceMetadata {
+                        source_instance: 1,
+                        sequence: seconds + 1,
+                        generation: 0,
+                        acquired_at: now,
+                        elapsed,
+                    }),
+                    reading: Ok(Value::Float(value)),
+                },
+                now,
+            )
+            .into_iter()
+            .map(|item| {
+                (
+                    item.key,
+                    item.observation.unit,
+                    item.observation.reading.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected =
+        |key: &str, unit: &str, value| (key.to_owned(), unit.to_owned(), Value::Float(value));
+    assert_eq!(
+        readings(&mut engine, "a/raw", 0, 10.),
+        [branch, root, downstream].map(|key| expected(key, "C", 10.))
+    );
+
+    let snapshot = engine.list();
+    assert_eq!(
+        engine.configure(ema("root", downstream), 3),
+        Err("dependency_cycle".into())
+    );
+    assert_eq!(engine.list(), snapshot);
+    let alpha = -(-1.0_f64).exp_m1();
+    let smoothed = (1. - alpha) * 10. + alpha * 20.;
+    let smoothed_twice = (1. - alpha) * 10. + alpha * smoothed;
+    assert_eq!(
+        readings(&mut engine, "a/raw", 1, 20.),
+        [
+            expected(branch, "C", smoothed),
+            expected(root, "C", smoothed),
+            expected(downstream, "C", smoothed_twice),
+        ]
+    );
+
+    engine.configure(ema("root", "b/raw"), 3).unwrap();
+    assert_eq!(engine.revision, 4);
+    assert_eq!(engine.state("root"), Some((State::Running, 1)));
+    assert_eq!(engine.state("downstream"), Some((State::Running, 2)));
+    assert_eq!(
+        engine.invalid_outputs(),
+        BTreeSet::from([root.into(), downstream.into()])
+    );
+    assert_eq!(engine.catalog()[downstream].unit, "K");
+    assert_eq!(
+        readings(&mut engine, "b/raw", 2, 30.),
+        [expected(root, "K", 30.), expected(downstream, "K", 30.)]
+    );
+    engine
+        .parameter_set("root", "tau".into(), json!(2.0), Some(4))
+        .unwrap();
+    let alpha_retuned = -(-0.5_f64).exp_m1();
+    let retuned = (1. - alpha_retuned) * 30. + alpha_retuned * 40.;
+    let downstream_retuned = (1. - alpha) * 30. + alpha * retuned;
+    assert_eq!(
+        readings(&mut engine, "b/raw", 3, 40.),
+        [
+            expected(root, "K", retuned),
+            expected(downstream, "K", downstream_retuned),
+        ]
+    );
+    engine.remove("root", true, 5).unwrap();
+    engine.create(ema("root", "a/raw"), 6).unwrap();
+    assert_eq!(engine.state("root"), Some((State::Running, 4)));
+    assert_eq!(engine.catalog()[root].unit, "C");
+    assert!(!engine.catalog().contains_key(downstream));
+    let output = readings(&mut engine, "a/raw", 4, 40.);
+    assert_eq!(output.len(), 2);
+    assert_eq!(output[1], expected(root, "C", 40.));
+}
+
+#[test]
 fn schemas_reject_unknown_fields_and_wrong_types_without_revision_change() {
     let mut e = engine();
     for value in [json!(true), json!("2"), json!(-1), json!(11)] {

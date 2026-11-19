@@ -1,225 +1,158 @@
-# Processing components
+# Ядро обработки компонентов
 
-Status: implemented on feature/processing-components; hardware validation and merge pending review.
-Baseline: `78d150ed484aca8932bbc375bf8c6dc59c64f733`.
+Сервер загружает начальный граф из TOML и поддерживает изменения через `components`
+в протоколе v1. Конфигурация и история вычислений живут в памяти процесса.
+Сетевой контракт описан в [processing-api.md](processing-api.md).
 
-## Boundaries
+## Владельцы состояния
 
-The physical DeviceRegistry remains immutable. A separate dynamic SignalCatalog describes
-physical and derived signals. DeviceService owns component instances in RAM; neither a
-transport session nor a driver owns a component. Configuration is data (type, identity,
-named inputs, parameters, revision), suitable for future TOML loading. There are no
-per-component threads, port opens, or legacy runtimes.
+| Файл | Ответственность |
+| --- | --- |
+| `src/processing.rs` | Публичные пути, `Engine`, общие типы и регистрация EMA/PID. |
+| `processing/schema.rs` | Дескрипторы, фабрики, реестр и проверка параметров. |
+| `processing/lifecycle.rs` | Управление компонентами, ревизии, `incarnation`, переходы состояний, страницы и диагностика. |
+| `processing/graph.rs` | Проверка связей и бюджета `describe`, топологический порядок, каталог, `lineage` и зависимые узлы. |
+| `processing/execution.rs` | Выполнение графа, свежесть входов, производные значения, предложения контроллеров, инвалидация и аудит Fault. |
+| `src/service.rs` | Общий `gate`, проверка непрерывности, вызовы `Engine`, кеш ответов, публикация и передача событий рекордеру. |
+| `service/control.rs` | Привязка выходов, владение, приём предложений и сверка ожидающих физических записей. |
 
-```mermaid
-flowchart LR
-  W[PortWorker] --> A[ObservationAggregator]
-  A --> P[Ordered processing coordinator]
-  R[Component factory registry] --> P
-  P --> C[Signal catalog and cache]
-  P --> F[ObservationFanout]
-  P --> S[SQLite recorder]
-  F --> N[TCP / WS sessions]
-  N --> M[Component management]
-  M --> P
-  P --> O[Output authority]
-  O --> Q[CommandRouter]
-  Q --> W
+`Engine` единолично хранит экземпляры, конфигурации, порядок выполнения,
+историю входов, ревизию, `incarnation`, состояния и причины Fault. Публичные
+типы доступны по прежним путям `processing::...`. Сервис владеет экземпляром
+`Engine` и согласует его изменения с физическим реестром, кешем и подписками.
+Компонент получает конечные числовые входы и возвращает именованные значения.
+Фабрика валидирует параметры и готовит новый объект до установки конфигурации.
+При ошибке подготовки рабочий граф и состояние компонента сохраняются.
+
+Граф проверяет конфликты ключей, доступность числовых входов и циклы.
+Из готовых узлов первым выбирается лексикографически первый. Единица выхода
+берётся из его описания или наследуется от первого именованного входа.
+`lineage` объединяет физические порты всех входов. Каскадное удаление охватывает
+все зависимые узлы. Перепривязка входа инвалидирует истории затронутых ветвей и
+закрывает их прежние подписки на границе управления.
+
+## Путь измерения
+
+1. Рабочий порт формирует метаданные `source_instance`, `sequence`,
+   `generation`, `acquired_at` и `elapsed`. Агрегатор передаёт событие сервису.
+2. Сервис под `gate` передаёт исходное событие рекордеру и проверяет привязку
+   сигнала и непрерывность. Нижняя граница поколения в `Continuity` отсекает
+   старые измерения, в том числе при запаздывающем уведомлении о потере.
+3. `Engine` обновляет историю и выполняет затронутые узлы в порядке графа.
+   Возраст проверяется по самому старому исходному измерению, участвующему
+   в вычислении. Тот же критерий использует периодический watchdog.
+4. Сервис сверяет ожидающие команды, применяет исходное событие к кешу и
+   подпискам, затем обрабатывает предложения контроллеров в порядке графа.
+   Отклонение предложения инвалидирует зависимые результаты до публикации.
+5. Сервис передаёт производные события рекордеру и публикует их в том же порядке
+   под общим `gate`. TCP и WebSocket используют общий диспетчер запросов и
+   текущий каталог для операций с сигналами.
+
+EMA и PID работают на монотонном времени. Перенастройка EMA сохраняет историю,
+если входы прежние. Потеря источника или смена входа сбрасывает историю
+затронутого графа. После Fault контроллер восстанавливается через явный Shadow
+и повторный переход в Auto при свежих входах.
+
+## Физические выходы и аудит
+
+Создание контроллера, привязка и Shadow проходят без физической записи. Auto
+требует свежего входа, привязки и исключительного владения выходом. Сервис
+проверяет и преобразует предложение по целевому `Spec`. `CommandRouter` и
+`PortWorker` применяют разрешение у границы физического вызова с проверкой
+срока команды, поколения владельца и непрерывности источников.
+[Подробнее об управляемых портах](managed-ports.md).
+
+На контроллер приходится максимум одна ожидающая запись. Штатная отмена до
+начала записи сохраняет состояние контроллера. Stopped инвалидирует его
+выходы и зависимый граф. Пассивная обработка сохраняет первоначальную причину
+Fault. При начатой записи рекордер отдельно фиксирует результат драйвера и
+результат ожидающей команды, включая `outcome_unknown` и позднее завершение.
+[Контракт аудита и гарантии SQLite](audit.md).
+
+### Развязка аудита
+
+`Engine` хранит `RecorderHandle` и синхронно регистрирует автоматические
+переходы Fault в `execution.rs`. В следующей задаче можно заменить прямую
+зависимость на синхронный вызов обработчика перехода с именем, `incarnation`,
+ревизией, причиной и состояниями перехода. Адаптер сервиса сможет преобразовать
+это событие в действующие `accepted` и `applied` в той же точке выполнения
+под `gate`. Перед заменой требуется проверить порядок при ошибке вычисления,
+ревизии при Configure, отклонённом предложении и завершении физической команды.
+Перенос эмиссии на конец пакета поменял бы порядок относительно других
+операций аудита. В текущем изменении регистрация остаётся на прежнем месте.
+
+## Стоимость работы под gate
+
+- Изменение управления после валидации пересчитывает `invalid_outputs`,
+  полный каталог для очистки кеша и `lineage` для обновления fanout.
+  Физические домены строятся заново из реестра на этом пути. Чтение типов,
+  списка и выходов возвращается раньше.
+- Для предложения допущенного Auto без ожидающей команды сервис заново
+  строит физические домены и `lineage` для привязки разрешения к поколениям
+  портов. Несколько предложений в пакете могут повторить эту работу.
+- Инвалидация кеша при потере порта и при watchdog с невалидными
+  выходами также строит домены и `lineage`. При отказе предложения внутри
+  текущего пакета сервис может инвалидировать кеш непосредственно по ключам.
+- `dependents` повторно сканирует граф. Перепривязка вызывает его для списка
+  затронутых выходов и снова при инвалидации. Delete, Stopped, Fault и
+  инвалидация от источника или watchdog также используют этот обход.
+- Сеанс запрашивает динамический каталог для пяти операций с сигналами.
+  Проверка доступности производного ключа при `get` может построить ещё один
+  каталог. Измеренные времена ядра приходятся на участки под общим `gate`;
+  длительность удержания и ожидания блокировки сервисом отдельно не измерялась.
+
+Исторические решения и исходные проверки METAKON описаны в версии этого
+документа на базовом коммите `86ba58f`. Реальные COM-порты и оборудование в
+описанных ниже измерениях не участвовали.
+
+## Измерения в Release
+
+```powershell
+$env:CARGO_TARGET_DIR = 'D:\rust_projects\lab-server-agent-build'
+cargo run --release --locked --example processing_core_bench
 ```
 
-## Extensibility and transactions
+Windows 10 Pro 22H2 (19045), AMD Ryzen 5 6600H, rustc 1.95.0
+(`x86_64-pc-windows-msvc`), стандартный Cargo Release. Benchmark использует
+`Instant`, `black_box` и искусственные монотонные метки с шагом 1 мс.
+В графе три физических сигнала. Цепочка состоит из EMA. Дерево с разветвлением
+считает среднее из значения родителя и второго физического входа, который
+подаётся заранее. Исходный образец запускает все компоненты в обеих формах.
 
-A ComponentFactory supplies a stable type identifier, kind (filter/controller), typed
-parameter schema, named input/output descriptions, validation and construction. A Component
-processes samples, resets on coordinator invalidation and prepares a replacement configuration while
-preserving permitted state. Filters and controllers share graph/lifecycle machinery;
-controllers additionally return an optional output proposal, never a hardware command.
-The registry is the only location mentioning builtin factories. API, storage, graph,
-catalog and client use descriptors and trait objects, without an EMA/PID type switch.
+Единица таблицы — мкс на операцию. Для каждой метрики выполняется прогрев
+и девять замеров. В установившемся режиме каждый замер включает 128–2048
+операций для обработки, каталога и lineage, либо 8–128 для поиска зависимых
+и настройки. Усредняется время внутри замера, затем берётся медиана.
+Таблица содержит медианы трёх запусков программы. «Сборка» измеряет создание
+графа с нуля через Create. «Первый проход» измеряет первое выполнение всех
+компонентов на свежем графе. «Компоненты» измеряет N вызовов
+`Component::process` на подготовленных входах, включая выделение карт
+результатов. «Configure» меняет физический вход корня и инвалидирует
+затронутую историю.
 
-Schemas describe float/integer/boolean/enum parameters, defaults, units and bounds.
-Reject unknown fields, nonfinite numbers, incorrect types and cross-field constraint
-violations. Validate the entire candidate graph and configuration before commit. Optimistic
-expected revisions prevent lost updates. Failed validation leaves configuration, revision,
-algorithm state, subscriptions and ownership unchanged. Counters must fail on exhaustion.
+### Базовые замеры после структурного переноса
 
-Identity includes a never-reused server-local incarnation. Revision is distinct from
-incarnation and output ownership generation. Removal/recreation of a name cannot authorize
-old commands or attach an old subscription to a new signal silently.
+| Граф | Узлы | Сборка | Первый проход | Process | Компоненты | Catalog | Lineage | Dependents | Configure |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Цепь | 1 | 17.00 | 5.00 | 3.89 | 0.22 | 1.36 | 1.62 | 0.37 | 8.26 |
+| Цепь | 8 | 103.00 | 23.30 | 20.09 | 1.58 | 4.57 | 6.65 | 10.73 | 43.72 |
+| Цепь | 32 | 1130.40 | 114.70 | 81.89 | 10.25 | 23.91 | 48.16 | 220.85 | 550.62 |
+| Цепь | 128 | 32697.80 | 448.20 | 335.30 | 25.27 | 67.26 | 97.17 | 2891.78 | 6423.85 |
+| Дерево | 1 | 7.40 | 4.00 | 4.17 | 0.18 | 1.32 | 1.75 | 0.47 | 7.61 |
+| Дерево | 8 | 94.00 | 24.30 | 23.55 | 1.41 | 4.59 | 8.97 | 8.47 | 38.56 |
+| Дерево | 32 | 1051.40 | 122.20 | 91.22 | 5.60 | 16.92 | 34.33 | 94.65 | 270.69 |
+| Дерево | 128 | 17460.40 | 447.60 | 378.28 | 22.31 | 67.60 | 135.57 | 1458.51 | 3387.14 |
 
-## Graph, catalog and event order
+Отдельный `catalog()` составляет 18–35% от времени полного `process()`.
+Прямые вызовы компонентов занимают 4–13%. Это оценки по раздельным замерам.
+Полный проход дополнительно включает обход графа, копирование входов,
+обновление истории и сбор выходов. Поиск зависимых в графе из 128 узлов
+достиг 2,89 мс на цепочке и 1,46 мс на дереве. Перепривязка корня
+заняла соответственно 6,42 и 3,39 мс.
 
-Named input edges reference catalog signals. Validate existence, scalar type, output name
-collisions and acyclicity before publication; evaluate in deterministic topological order.
-Each source event precedes all of its derived events in cache, fanout and recorder.
-Management changes share the coordinator's commit boundary with observations. Publish
-catalog registration before first value; invalidate/remove before acknowledging deletion.
-Reject deletion with dependents unless an explicit cascade is requested. Cascade removes the transitive dependency set and revokes controller authority at
-the same service commit boundary, before acknowledging deletion.
-
-Dynamic catalog membership must reach both describe/get and fanout domains. Domain lineage
-is a set of physical source incarnations, not a fabricated physical port. Multi-input
-components inherit all source domains. A removed signal terminates affected streams with
-an explicit reason; unrelated clients/ports continue. No replay is implied.
-
-## Quality and time
-
-Errors, missing inputs, stale samples, backwards/duplicate timestamps, port stop and loss
-invalidate all descendants. An independent monotonic watchdog detects silence; receiving
-no event must not leave an Auto controller active indefinitely. Finite numeric validation
-also applies to computed outputs. The graph carries the oldest contributing acquisition
-time across multi-input chains; a fresh trigger cannot hide an aged ancestor. Wall-clock timestamps remain for display/SQLite;
-elapsed-time processing and freshness require monotonic acquisition metadata.
-
-Current AggregatorEvent::DataLost is explicitly retrospective: it can arrive after an
-affected batch, and equal epoch reads do not certify continuity. Resetting a filter only
-at the notification does not establish a trustworthy recovery boundary. The worker envelope and Continuity acceptance floor resolve recovery; see the implementation record below.
-
-## Mathematics
-
-EMA initializes from the first valid sample and uses alpha = -expm1(-dt/tau), tau > 0.
-Changing tau preserves value and clock; input replacement or invalidation resets history.
-PID uses error = setpoint - measurement, derivative on measurement, conditional integral
-anti-windup and finite inclusive output bounds. First sample has no I/D increment. Large
-gaps invalidate the controller instead of integrating across the gap. Diagnostics are
-ordinary signals (error, P, I, D, unconstrained output, bounded output).
-
-## Output authority
-
-Created controllers are shadow-only. Explicit Auto acquisition requires valid fresh input
-and a writable target. Manual grants operator writes; Auto grants one controller writes.
-Every write uses CommandRouter/PortWorker and a generation checked at the driver's start
-boundary. Checking only at enqueue is insufficient. Stop/delete/invalidation revokes queued
-generations. An already-started write cannot be cancelled: retain its execution record and
-do not grant a conflicting owner until it resolves. outcome_unknown latches a fault;
-neither periodic updates nor recovery may automatically retry it.
-
-The authority is algorithm-independent. It validates the calculated finite value against
-the target Spec. Integer targets (including furnace1/power) use explicit nearest-integer
-rounding, halves away from zero, with range checks both before and after conversion;
-out-of-range proposals are rejected, never silently clamped by the adapter.
-
-Generic actions may mutate outputs too. Their admission must participate in ownership;
-until effect metadata exists, conservatively reserve the entire device for an action.
-Do not infer effects from action names. Safe release means revoking authority and accounting
-for in-flight commands; it does not assert that a physical heater has switched off.
-A configured safe-output procedure requires a separate explicit contract and confirmation.
-Manual requests remain explicit operator actions after outcome_unknown; automatic authority stays faulted.
-
-## API and client direction
-
-Extend protocol v1 additively with generic type listing, instance listing, create, configure,
-delete and controller-state operations. Requests retain monotonic connection IDs and bounded
-frames. Configuration mutations carry expected_revision; responses include revision and
-incarnation. Type descriptors expose schema and ports. No EMA-only/PID-only network commands.
-describe/get/subscribe use the same dynamic catalog on TCP and WS. Steel wrappers should
-mirror generic operations and leave scripts/arduino-start.scm unchanged.
-
-The implemented wire fields and executable examples are documented in processing-api.md
-and lab-plot/docs/processing.md.
-
-The inspected lab-plot baseline is `386459a` on main. Its typed Request enum, encoder,
-ResponseData parser, worker matches_request and Steel response conversion now support a
-generic management request/result family. The worker validates the response against the
-pending typed request. Existing variants and ACK semantics are preserved. Descriptor-driven
-JSON converts to Steel values without a concrete algorithm switch. Plot bindings use global
-signal keys for both physical and derived signals. Client changes are isolated on
-lab-plot feature/processing-components.
-
-## Archive reference
-
-Reviewed com_port_reader at `1502efb76dcd02eb626bbd6c2e49a047c2f29353`:
-`src/signal_processing/filter.rs`, `graph.rs`, `src/process_control/pid.rs`.
-Useful behavior: elapsed-time EMA, state-preserving retune, transitive reset/removal,
-derivative on measurement and anti-windup. Its central concrete filter enum is not reused.
-Reviewed lab-runtime-legacy at `5f357933566fb5cf6c6a7c131d9e149aa1999039`:
-`crates/lab-core/src/control.rs`, `output/authority.rs`. Useful separation: algorithm
-proposal versus authority, instance/epoch lease validation, ambiguous write latch.
-Its runtime, thread management and EMA/PID-specific controller aggregate are not reused.
-
-## Baseline validation (stage 0)
-
-Both working trees were clean. Fetched origin: master `95fec78`, feature `78d150e`,
-0 behind / 4 ahead. fmt, check --all-targets, Debug/Release tests and Clippy
---all-targets -- -D warnings passed with CARGO_TARGET_DIR set as documented in README.
-Each test profile passed 362 tests. The initial invocation without that environment
-variable failed 9 SQLite test setup checks; no source changes were needed.
-Rechecked refs, merged --ff-only and pushed master normally. Feature branch retained.
-Real METAKON hardware was not tested; writes remain disabled by default. No COM port opened.
-
-Additional baseline verification: 20 concurrent library tests and all 11 aggregator
-integration tests passed on each of three repeated runs. `git diff --check` passed.
-These validate the existing implementation only, not the proposed processing design.
-
-The fast-forward included these existing commits (no merge commit was created):
-
-| SHA | Change |
-| --- | --- |
-| `69dbf7b25afb55f3e56dd3fd74ca0d2e57be57f2` | METAKON driver and hardware-free integration tests |
-| `1376a5d4c89d89ebf3c4bf56628490937ed46fec` | Read-only trial documentation and protocol decisions |
-| `c2f43ca599a9d0d20a1e9077abc8aad03119bf16` | Interframe pause |
-| `78d150ed484aca8932bbc375bf8c6dc59c64f733` | Arduino PowerShell launcher |
-
-Branches: [processing-components](https://github.com/alexandervolkov1/lab-server/tree/feature/processing-components),
-[retained metakon-5x3-driver](https://github.com/alexandervolkov1/lab-server/tree/feature/metakon-5x3-driver).
-Master will not be changed again before review. No PR, tag or release was created.
-
-## Принятый контракт и реализация
-
-Вариант A утверждён пользователем и реализован. PortWorker создаёт SourceMetadata:
-source_instance, sequence периодической попытки, generation, acquired_at (Instant),
-elapsed от начала worker. Ошибки чтения также являются попытками; пропущенная отправка
-увеличивает поколение следующего принятого образца. Агрегатор не восстанавливает метаданные.
-Continuity хранит минимально допустимое поколение и отклоняет старый префикс независимо
-от позиции DataLost. MAX означает постоянную утрату непрерывности. Старые исходные
-измерения сохраняются в recorder, но не восстанавливают граф. Контроллер после потери
-остаётся fault до явного shadow и отдельного Auto; фильтр инициализируется новым поколением.
-
-Общие интерфейсы находятся в src/processing.rs: ComponentFactory, Component, Registry,
-TypeDescription, ParameterSchema/ParameterType, Configuration, Engine и Management.
-В этой версии сигналы компонентов — конечные числовые скаляры, именованные входы и выходы;
-параметры поддерживают float/integer/boolean/choice. Kind определяет lifecycle фильтра или
-контроллера, proposal указывает выход-кандидат контроллера. Центральный код не знает
-конкретных типов EMA/PID. Для нового типа реализуйте factory и Component, зарегистрируйте
-его в builtins() (или Registry при самостоятельном использовании Engine), добавьте
-математические тесты. Транспорт, recorder и клиент менять не требуется.
-
-prepare/reconfigure возвращает новый объект до commit, а проверки конфигурации и графа
-выполняются до изменения RAM. Глобальная revision обеспечивает CAS всех управленческих
-изменений. Граф ограничен, порядок детерминирован, каталог вычисляется топологически,
-lineage связывает производный сигнал со всеми исходными физическими портами. Общий gate
-DeviceService сериализует управление и исходное событие со всеми производными событиями;
-recording callback выполняется на этой же границе. Дополнительных runtime/worker потоков
-не создано. Watchdog обслуживается существующим startup loop даже при пустом агрегаторе.
-
-Output Authority создаётся в startup и разделяется Managed workers и CommandRouter.
-Подробности режимов и проверки issuer/scope описаны в [managed-ports.md](managed-ports.md).
-Permit передаётся
-в существующий SetExecution и проверяется непосредственно при начале команды PortWorker.
-Проверяются поколение владельца, поколения и живость исходных портов, deadline. Последний
-ограничен возрастом входа. Atomic source_alive позволяет проверить остановку без повторного
-захвата worker stop mutex. У Generic action консервативная область — все writable-выходы
-прибора. Controller держит не более одной ожидающей команды; ошибки отзывают authority.
-
-Код и тесты реализации: src/continuity.rs, src/processing/, src/output.rs,
-tests/processing.rs, tests/processing_service.rs, тест processing_management в
- tests/websocket.rs, loss_before_old_prefix в src/port_worker/subscription_races.rs.
-SQLite v2 включает транзакционную миграцию v1, исходные метаданные и общий record_order.
-В lab-plot добавлены typed request/result, Steel wrappers и проверка реального серверного
-тракта Arduino driver → EMA → TCP → PlotState с эмуляцией serial I/O в памяти.
-
-Точный сетевой контракт, переходы состояний, ограничения и совместимость описаны в
-[processing-api.md](processing-api.md). Примеры Steel находятся в lab-plot/docs/processing.md.
-Конфигурации пока RAM-only; data-only Configuration допускает последующий TOML loader.
-Физическое оборудование, аппаратные interlock и восстановление COM-порта не проверены.
-Автоматического повторного открытия остановившегося порта по-прежнему нет.
-
-
-### Command audit
-
-The shared Recorder now uses schema v3 with additive v1/v2 migrations and a separate
-bounded audit queue. PID writes carry component name/incarnation, proposal and converted
-value through SetExecution. Driver completion and controller Pending result are separate
-facts. Management commands retain arguments and revisions under the existing service gate;
-automatic Fault transitions are internal operations. No ownership, state transition or
-retry rules changed. See [audit.md](audit.md) for the event contract and completeness limits.
+Микробенчмарк не включает сеть, запись SQLite, ожидание `gate`, устройства
+и полный запуск сервера. Размеры устройств, число активных ветвей,
+нагрузка ОС и настройка процессора влияют на абсолютные значения. Графы
+используют разные компоненты, поэтому сравнивать эффект изменений следует
+внутри одной формы и размера. Холодные замеры получают свежие экземпляры
+графа в уже запущенном процессе.
