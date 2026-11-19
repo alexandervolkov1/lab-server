@@ -20,13 +20,12 @@ pub(crate) enum Phase {
     Actions,
     Describe,
     DescribeSort,
-    DescribeJson,
     DescribeSerialize,
     Response,
 }
 
 impl Phase {
-    const ALL: [(Self, &'static str); 14] = [
+    const ALL: [(Self, &'static str); 13] = [
         (Self::Parse, "parse"),
         (Self::Dispatch, "dispatch"),
         (Self::Catalog, "catalog"),
@@ -38,7 +37,6 @@ impl Phase {
         (Self::Actions, "actions"),
         (Self::Describe, "describe"),
         (Self::DescribeSort, "describe_sort"),
-        (Self::DescribeJson, "describe_json"),
         (Self::DescribeSerialize, "describe_serialize"),
         (Self::Response, "response"),
     ];

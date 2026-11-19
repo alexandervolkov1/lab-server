@@ -353,10 +353,7 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
         assert!(total("catalog") >= total("snapshot_build"));
         assert!(total("availability") >= total("availability_build"));
         assert!(total("get") >= total("availability") + total("get_value"));
-        assert!(
-            total("describe")
-                >= total("describe_sort") + total("describe_json") + total("describe_serialize")
-        );
+        assert!(total("describe") >= total("describe_sort") + total("describe_serialize"));
         reply
     };
     let physical = [
@@ -464,8 +461,7 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
             ("snapshot_build", 1),
             ("actions", 1),
             ("describe", 1),
-            ("describe_sort", 2),
-            ("describe_json", 2),
+            ("describe_sort", 1),
             ("describe_serialize", 1),
         ],
     );

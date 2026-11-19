@@ -9,6 +9,7 @@ use serde_json::{Value as Json, json};
 
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::outbound::{OutboundBuffer, is_output_error};
+mod describe;
 #[cfg(test)]
 mod describe_tests;
 #[cfg(feature = "gate-metrics")]
@@ -16,6 +17,7 @@ pub mod metrics;
 mod requests;
 mod subscriptions;
 use crate::protocol::{ParseError, Request, parse_request};
+pub(crate) use describe::describe_response;
 use requests::completion_json;
 pub use requests::{FinishedRequest, PendingRequests};
 pub use subscriptions::{SubscriptionChange, SubscriptionError, SubscriptionSet};
@@ -28,63 +30,6 @@ macro_rules! request_phase {
     }};
 }
 pub(crate) use request_phase;
-
-pub(crate) fn describe_response(
-    id: u64,
-    catalog: &HashMap<String, ParameterDescription>,
-    mut actions: Vec<ActionDescription>,
-) -> String {
-    #[cfg(feature = "gate-metrics")]
-    let _describe = metrics::span(metrics::Phase::Describe);
-    let descriptions = request_phase!(DescribeSort, {
-        let mut descriptions: Vec<_> = catalog.values().collect();
-        descriptions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        descriptions
-    });
-
-    let parameters: Vec<_> = request_phase!(
-        DescribeJson,
-        descriptions
-            .into_iter()
-            .map(|description| {
-                let (kind, min, max, unit) = match &description.spec {
-                    crate::model::Spec::Float { min, max } => {
-                        ("float", json!(min), json!(max), description.unit.as_str())
-                    }
-                    crate::model::Spec::Integer { min, max } => {
-                        ("integer", json!(min), json!(max), description.unit.as_str())
-                    }
-                    crate::model::Spec::Boolean => ("boolean", json!(null), json!(null), ""),
-                };
-
-                json!({
-                    "key": &description.id,
-                    "type": kind,
-                    "min": min,
-                    "max": max,
-                    "unit": unit,
-                    "writable": description.writable,
-                    "poll_period_ns": description
-                        .default_poll_period
-                        .map(|period| period.as_nanos())
-                })
-            })
-            .collect()
-    );
-
-    request_phase!(
-        DescribeSort,
-        actions.sort_unstable_by(|left, right| left.name.cmp(&right.name))
-    );
-    let response = request_phase!(DescribeJson, {
-        let actions: Vec<_> = actions
-            .into_iter()
-            .map(|action| json!({ "key": action.name, "description": action.description }))
-            .collect();
-        json!({"id": id, "status": "ok", "parameters": parameters, "actions": actions})
-    });
-    request_phase!(DescribeSerialize, response.to_string())
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnqueueError {
