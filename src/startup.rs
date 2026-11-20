@@ -26,7 +26,7 @@ use crate::recorder::{
     DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
 };
 use crate::tcp::MultiDeviceTcp;
-use crate::virtual_device::{VirtualDeviceIo, VirtualDriver};
+use crate::virtual_device::{VirtualModel, create_model};
 
 type StartupResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const IDLE_WAIT: Duration = Duration::from_millis(5);
@@ -136,11 +136,20 @@ pub fn start(config: &ServerConfig) -> StartupResult<StartedServer> {
 /// requested preparation delay before returning it. No retries are performed.
 pub fn start_with<P: DeviceIo + Send + 'static>(
     config: &ServerConfig,
+    factory: impl FnMut(&DeviceConfig) -> Result<DriverSetup, String>,
+    open: impl FnMut(&PortConfig, Duration) -> io::Result<P>,
+) -> StartupResult<StartedServer> {
+    start_with_model_factory(config, factory, open, create_model)
+}
+
+fn start_with_model_factory<P: DeviceIo + Send + 'static>(
+    config: &ServerConfig,
     mut factory: impl FnMut(&DeviceConfig) -> Result<DriverSetup, String>,
     mut open: impl FnMut(&PortConfig, Duration) -> io::Result<P>,
+    model_factory: impl FnMut(&str, &toml::Table) -> Result<Box<dyn VirtualModel>, String>,
 ) -> StartupResult<StartedServer> {
     let started_at = std::time::Instant::now();
-    let mut virtual_models = config.validate_with_models()?;
+    let mut virtual_models = config.validate_with_models(model_factory)?;
     let mut grouped = HashMap::<&str, (Vec<DeviceInstance>, Duration)>::new();
     let mut registry = DeviceRegistry::new();
     for port in &config.ports {
@@ -156,7 +165,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
         };
         let setup = match virtual_models.get(device.port.as_str()) {
             Some(model) => DriverSetup {
-                driver: Box::new(VirtualDriver::new(model.as_ref())),
+                driver: Box::new(model.driver()),
                 post_open_delay: Duration::ZERO,
             },
             None => factory(device).map_err(invalid)?,
@@ -249,11 +258,7 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             let (devices, _) = grouped
                 .remove(port.id.as_str())
                 .expect("validated virtual device");
-            let io = VirtualDeviceIo::new(model).map_err(|message| ConfigError::Validation {
-                field: format!("virtual port {:?}", port.id),
-                message,
-            })?;
-            prepare_port(&port.id, Ok(Box::new(io)), devices)?;
+            prepare_port(&port.id, Ok(Box::new(model.into_io())), devices)?;
         }
         tcp.attach_startup_ports(ports, OBSERVATION_QUEUE_CAPACITY);
         if let Some(handle) = &recording.handle {

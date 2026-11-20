@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::virtual_device::{VirtualModel, create_model};
+use crate::virtual_device::{PreparedVirtualModel, VirtualModel, create_model};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,12 +208,13 @@ impl ServerConfig {
     /// Also usable after constructing or editing the public model in memory.
     /// Returns the first error without opening any I/O resources.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with_models().map(drop)
+        self.validate_with_models(create_model).map(drop)
     }
 
     pub(crate) fn validate_with_models(
         &self,
-    ) -> Result<HashMap<&str, Box<dyn VirtualModel>>, ConfigError> {
+        mut model_factory: impl FnMut(&str, &toml::Table) -> Result<Box<dyn VirtualModel>, String>,
+    ) -> Result<HashMap<&str, PreparedVirtualModel>, ConfigError> {
         if let Some(ws) = &self.websocket {
             if ws.enabled && ws.bind.is_none() {
                 return Err(invalid("websocket.bind", "required when enabled"));
@@ -324,7 +325,8 @@ impl ServerConfig {
                     format!("duplicate {:?}; already declared in {previous}.id", port.id),
                 ));
             }
-            let model = create_model(&port.model, &port.options)
+            let model = model_factory(&port.model, &port.options)
+                .and_then(PreparedVirtualModel::new)
                 .map_err(|reason| invalid(&object, format!("model {:?}: {reason}", port.model)))?;
             virtual_models.insert(port.id.as_str(), model);
         }

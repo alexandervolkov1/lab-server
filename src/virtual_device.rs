@@ -54,6 +54,7 @@ enum Reply {
     Reading(WireValue),
     Complete,
     Error(String),
+    SourceStopped(String),
 }
 
 // Keep all model values exact across the private wire format.
@@ -94,10 +95,44 @@ pub struct VirtualDeviceIo {
     last_elapsed: Duration,
 }
 
+/// A model with a validated step period whose clock has not started yet.
+pub(crate) struct PreparedVirtualModel {
+    model: Box<dyn VirtualModel>,
+    period: Duration,
+}
+
+impl PreparedVirtualModel {
+    pub(crate) fn new(model: Box<dyn VirtualModel>) -> Result<Self, String> {
+        let period = model.step_period();
+        if period.is_zero() {
+            return Err("virtual model step period must be positive".into());
+        }
+        Ok(Self { model, period })
+    }
+
+    pub(crate) fn driver(&self) -> VirtualDriver {
+        VirtualDriver::new(self.model.as_ref())
+    }
+
+    pub(crate) fn into_io(self) -> VirtualDeviceIo {
+        let epoch = Instant::now();
+        self.with_clock(move || epoch.elapsed())
+    }
+
+    fn with_clock(self, clock: impl Fn() -> Duration + Send + 'static) -> VirtualDeviceIo {
+        VirtualDeviceIo {
+            model: self.model,
+            reply: Cursor::new(Vec::new()),
+            clock: Box::new(clock),
+            period: self.period,
+            last_elapsed: Duration::ZERO,
+        }
+    }
+}
+
 impl VirtualDeviceIo {
     pub fn new(model: Box<dyn VirtualModel>) -> Result<Self, String> {
-        let epoch = Instant::now();
-        Self::with_clock(model, move || epoch.elapsed())
+        Ok(PreparedVirtualModel::new(model)?.into_io())
     }
 
     /// `clock` reports monotonic elapsed time since model time zero.
@@ -105,30 +140,21 @@ impl VirtualDeviceIo {
         model: Box<dyn VirtualModel>,
         clock: impl Fn() -> Duration + Send + 'static,
     ) -> Result<Self, String> {
-        let period = model.step_period();
-        if period.is_zero() {
-            return Err("virtual model step period must be positive".into());
-        }
-        Ok(Self {
-            model,
-            reply: Cursor::new(Vec::new()),
-            clock: Box::new(clock),
-            period,
-            last_elapsed: Duration::ZERO,
-        })
+        Ok(PreparedVirtualModel::new(model)?.with_clock(clock))
     }
 
-    fn advance_to_now(&mut self) -> Result<(), String> {
+    fn advance_to_now(&mut self) -> Result<(), Reply> {
         let elapsed = (self.clock)();
         if elapsed < self.last_elapsed {
-            return Err("virtual model clock moved backwards".into());
+            return Err(Reply::Error("virtual model clock moved backwards".into()));
         }
         let period = self.period.as_nanos();
         let steps = elapsed.as_nanos() / period - self.last_elapsed.as_nanos() / period;
         if steps > u128::from(MAX_STEPS_PER_TRANSACTION) {
-            return Err(format!(
+            // No future monotonic timestamp can fit the budget without skipping steps.
+            return Err(Reply::SourceStopped(format!(
                 "virtual model catch-up needs {steps} steps, limit is {MAX_STEPS_PER_TRANSACTION}"
-            ));
+            )));
         }
         // Advance first so mutations use the old inputs for every completed
         // step. Fractions of a step stay aligned to the original clock epoch.
@@ -139,8 +165,10 @@ impl VirtualDeviceIo {
         Ok(())
     }
 
-    fn execute(&mut self, request: Request) -> Result<Reply, String> {
-        self.advance_to_now()?;
+    fn execute(&mut self, request: Request) -> Reply {
+        if let Err(reply) = self.advance_to_now() {
+            return reply;
+        }
         match request {
             Request::Read(parameter) => self
                 .model
@@ -152,6 +180,7 @@ impl VirtualDeviceIo {
                 .map(|()| Reply::Complete),
             Request::Invoke(action) => self.model.invoke_action(&action).map(|()| Reply::Complete),
         }
+        .unwrap_or_else(Reply::Error)
     }
 }
 
@@ -189,7 +218,7 @@ impl DeviceIo for VirtualDeviceIo {
                 )
             })?;
         let request = serde_json::from_slice(request)?;
-        let reply = self.execute(request).unwrap_or_else(Reply::Error);
+        let reply = self.execute(request);
         self.reply.get_mut().clear();
         self.reply.set_position(0);
         serde_json::to_writer(self.reply.get_mut(), &reply)?;
@@ -228,6 +257,9 @@ impl VirtualDriver {
             .ok_or_else(|| malformed_reply("incomplete frame"))?;
         match serde_json::from_slice(payload).map_err(malformed_reply)? {
             Reply::Error(message) => Err(DriverError::new(message, PortState::Synchronized)),
+            Reply::SourceStopped(message) => {
+                Err(DriverError::new(message, PortState::Disconnected))
+            }
             reply => Ok(reply),
         }
     }

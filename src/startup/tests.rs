@@ -52,6 +52,79 @@ fn server() -> (StartedServer, Arc<AtomicU64>) {
     .unwrap();
     (server, calls)
 }
+
+struct ZeroPeriodModel;
+
+impl VirtualModel for ZeroPeriodModel {
+    fn parameters(&self) -> Vec<ParameterDescription> {
+        Vec::new()
+    }
+
+    fn read(&self, _: &str) -> Result<Value, String> {
+        unreachable!()
+    }
+
+    fn write(&mut self, _: &str, _: Value) -> Result<(), String> {
+        unreachable!()
+    }
+
+    fn step_period(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn advance(&mut self, _: u32) {
+        unreachable!()
+    }
+}
+
+#[test]
+fn zero_virtual_period_is_rejected_before_opening_resources() {
+    let mut config =
+        ServerConfig::from_toml(include_str!("../../examples/virtual-plant.toml")).unwrap();
+    let mut physical =
+        ServerConfig::from_toml(include_str!("../../examples/processing.toml")).unwrap();
+    physical.devices[0].id = "physical_furnace".into();
+    config.ports = physical.ports;
+    config.devices.extend(physical.devices);
+    config.processing = None;
+    config.tcp.bind.set_port(0);
+    config
+        .websocket
+        .as_mut()
+        .unwrap()
+        .bind
+        .as_mut()
+        .unwrap()
+        .set_port(0);
+    let db = Database::new();
+    config.recording.as_mut().unwrap().path = Some(db.0.clone());
+
+    let mut open_calls = 0;
+    let result = start_with_model_factory(
+        &config,
+        create_driver,
+        |_, _| {
+            open_calls += 1;
+            Ok(BufReader::new(Cursor::new(Vec::<u8>::new())))
+        },
+        |_, _| Ok(Box::new(ZeroPeriodModel)),
+    );
+    let Err(error) = result else {
+        panic!("a zero step period must be rejected")
+    };
+    assert_eq!(open_calls, 0);
+    assert!(!db.0.exists());
+    let Some(ConfigError::Validation { field, message }) = error.downcast_ref::<ConfigError>()
+    else {
+        panic!("expected a configuration validation error, got {error}");
+    };
+    assert_eq!(field, "virtual_ports[0]");
+    assert_eq!(
+        message,
+        "model \"thermal_plant\": virtual model step period must be positive"
+    );
+}
+
 fn event(value: Value) -> AggregatorEvent {
     AggregatorEvent::Measurement {
         port_id: "bus".into(),
