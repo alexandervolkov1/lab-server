@@ -28,7 +28,21 @@ impl DeviceService {
         connection: &mut TcpConnection,
         observations: &ObservationReceiver,
     ) -> io::Result<bool> {
-        let _gate = self.lock_service(GateOperation::TcpDrive);
-        connection.drive_once_with_observations(self, &self.catalog, &self.latest, observations)
+        let result = {
+            let _gate = self.lock_service(GateOperation::TcpDrive);
+            connection.session.pending.defer_experiment_save = true;
+            let result = connection.drive_once_with_observations(
+                self,
+                &self.catalog,
+                &self.latest,
+                observations,
+            );
+            connection.session.pending.defer_experiment_save = false;
+            result
+        };
+        let save = self.finish_experiment_save(&mut connection.session);
+        let finished = result?;
+        save?;
+        Ok(finished && connection.session.is_finished())
     }
 }

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,15 +13,18 @@ use crate::fanout::{ObservationFanout, ObservationReceiver};
 use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::PortHandle;
+use crate::processing::Management;
 use crate::session::{CommandBackend, EnqueueError, PendingRequests, request_phase};
 
 mod control;
 mod diagnostics;
+mod experiment;
 #[cfg(feature = "gate-metrics")]
 mod gate_metrics;
 
 use control::Control;
 pub(crate) use diagnostics::Runtime;
+pub(crate) use experiment::PendingSave;
 #[cfg(feature = "gate-metrics")]
 use gate_metrics::GateGuard;
 #[cfg(feature = "gate-metrics")]
@@ -45,6 +49,7 @@ const COMPONENT_UNAVAILABLE: &str = "component_unavailable";
 pub struct DeviceService {
     audit: std::sync::OnceLock<crate::recorder::RecorderHandle>,
     pub(crate) runtime: std::sync::OnceLock<Runtime>,
+    pub(crate) experiment_file: Option<PathBuf>,
     controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
     #[cfg(feature = "gate-metrics")]
@@ -76,20 +81,17 @@ impl DeviceService {
         #[cfg(not(feature = "gate-metrics"))]
         acquire()
     }
-    pub fn manage(
-        &self,
-        command: crate::processing::Management,
-    ) -> Result<serde_json::Value, String> {
+    pub fn manage(&self, command: Management) -> Result<serde_json::Value, String> {
+        if matches!(command, Management::Save { .. }) {
+            return self.save_experiment(self.management_audit(&command).as_ref());
+        }
         let _gate = self.lock_service(GateOperation::Manage);
-        self.manage_inner(command)
+        let audit = self.management_audit(&command);
+        self.manage_audited(command, audit.as_ref())
     }
-    pub(crate) fn manage_inner(
-        &self,
-        command: crate::processing::Management,
-    ) -> Result<serde_json::Value, String> {
-        let request = crate::audit::management_request(&command);
-        let audit = self
-            .audit
+    fn management_audit(&self, command: &Management) -> Option<crate::audit::Operation> {
+        let request = crate::audit::management_request(command);
+        self.audit
             .get()
             .filter(|_| crate::audit::mutation(&request))
             .map(|r| {
@@ -97,12 +99,11 @@ impl DeviceService {
                     r,
                     serde_json::json!({"source":"internal","request":request}),
                 )
-            });
-        self.manage_audited(command, audit.as_ref())
+            })
     }
     fn manage_audited(
         &self,
-        command: crate::processing::Management,
+        command: Management,
         audit: Option<&crate::audit::Operation>,
     ) -> Result<serde_json::Value, String> {
         let mut engine = self.processing.lock().expect("processing lock poisoned");
@@ -116,7 +117,7 @@ impl DeviceService {
     fn manage_impl(
         &self,
         engine: &mut crate::processing::Engine,
-        command: crate::processing::Management,
+        command: Management,
     ) -> Result<serde_json::Value, String> {
         use crate::processing::Management::*;
         if !matches!(command, Outputs | Types | List { .. }) {
@@ -125,6 +126,7 @@ impl DeviceService {
         let mut discontinued = std::collections::BTreeSet::new();
         match command {
             Outputs => return Ok(self.router.authority().snapshot()),
+            Save { .. } => unreachable!("Save is dispatched outside the mutation path"),
             Bind {
                 name,
                 target,
@@ -392,6 +394,7 @@ impl DeviceService {
         Self {
             audit: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
+            experiment_file: None,
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
             #[cfg(feature = "gate-metrics")]
@@ -493,8 +496,15 @@ impl DeviceService {
         text: &str,
         now: Instant,
     ) -> io::Result<()> {
-        let _gate = self.lock_service(GateOperation::ReceiveMessage);
-        session.receive_message(text, self, &self.catalog, &self.latest, now)
+        let result = {
+            let _gate = self.lock_service(GateOperation::ReceiveMessage);
+            session.pending.defer_experiment_save = true;
+            let result = session.receive_message(text, self, &self.catalog, &self.latest, now);
+            session.pending.defer_experiment_save = false;
+            result
+        };
+        let save = self.finish_experiment_save(session);
+        result.and(save)
     }
 
     /// Bounded pump for the external server loop; no extra observation queue.
@@ -600,6 +610,10 @@ fn route_error(error: RouteError) -> EnqueueError {
     }
 }
 
+fn parse_management(command: serde_json::Value) -> Result<Management, String> {
+    serde_json::from_value(command).map_err(|error| format!("invalid_component_request:{error}"))
+}
+
 impl CommandBackend for DeviceService {
     fn audit_recorder(&self) -> Option<crate::recorder::RecorderHandle> {
         self.audit.get().cloned()
@@ -609,21 +623,38 @@ impl CommandBackend for DeviceService {
         command: serde_json::Value,
         audit: Option<&crate::audit::Operation>,
     ) -> Result<serde_json::Value, String> {
-        self.manage_audited(
-            serde_json::from_value(command)
-                .map_err(|e| format!("invalid_component_request:{e}"))?,
-            audit,
-        )
+        let command = parse_management(command)?;
+        if matches!(command, Management::Save { .. }) {
+            self.save_experiment(audit)
+        } else {
+            self.manage_audited(command, audit)
+        }
+    }
+
+    fn dispatch_components(
+        &self,
+        id: u64,
+        command: serde_json::Value,
+        requests: &mut PendingRequests,
+    ) -> Option<Result<serde_json::Value, String>> {
+        match parse_management(command) {
+            Ok(Management::Save { .. }) if requests.defer_experiment_save => {
+                match self.defer_experiment_save(id, requests) {
+                    Ok(()) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            }
+            Ok(Management::Save { .. }) => Some(self.save_experiment(requests.audit.as_ref())),
+            Ok(command) => Some(self.manage_audited(command, requests.audit.as_ref())),
+            Err(error) => Some(Err(error)),
+        }
     }
 
     fn server_status(&self) -> Result<serde_json::Value, String> {
         self.diagnostics()
     }
     fn components(&self, command: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.manage_inner(
-            serde_json::from_value(command)
-                .map_err(|e| format!("invalid_component_request:{e}"))?,
-        )
+        self.manage(parse_management(command)?)
     }
     fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
         let engine = self.processing.lock().expect("processing lock poisoned");

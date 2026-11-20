@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::virtual_device::{PreparedVirtualModel, VirtualModel, create_model};
 
@@ -39,7 +39,7 @@ pub struct ProcessingConfig {
 enum ProcessingSource {
     Inline,
     Unresolved(PathBuf),
-    External(PathBuf),
+    External { path: PathBuf, target: PathBuf },
 }
 
 #[derive(Deserialize)]
@@ -65,11 +65,69 @@ impl TryFrom<ProcessingSection> for ProcessingConfig {
     }
 }
 
-#[derive(Deserialize)]
+const EXPERIMENT_VERSION: u64 = 1;
+
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ExperimentDocument {
+pub(crate) struct ExperimentDocument {
     schema_version: u64,
     components: Vec<StartupComponent>,
+}
+
+impl ExperimentDocument {
+    pub(crate) fn new(components: Vec<StartupComponent>) -> Self {
+        Self {
+            schema_version: EXPERIMENT_VERSION,
+            components,
+        }
+    }
+
+    pub(crate) fn to_toml(&self) -> io::Result<String> {
+        // With arbitrary_precision enabled, JSON numbers serialize to a
+        // private struct for non-JSON serializers. Convert them to TOML
+        // scalars explicitly while keeping the shared experiment schema.
+        let value = serde_json::to_value(self)?;
+        toml::to_string_pretty(&experiment_value(value)?).map_err(io::Error::other)
+    }
+}
+
+fn experiment_value(value: serde_json::Value) -> io::Result<toml::Value> {
+    use serde_json::Value::*;
+    let invalid_value = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "value cannot be represented in experiment TOML",
+        )
+    };
+    Ok(match value {
+        Bool(value) => toml::Value::Boolean(value),
+        String(value) => toml::Value::String(value),
+        Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                toml::Value::Integer(integer)
+            } else {
+                toml::Value::Float(
+                    value
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(invalid_value)?,
+                )
+            }
+        }
+        Array(values) => toml::Value::Array(
+            values
+                .into_iter()
+                .map(experiment_value)
+                .collect::<io::Result<_>>()?,
+        ),
+        Object(fields) => toml::Value::Table(
+            fields
+                .into_iter()
+                .map(|(key, value)| Ok((key, experiment_value(value)?)))
+                .collect::<io::Result<_>>()?,
+        ),
+        Null => return Err(invalid_value()),
+    })
 }
 
 impl ProcessingConfig {
@@ -101,29 +159,38 @@ impl ProcessingConfig {
             ))?;
             base.join(path)
         };
-        let input = read_config(&path)?;
+        // Freeze the actual file's absolute location, including symlink
+        // resolution, before reading. Later Save uses this same target.
+        let io_error = |source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        };
+        let target = fs::canonicalize(&path).map_err(io_error)?;
+        let input = fs::read_to_string(&target).map_err(io_error)?;
         let document: ExperimentDocument = toml::from_str(&input)
             .map_err(|error| ConfigError::Parse(error).in_processing_file(&path))?;
-        if document.schema_version != 1 {
+        if document.schema_version != EXPERIMENT_VERSION {
             return Err(invalid(
                 "schema_version",
                 format!(
-                    "unsupported version {}; expected 1",
+                    "unsupported version {}; expected {EXPERIMENT_VERSION}",
                     document.schema_version
                 ),
             )
             .in_processing_file(&path));
         }
         self.components = document.components;
-        self.source = ProcessingSource::External(path);
+        self.source = ProcessingSource::External { path, target };
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(try_from = "toml::Table")]
 pub struct StartupComponent {
+    #[serde(flatten)]
     pub configuration: crate::processing::Configuration,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<StartupBinding>,
 }
 
@@ -152,7 +219,7 @@ impl TryFrom<toml::Table> for StartupComponent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupBinding {
     pub target: String,
@@ -323,8 +390,15 @@ impl ServerConfig {
             .as_ref()
             .map(|processing| &processing.source)
         {
-            Some(ProcessingSource::External(path)) => error.in_processing_file(path),
+            Some(ProcessingSource::External { path, .. }) => error.in_processing_file(path),
             _ => error,
+        }
+    }
+
+    pub(crate) fn experiment_target(&self) -> Option<&Path> {
+        match &self.processing.as_ref()?.source {
+            ProcessingSource::External { target, .. } => Some(target),
+            _ => None,
         }
     }
 
@@ -554,5 +628,53 @@ fn nonempty(value: &str, field: &str) -> Result<(), ConfigError> {
         Err(invalid(field, "must not be empty or whitespace-only"))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    use super::*;
+    use crate::processing::Configuration;
+    use serde_json::json;
+
+    #[test]
+    fn export_round_trips_toml_strings_and_scalar_types() {
+        let escaped = "device/path\\with\"quotes\"\nand a tab\tΩ";
+        let components = vec![StartupComponent {
+            configuration: Configuration {
+                name: "controller.alpha".into(),
+                type_id: "test-controller".into(),
+                inputs: BTreeMap::from([("input".into(), escaped.into())]),
+                parameters: BTreeMap::from([
+                    ("choice".into(), json!(escaped)),
+                    ("count".into(), json!(i64::MIN)),
+                    ("enabled".into(), json!(true)),
+                    ("gain".into(), json!(1.25)),
+                ]),
+                max_age_ms: 5000,
+            },
+            binding: Some(StartupBinding {
+                target: escaped.into(),
+                command_timeout_ms: 999,
+            }),
+        }];
+        let document = ExperimentDocument::new(components.clone());
+        let text = document.to_toml().unwrap();
+        assert_eq!(document.to_toml().unwrap(), text);
+        let parsed: ExperimentDocument = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.components, components);
+    }
+
+    #[test]
+    fn loading_relative_main_path_freezes_the_absolute_experiment_target() {
+        let main = Path::new("examples/virtual-plant-external.toml");
+        let config = ServerConfig::load(main).unwrap();
+        let target = config.experiment_target().unwrap();
+        assert!(target.is_absolute());
+        assert_eq!(
+            target,
+            fs::canonicalize("examples/experiments/thermal-loop.toml").unwrap()
+        );
     }
 }

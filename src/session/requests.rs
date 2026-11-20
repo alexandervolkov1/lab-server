@@ -87,6 +87,8 @@ impl Entry {
 
 pub struct PendingRequests {
     pub(crate) audit: Option<crate::audit::Operation>,
+    pub(crate) defer_experiment_save: bool,
+    pub(crate) experiment_save: Option<crate::service::PendingSave>,
     limit: usize,
     entries: VecDeque<Entry>,
 }
@@ -95,22 +97,26 @@ impl PendingRequests {
     pub fn new(limit: usize) -> Self {
         Self {
             audit: None,
+            defer_experiment_save: false,
+            experiment_save: None,
             limit,
             entries: VecDeque::new(),
         }
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len() + usize::from(self.experiment_save.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.experiment_save.is_none()
     }
 
     pub(super) fn contains_id(&self, id: u64) -> bool {
-        self.entries.iter().any(|entry| entry.id() == id)
+        self.experiment_save
+            .as_ref()
+            .is_some_and(|save| save.id == id)
+            || self.entries.iter().any(|entry| entry.id() == id)
     }
 
     pub(crate) fn ensure_available(&self, id: u64) -> Result<(), EnqueueError> {
@@ -118,7 +124,7 @@ impl PendingRequests {
             return Err(EnqueueError::DuplicateId);
         }
 
-        if self.entries.len() >= self.limit {
+        if self.len() >= self.limit {
             return Err(EnqueueError::Full);
         }
 

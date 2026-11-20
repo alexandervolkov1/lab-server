@@ -72,6 +72,14 @@ pub struct Engine {
     catalog_budget: usize,
 }
 impl Engine {
+    /// Complete configuration in stable instance-name order, with normalized
+    /// parameters. Incarnations are used only to match service-side bindings.
+    pub(crate) fn configurations(&self) -> impl Iterator<Item = (&Configuration, u64)> {
+        self.nodes
+            .values()
+            .map(|node| (&node.config, node.incarnation))
+    }
+
     pub(crate) fn with_catalog_budget(mut self, bytes: usize) -> Self {
         self.catalog_budget = bytes.min(48 * 1024);
         self

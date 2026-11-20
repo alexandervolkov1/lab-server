@@ -279,6 +279,7 @@ impl Engine {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Management {
     Outputs,
+    Save {},
     Bind {
         name: String,
         target: String,

@@ -193,6 +193,7 @@ fn start_with_model_factory<P: DeviceIo + Send + 'static>(
         CommandRouter::with_authority(registry, authority.clone()),
         OBSERVATION_QUEUE_CAPACITY,
     );
+    tcp.experiment_file = config.experiment_target().map(ToOwned::to_owned);
     let audit =
         configure_processing(config, &tcp).map_err(|error| config.processing_error(error))?;
     tcp.validate_startup_catalog().map_err(|reason| {

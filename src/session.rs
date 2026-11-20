@@ -44,7 +44,7 @@ pub enum EnqueueError {
 }
 
 impl EnqueueError {
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Authority(reason) => reason,
             Self::DuplicateId => "duplicate_id",
@@ -70,6 +70,15 @@ pub trait CommandBackend {
         _audit: Option<&crate::audit::Operation>,
     ) -> Result<serde_json::Value, String> {
         self.components(command)
+    }
+    /// A deferred result is delivered later on the same transport session.
+    fn dispatch_components(
+        &self,
+        _id: u64,
+        command: Json,
+        requests: &mut PendingRequests,
+    ) -> Option<Result<Json, String>> {
+        Some(self.components_audited(command, requests.audit.as_ref()))
     }
     fn server_status(&self) -> Result<serde_json::Value, String> {
         Err("unsupported_op".into())
@@ -276,6 +285,19 @@ impl<Input> SessionState<Input> {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn component_response(
+        &mut self,
+        id: u64,
+        result: Result<Json, String>,
+    ) -> io::Result<()> {
+        match result {
+            Ok(data) => {
+                self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
+            }
+            Err(error) => self.queue_error(id, &error),
+        }
     }
 
     fn queue_error(&mut self, id: u64, error: &str) -> io::Result<()> {
@@ -507,7 +529,7 @@ impl<Input> SessionState<Input> {
         drop(dispatch);
         let result = match incoming {
             ParsedMessage::Request(request) => {
-                self.dispatch_request(request, commands, catalog, latest, now, audit.as_ref())
+                self.dispatch_request(request, commands, catalog, latest, now)
             }
             ParsedMessage::InvalidRequest { error, .. } => {
                 self.dispatch_invalid_request(id, error, audit.as_ref())
@@ -524,7 +546,6 @@ impl<Input> SessionState<Input> {
         catalog: &HashMap<String, ParameterDescription>,
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
-        audit: Option<&crate::audit::Operation>,
     ) -> io::Result<()> {
         let snapshot = match request {
             Request::Describe { .. }
@@ -544,12 +565,10 @@ impl<Input> SessionState<Input> {
                 Err(error) => self.queue_error(id, &error),
             },
             Request::Components { id, command } => {
-                match commands.components_audited(command, audit) {
-                    Ok(data) => {
-                        self.queue_response(&json!({"id":id,"status":"ok","data":data}).to_string())
-                    }
-                    Err(error) => self.queue_error(id, &error),
+                if let Some(result) = commands.dispatch_components(id, command, &mut self.pending) {
+                    self.component_response(id, result)?;
                 }
+                Ok(())
             }
             Request::Subscribe { id, keys } => {
                 self.dispatch_subscription(id, SubscriptionChange::Subscribe, keys, catalog)

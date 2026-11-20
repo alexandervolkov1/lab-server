@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use super::{DeviceService, GateOperation};
+use crate::config::StartupBinding;
 use crate::pending::{Completion, Pending, Poll};
 use crate::port_worker::{CommandError, StopReason};
 use crate::processing::{Engine, State};
@@ -13,6 +14,15 @@ pub(super) struct Control {
     target: String,
     timeout: Duration,
     pending: Option<Pending<Result<(), CommandError>>>,
+}
+
+impl Control {
+    pub(super) fn binding(&self, incarnation: u64) -> Option<StartupBinding> {
+        (self.owner.1 == incarnation).then(|| StartupBinding {
+            target: self.target.clone(),
+            command_timeout_ms: self.timeout.as_millis() as u64,
+        })
+    }
 }
 
 impl DeviceService {
@@ -260,16 +270,8 @@ impl DeviceService {
     ) -> Result<serde_json::Value, String> {
         let controls = self.controls.lock().unwrap();
         engine.page_with(offset, limit, |name, incarnation, instance| {
-            instance["binding"] = controls
-                .get(name)
-                .filter(|c| c.owner.1 == incarnation)
-                .map(|c| {
-                    serde_json::json!({
-                        "target": c.target,
-                        "command_timeout_ms": c.timeout.as_millis() as u64
-                    })
-                })
-                .unwrap_or(serde_json::Value::Null);
+            instance["binding"] =
+                serde_json::json!(controls.get(name).and_then(|c| c.binding(incarnation)));
         })
     }
 }
