@@ -11,6 +11,7 @@ pub mod pending;
 pub mod port_worker;
 pub mod recorder;
 pub mod startup;
+pub mod virtual_device;
 
 pub mod client_limit;
 pub mod connection;

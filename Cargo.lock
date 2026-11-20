@@ -296,6 +296,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "thermal-plant-model",
  "toml",
  "tungstenite",
 ]
@@ -596,6 +597,11 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "thermal-plant-model"
+version = "0.1.0"
+source = "git+https://github.com/alexandervolkov1/thermal-plant-model?rev=c53a21fcd682639f51f607563757685535c6797a#c53a21fcd682639f51f607563757685535c6797a"
 
 [[package]]
 name = "thiserror"
