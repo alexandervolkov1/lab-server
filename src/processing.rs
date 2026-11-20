@@ -8,8 +8,6 @@ use std::time::Instant;
 mod execution;
 mod graph;
 mod lifecycle;
-#[cfg(test)]
-mod rewire_measurement;
 mod schema;
 
 pub use execution::{Produced, number};

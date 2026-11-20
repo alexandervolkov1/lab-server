@@ -12,8 +12,6 @@ use crate::outbound::{OutboundBuffer, is_output_error};
 mod describe;
 #[cfg(test)]
 mod describe_tests;
-#[cfg(feature = "gate-metrics")]
-pub mod metrics;
 mod requests;
 mod subscriptions;
 use crate::protocol::{ParseError, Request, parse_request};
@@ -21,15 +19,6 @@ pub(crate) use describe::describe_response;
 use requests::completion_json;
 pub use requests::{FinishedRequest, PendingRequests};
 pub use subscriptions::{SubscriptionChange, SubscriptionError, SubscriptionSet};
-
-macro_rules! request_phase {
-    ($phase:ident, $body:expr) => {{
-        #[cfg(feature = "gate-metrics")]
-        let _span = $crate::session::metrics::span($crate::session::metrics::Phase::$phase);
-        $body
-    }};
-}
-pub(crate) use request_phase;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnqueueError {
@@ -130,8 +119,6 @@ pub(crate) enum ParsedMessage {
 
 impl ParsedMessage {
     pub(crate) fn parse(text: &str) -> Self {
-        #[cfg(feature = "gate-metrics")]
-        let _parse = metrics::span(metrics::Phase::Parse);
         match parse_request(text) {
             Ok(request) => Self::Request(request),
             Err(error) => Self::InvalidRequest {
@@ -269,8 +256,6 @@ impl<Input> SessionState<Input> {
     }
 
     pub(crate) fn queue_response(&mut self, response: &str) -> io::Result<()> {
-        #[cfg(feature = "gate-metrics")]
-        let _response = metrics::span(metrics::Phase::Response);
         if !self.audits.is_empty()
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(response)
             && let Some(id) = v["id"].as_u64()
@@ -357,8 +342,6 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
-        #[cfg(feature = "gate-metrics")]
-        let _get = metrics::span(metrics::Phase::Get);
         if self.pending.contains_id(id) {
             return self.queue_error(id, "duplicate_id");
         }
@@ -373,23 +356,20 @@ impl<Input> SessionState<Input> {
                     .lock()
                     .map_err(|_| io::Error::other("observation lock poisoned"))?;
 
-                if !request_phase!(Availability, commands.available(&key)) {
+                if !commands.available(&key) {
                     return self.queue_error(id, "runtime_unavailable");
                 }
 
-                request_phase!(
-                    GetValue,
-                    match guard.get(&key) {
-                        Some(observation) => crate::observation_json(Some(id), observation)?,
+                match guard.get(&key) {
+                    Some(observation) => crate::observation_json(Some(id), observation)?,
 
-                        None => json!({
-                            "id": id,
-                            "status": "no_data",
-                            "key": key
-                        })
-                        .to_string(),
-                    }
-                )
+                    None => json!({
+                        "id": id,
+                        "status": "no_data",
+                        "key": key
+                    })
+                    .to_string(),
+                }
             };
 
             return self.queue_response(&response);
@@ -491,8 +471,6 @@ impl<Input> SessionState<Input> {
         latest: &Mutex<HashMap<String, Observation>>,
         now: Instant,
     ) -> io::Result<()> {
-        #[cfg(feature = "gate-metrics")]
-        let dispatch = metrics::span(metrics::Phase::Dispatch);
         let id = incoming.id();
         let audit = commands.audit_recorder().and_then(|recorder| {
             let (request, invalid_frame) = incoming.audit_request();
@@ -514,8 +492,6 @@ impl<Input> SessionState<Input> {
                 if let Some(a) = audit {
                     a.response(json!({"status":"error","error":"duplicate_id"}));
                 }
-                #[cfg(feature = "gate-metrics")]
-                drop(dispatch);
                 return self.queue_error(id, "duplicate_id");
             }
             self.last_request_id = id;
@@ -525,8 +501,6 @@ impl<Input> SessionState<Input> {
         if let (Some(id), Some(a)) = (id, audit.as_ref()) {
             self.audits.insert(id, a.clone());
         }
-        #[cfg(feature = "gate-metrics")]
-        drop(dispatch);
         let result = match incoming {
             ParsedMessage::Request(request) => {
                 self.dispatch_request(request, commands, catalog, latest, now)
@@ -552,7 +526,7 @@ impl<Input> SessionState<Input> {
             | Request::Get { .. }
             | Request::Set { .. }
             | Request::Subscribe { .. }
-            | Request::Unsubscribe { .. } => request_phase!(Catalog, commands.catalog_snapshot()),
+            | Request::Unsubscribe { .. } => commands.catalog_snapshot(),
             _ => None,
         };
         let catalog = snapshot.as_ref().unwrap_or(catalog);
@@ -576,9 +550,7 @@ impl<Input> SessionState<Input> {
             Request::Unsubscribe { id, keys } => {
                 self.dispatch_subscription(id, SubscriptionChange::Unsubscribe, keys, catalog)
             }
-            Request::Describe { id } => {
-                self.describe_with_actions(id, catalog, request_phase!(Actions, commands.actions()))
-            }
+            Request::Describe { id } => self.describe_with_actions(id, catalog, commands.actions()),
             Request::Hello { id } => self.queue_response(
                 &json!({
                     "id": id,

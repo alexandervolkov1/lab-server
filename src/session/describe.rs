@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Serialize, Serializer};
 
-use super::request_phase;
 use crate::model::{ActionDescription, ParameterDescription, Spec};
 
 pub(crate) fn describe_response(
@@ -10,24 +9,16 @@ pub(crate) fn describe_response(
     catalog: &HashMap<String, ParameterDescription>,
     mut actions: Vec<ActionDescription>,
 ) -> String {
-    #[cfg(feature = "gate-metrics")]
-    let _describe = super::metrics::span(super::metrics::Phase::Describe);
-    let parameters = request_phase!(DescribeSort, {
-        let mut parameters: Vec<_> = catalog.values().collect();
-        parameters.sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        parameters
-    });
-    request_phase!(
-        DescribeSerialize,
-        serde_json::to_string(&Response {
-            actions: &actions,
-            id,
-            parameters: &parameters,
-            status: "ok",
-        })
-        .expect("describe response contains only JSON-representable values")
-    )
+    let mut parameters: Vec<_> = catalog.values().collect();
+    parameters.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    actions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    serde_json::to_string(&Response {
+        actions: &actions,
+        id,
+        parameters: &parameters,
+        status: "ok",
+    })
+    .expect("describe response contains only JSON-representable values")
 }
 
 // Field order matches the sorted serde_json::Map keys in the original v1 response.

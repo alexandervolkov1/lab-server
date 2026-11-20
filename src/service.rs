@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::command_router::{CommandRouter, RouteError};
@@ -14,35 +14,15 @@ use crate::model::{ActionDescription, Observation, ParameterDescription, Value};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::PortHandle;
 use crate::processing::Management;
-use crate::session::{CommandBackend, EnqueueError, PendingRequests, request_phase};
+use crate::session::{CommandBackend, EnqueueError, PendingRequests};
 
 mod control;
 mod diagnostics;
 mod experiment;
-#[cfg(feature = "gate-metrics")]
-mod gate_metrics;
 
 use control::Control;
 pub(crate) use diagnostics::Runtime;
 pub(crate) use experiment::PendingSave;
-#[cfg(feature = "gate-metrics")]
-use gate_metrics::GateGuard;
-#[cfg(feature = "gate-metrics")]
-pub(crate) use gate_metrics::Histogram;
-#[cfg(feature = "gate-metrics")]
-pub use gate_metrics::{GateMetric, GateTiming};
-#[cfg(not(feature = "gate-metrics"))]
-type GateGuard<'a> = std::sync::MutexGuard<'a, ()>;
-
-#[derive(Clone, Copy)]
-pub(crate) enum GateOperation {
-    Manage,
-    ApplyEvent,
-    Tick,
-    ReceiveMessage,
-    StopControls,
-    TcpDrive,
-}
 
 const COMPONENT_UNAVAILABLE: &str = "component_unavailable";
 
@@ -52,8 +32,6 @@ pub struct DeviceService {
     pub(crate) experiment_file: Option<PathBuf>,
     controls: Mutex<HashMap<String, Control>>,
     gate: Mutex<()>,
-    #[cfg(feature = "gate-metrics")]
-    gate_metrics: gate_metrics::GateMetrics,
     processing: Mutex<crate::processing::Engine>,
     continuity: Mutex<HashMap<String, crate::continuity::Continuity>>,
     router: CommandRouter,
@@ -74,18 +52,14 @@ impl DeviceService {
         }
     }
 
-    pub(crate) fn lock_service(&self, _operation: GateOperation) -> GateGuard<'_> {
-        let acquire = || self.gate.lock().expect("service lock poisoned");
-        #[cfg(feature = "gate-metrics")]
-        return self.gate_metrics.measure(_operation, acquire);
-        #[cfg(not(feature = "gate-metrics"))]
-        acquire()
+    pub(crate) fn lock_service(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().expect("service lock poisoned")
     }
     pub fn manage(&self, command: Management) -> Result<serde_json::Value, String> {
         if matches!(command, Management::Save { .. }) {
             return self.save_experiment(self.management_audit(&command).as_ref());
         }
-        let _gate = self.lock_service(GateOperation::Manage);
+        let _gate = self.lock_service();
         let audit = self.management_audit(&command);
         self.manage_audited(command, audit.as_ref())
     }
@@ -191,7 +165,7 @@ impl DeviceService {
         event: AggregatorEvent,
         mut record: impl FnMut(&AggregatorEvent),
     ) -> io::Result<()> {
-        let _gate = self.lock_service(GateOperation::ApplyEvent);
+        let _gate = self.lock_service();
         record(&event);
         let mut produced = Vec::new();
         match &event {
@@ -346,7 +320,7 @@ impl DeviceService {
         Ok(())
     }
     pub fn tick_recorded(&self, mut record: impl FnMut(&AggregatorEvent)) -> io::Result<()> {
-        let _gate = self.lock_service(GateOperation::Tick);
+        let _gate = self.lock_service();
         let mut engine = self.processing.lock().unwrap();
         let stale = engine.tick(Instant::now());
         self.reconcile_controls(&mut engine);
@@ -397,8 +371,6 @@ impl DeviceService {
             experiment_file: None,
             controls: Mutex::new(HashMap::new()),
             gate: Mutex::new(()),
-            #[cfg(feature = "gate-metrics")]
-            gate_metrics: gate_metrics::GateMetrics::default(),
             processing: Mutex::new(
                 crate::processing::Engine::new(crate::processing::builtins(), catalog.clone())
                     .with_catalog_budget(catalog_budget),
@@ -497,7 +469,7 @@ impl DeviceService {
         now: Instant,
     ) -> io::Result<()> {
         let result = {
-            let _gate = self.lock_service(GateOperation::ReceiveMessage);
+            let _gate = self.lock_service();
             session.pending.defer_experiment_save = true;
             let result = session.receive_message(text, self, &self.catalog, &self.latest, now);
             session.pending.defer_experiment_save = false;
@@ -658,7 +630,7 @@ impl CommandBackend for DeviceService {
     }
     fn catalog_snapshot(&self) -> Option<HashMap<String, ParameterDescription>> {
         let engine = self.processing.lock().expect("processing lock poisoned");
-        Some(request_phase!(SnapshotBuild, engine.catalog()))
+        Some(engine.catalog())
     }
     fn actions(&self) -> Vec<ActionDescription> {
         self.registry()

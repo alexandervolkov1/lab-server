@@ -174,15 +174,7 @@ impl Engine {
         let (affected, changed) = if rewire {
             // Only edges entering this node change. A path from it to a
             // descendant cannot use such an edge in either validated DAG.
-            let dependents = {
-                #[cfg(test)]
-                let _span = super::rewire_measurement::span(
-                    super::rewire_measurement::Phase::FirstDependents,
-                );
-                self.dependents(&name)
-            };
-            #[cfg(test)]
-            let _span = super::rewire_measurement::span(super::rewire_measurement::Phase::Changed);
+            let dependents = self.dependents(&name);
             let changed = dependents
                 .iter()
                 .flat_map(|name| {
@@ -201,9 +193,6 @@ impl Engine {
         node.config = config;
         node.component = replacement;
         if rewire {
-            #[cfg(test)]
-            let _span =
-                super::rewire_measurement::span(super::rewire_measurement::Phase::Invalidate);
             // dependents() yields unique names in lexicographic order.
             for name in affected {
                 self.invalidate_node(&name, "input_changed", FaultUpdate::PreserveInactive);

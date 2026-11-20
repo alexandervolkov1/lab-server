@@ -310,74 +310,31 @@ fn one_session_uses_the_current_catalog_after_component_creation_and_deletion() 
     }
 }
 
-#[cfg(feature = "gate-metrics")]
 #[test]
-fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
+fn get_and_describe_follow_rewire_and_source_shutdown() {
     use lab_server::model::SourceMetadata;
-    use lab_server::session::metrics::RequestMetrics;
 
     let mut context = Context::new();
-    let request = |service: &DeviceService, text: &str, extra: &[(&str, u64)]| {
-        let run = || {
-            let mut session = Session::new(1, 16 * 1024);
-            service
-                .receive_message(&mut session, text, Instant::now())
-                .unwrap();
-            let [reply]: [Json; 1] = messages(&mut session).try_into().unwrap();
-            reply
-        };
-        let metrics = RequestMetrics::default();
-        let reply = metrics.record_on_thread(run);
-        assert_eq!(reply, run(), "profiling changed {text}");
-        let expected: HashMap<_, _> = [("parse", 1), ("dispatch", 1), ("response", 1)]
-            .into_iter()
-            .chain(extra.iter().copied())
-            .collect();
-        let snapshot = metrics.snapshot();
-        for phase in snapshot {
-            assert_eq!(
-                phase.count,
-                expected.get(phase.phase).copied().unwrap_or(0),
-                "{text}, {}",
-                phase.phase
-            );
-        }
-        let total = |phase: &str| {
-            snapshot
-                .iter()
-                .find(|m| m.phase == phase)
-                .unwrap()
-                .timing
-                .total_ns
-        };
-        assert!(total("catalog") >= total("snapshot_build"));
-        assert!(total("get") >= total("availability") + total("get_value"));
-        assert!(total("describe") >= total("describe_sort") + total("describe_serialize"));
+    let request = |service: &DeviceService, text: &str| {
+        let mut session = Session::new(1, 16 * 1024);
+        service
+            .receive_message(&mut session, text, Instant::now())
+            .unwrap();
+        let [reply]: [Json; 1] = messages(&mut session).try_into().unwrap();
         reply
     };
-    let physical = [
-        ("catalog", 1),
-        ("snapshot_build", 1),
-        ("get", 1),
-        ("availability", 1),
-        ("get_value", 1),
-    ];
-    let derived = physical.to_vec();
     let physical_get = r#"{"id":1,"op":"get","key":"furnace1/temperature"}"#;
     let derived_get = r#"{"id":1,"op":"get","key":"processing/smooth/value"}"#;
     assert_eq!(
-        request(&context.service, r#"{"id":1,"op":"ping"}"#, &[]),
+        request(&context.service, r#"{"id":1,"op":"ping"}"#),
         json!({"id":1,"status":"ok"})
     );
     assert_eq!(
-        request(&context.service, r#"{"id":1,"op":"hello"}"#, &[])["status"],
+        request(&context.service, r#"{"id":1,"op":"hello"}"#)["status"],
         "ok"
     );
-    assert_eq!(request(&context.service, "{", &[])["error"], "invalid_json");
-    assert_eq!(
-        request(&context.service, physical_get, &physical)["status"],
-        "no_data"
-    );
+    assert_eq!(request(&context.service, "{")["error"], "invalid_json");
+    assert_eq!(request(&context.service, physical_get)["status"], "no_data");
 
     let configure = |service: &DeviceService, action, name, input, revision| {
         service.manage(serde_json::from_value(json!({
@@ -399,10 +356,7 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
         "furnace1/temperature",
         1,
     );
-    assert_eq!(
-        request(&context.service, derived_get, &derived)["status"],
-        "no_data"
-    );
+    assert_eq!(request(&context.service, derived_get)["status"], "no_data");
     let start = Instant::now();
     let sample = |context: &Context, sequence, acquired_at, value| {
         context
@@ -427,14 +381,8 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
             .unwrap();
     };
     sample(&context, 1, start, 12.0);
-    assert_eq!(
-        request(&context.service, physical_get, &physical)["value"],
-        12.0
-    );
-    assert_eq!(
-        request(&context.service, derived_get, &derived)["value"],
-        12.0
-    );
+    assert_eq!(request(&context.service, physical_get)["value"], 12.0);
+    assert_eq!(request(&context.service, derived_get)["value"], 12.0);
     configure(
         &context.service,
         "configure",
@@ -442,27 +390,13 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
         "processing/bridge/value",
         2,
     );
-    assert_eq!(
-        request(&context.service, derived_get, &derived)["status"],
-        "no_data"
-    );
+    assert_eq!(request(&context.service, derived_get)["status"], "no_data");
     sample(&context, 2, start + Duration::from_secs(1), 27.0);
-    let current = request(&context.service, derived_get, &derived);
+    let current = request(&context.service, derived_get);
     assert!(current["value"].as_f64().unwrap() > 12.0);
     assert_eq!(current["completed_at_unix_ms"], 2000);
 
-    let description = request(
-        &context.service,
-        r#"{"id":1,"op":"describe"}"#,
-        &[
-            ("catalog", 1),
-            ("snapshot_build", 1),
-            ("actions", 1),
-            ("describe", 1),
-            ("describe_sort", 1),
-            ("describe_serialize", 1),
-        ],
-    );
+    let description = request(&context.service, r#"{"id":1,"op":"describe"}"#);
     let keys: Vec<_> = description["parameters"]
         .as_array()
         .unwrap()
@@ -481,13 +415,10 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
 
     context.close();
     assert_eq!(
-        request(&context.service, physical_get, &physical[..4])["error"],
+        request(&context.service, physical_get)["error"],
         "runtime_unavailable"
     );
-    assert_eq!(
-        request(&context.service, derived_get, &derived)["status"],
-        "error"
-    );
+    assert_eq!(request(&context.service, derived_get)["status"], "error");
     context
         .service
         .manage(
@@ -498,17 +429,14 @@ fn request_phases_count_real_catalog_builds_and_preserve_get_semantics() {
         )
         .unwrap();
     assert_eq!(
-        request(&context.service, derived_get, &physical[..3])["error"],
+        request(&context.service, derived_get)["error"],
         "unknown_key"
     );
 }
 
-#[cfg(feature = "gate-metrics")]
 #[test]
 fn cached_get_calls_custom_availability_with_latest_locked_and_uses_the_base_catalog() {
-    use lab_server::session::{
-        CommandBackend, EnqueueError, PendingRequests, metrics::RequestMetrics,
-    };
+    use lab_server::session::{CommandBackend, EnqueueError, PendingRequests};
 
     struct InspectLatest<'a>(&'a Mutex<HashMap<String, Observation>>);
     impl CommandBackend for InspectLatest<'_> {
@@ -544,41 +472,20 @@ fn cached_get_calls_custom_availability_with_latest_locked_and_uses_the_base_cat
     let context = Context::new();
     let backend = InspectLatest(&context.latest);
     let mut session = Session::new(1, 4096);
-    let metrics = RequestMetrics::default();
-    metrics.record_on_thread(|| {
-        session
-            .receive_message(
-                r#"{"id":18446744073709551615,"op":"get","key":"furnace1/temperature"}"#,
-                &backend,
-                &context.catalog,
-                &context.latest,
-                Instant::now(),
-            )
-            .unwrap();
-    });
+    session
+        .receive_message(
+            r#"{"id":18446744073709551615,"op":"get","key":"furnace1/temperature"}"#,
+            &backend,
+            &context.catalog,
+            &context.latest,
+            Instant::now(),
+        )
+        .unwrap();
     assert_eq!(
         messages(&mut session),
         [json!({"id":u64::MAX,"status":"no_data","key":"furnace1/temperature"})]
     );
     assert!(context.latest.try_lock().is_ok());
-    let active: Vec<_> = metrics
-        .snapshot()
-        .into_iter()
-        .filter(|sample| sample.count != 0)
-        .map(|sample| (sample.phase, sample.count))
-        .collect();
-    assert_eq!(
-        active,
-        [
-            ("parse", 1),
-            ("dispatch", 1),
-            ("catalog", 1),
-            ("get", 1),
-            ("availability", 1),
-            ("get_value", 1),
-            ("response", 1)
-        ]
-    );
 }
 
 #[test]

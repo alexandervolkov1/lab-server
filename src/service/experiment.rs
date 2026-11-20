@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value as Json, json};
 
-use super::{DeviceService, GateOperation};
+use super::DeviceService;
 use crate::audit::Operation;
 use crate::config::{ExperimentDocument, StartupComponent};
 use crate::session::{PendingRequests, SessionState};
@@ -85,7 +85,7 @@ impl DeviceService {
 
     pub(super) fn save_experiment(&self, audit: Option<&Operation>) -> Result<Json, String> {
         let snapshot = {
-            let _gate = self.lock_service(GateOperation::Manage);
+            let _gate = self.lock_service();
             self.capture_experiment(audit)?
         };
         self.save_snapshot(snapshot, audit)
@@ -142,7 +142,7 @@ impl DeviceService {
 
     fn publish_experiment(&self, staged: Staged) -> Result<(), String> {
         let publication = {
-            let _gate = self.lock_service(GateOperation::Manage);
+            let _gate = self.lock_service();
             // Also excludes direct management callers that already serialize
             // through the Engine mutex. Cleanup happens after both guards drop.
             let engine = self.processing.lock().expect("processing lock poisoned");

@@ -75,7 +75,7 @@ fn exports_the_whole_graph_beyond_the_default_management_page() {
 fn stale_staged_snapshot_cannot_replace_a_newer_save() {
     let (directory, target, service) = fixture();
     let stale = {
-        let _gate = service.lock_service(GateOperation::Manage);
+        let _gate = service.lock_service();
         service.capture_experiment(None).unwrap()
     }
     .stage()
