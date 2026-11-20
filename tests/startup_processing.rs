@@ -10,8 +10,10 @@ use lab_server::{
 };
 use serde_json::{Value as Json, json};
 use std::{
+    fs,
     io::{self, BufReader, Cursor},
     net::TcpListener,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,6 +24,9 @@ use std::{
 #[path = "support/recording_db.rs"]
 mod db;
 use db::{Database, scalar};
+#[path = "support/experiment_files.rs"]
+mod experiment_files;
+use experiment_files::ExperimentFiles;
 
 const GRAPH: &str = r#"
 [[processing.components]]
@@ -52,12 +57,33 @@ target = "furnace1/power"
 command_timeout_ms = 1000
 "#;
 
-fn config(graph: &str) -> ServerConfig {
-    ServerConfig::from_toml(&format!(
+fn main_document(graph: &str) -> String {
+    format!(
         "{}\n{graph}",
         include_str!("../examples/arduino.toml").replace("127.0.0.1:7240", "127.0.0.1:0")
-    ))
-    .unwrap()
+    )
+}
+
+fn config(graph: &str) -> ServerConfig {
+    ServerConfig::from_toml(&main_document(graph)).unwrap()
+}
+
+fn external_config(files: &ExperimentFiles, graph: &str) -> ServerConfig {
+    fs::write(
+        files.main(),
+        main_document(&format!(
+            "[processing]\nfile = {:?}\n",
+            ExperimentFiles::RELATIVE
+        )),
+    )
+    .unwrap();
+    let components = graph.replace("processing.components", "components");
+    fs::write(
+        files.experiment(),
+        format!("schema_version = 1\n{components}"),
+    )
+    .unwrap();
+    ServerConfig::load(files.main()).unwrap()
 }
 
 struct Source {
@@ -148,14 +174,40 @@ fn optional_processing_keeps_empty_graph_and_revision_zero() {
 
 #[test]
 fn startup_graph_is_visible_processes_measurements_and_never_writes() {
+    check_startup_graph(&config(GRAPH));
+}
+
+#[test]
+fn external_graph_orders_dependencies_and_starts_from_the_loaded_snapshot() {
+    let pid_header = "[[processing.components]]\nname = \"loop\"";
+    let (ema, pid) = GRAPH.split_once(pid_header).unwrap();
+    let reversed = format!("{pid_header}{pid}{ema}");
+    let files = ExperimentFiles::new();
+    let config = external_config(&files, &reversed);
+    assert_eq!(
+        config.processing.as_ref().unwrap().components[0]
+            .configuration
+            .name,
+        "loop"
+    );
+    // Validation and startup use the resolved snapshot even after the files are gone.
+    let path = files.experiment();
+    drop(files);
+    assert!(!path.exists());
+    config.validate().unwrap();
+    check_startup_graph(&config);
+}
+
+fn check_startup_graph(config: &ServerConfig) {
     let reads = Arc::default();
     let writes = Arc::new(AtomicUsize::new(0));
-    let server = start(&config(GRAPH), &reads, &writes).unwrap();
+    let server = start(config, &reads, &writes).unwrap();
     let service = server.backend();
     let snapshot = list(service);
     assert_eq!(snapshot["revision"], 3);
     assert_eq!(snapshot["total"], 2);
     assert_eq!(snapshot["instances"][0]["state"], "shadow");
+    assert_eq!(snapshot["instances"][0]["incarnation"], 2);
     assert_eq!(
         snapshot["instances"][0]["configuration"]["inputs"]["input"],
         "processing/smooth/value"
@@ -165,6 +217,7 @@ fn startup_graph_is_visible_processes_measurements_and_never_writes() {
         json!({"target":"furnace1/power","command_timeout_ms":1000})
     );
     assert_eq!(snapshot["instances"][1]["state"], "running");
+    assert_eq!(snapshot["instances"][1]["incarnation"], 1);
     assert_eq!(
         snapshot["instances"][1]["configuration"]["parameters"]["tau"],
         2.0
@@ -374,53 +427,76 @@ input = 'processing/loop/output'
             "smooth",
             "invalid_instance",
         ),
+        (
+            GRAPH.replace("name = \"loop\"", "name = \"bad/name\""),
+            "bad/name",
+            "invalid_instance",
+        ),
     ];
+    let files = ExperimentFiles::new();
     for (graph, name, reason) in cases {
-        let reads = Arc::default();
-        let writes = Arc::default();
-        let mut opens = 0;
-        let result = start_with(
-            &config(&graph),
-            |_| Ok(test_driver(&reads, &writes)),
-            |_, _| {
-                opens += 1;
-                Ok(mock_port())
-            },
-        );
-        let error = match result {
-            Ok(_) => panic!("accepted {name}: {reason}"),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            error.contains(name) && error.contains(reason),
-            "{name}: {reason}: {error}"
-        );
-        assert_eq!(opens, 0, "{name}: {reason}");
-        assert_eq!(reads.load(Ordering::SeqCst), 0);
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        for (config, file) in [
+            (config(&graph), None),
+            (external_config(&files, &graph), Some(files.experiment())),
+        ] {
+            let reads = Arc::default();
+            let writes = Arc::default();
+            let mut opens = 0;
+            let result = start_with(
+                &config,
+                |_| Ok(test_driver(&reads, &writes)),
+                |_, _| {
+                    opens += 1;
+                    Ok(mock_port())
+                },
+            );
+            let error = match result {
+                Ok(_) => panic!("accepted {name}: {reason}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(name) && error.contains(reason),
+                "{name}: {reason}: {error}"
+            );
+            if let Some(path) = file {
+                assert!(error.contains(&path.display().to_string()), "{error}");
+            }
+            assert_eq!(opens, 0, "{name}: {reason}");
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            assert_eq!(writes.load(Ordering::SeqCst), 0);
+        }
     }
 }
 
 #[test]
 fn startup_uses_existing_instance_resource_limit() {
     let graph: String = (0..129).map(|i| format!("\n[[processing.components]]\nname='ema{i}'\ntype_id='ema'\nmax_age_ms=5000\n[processing.components.inputs]\ninput='furnace1/sample_temperature'\n")).collect();
-    let mut opens = 0;
-    let error = start_with(
-        &config(&graph),
-        |_| Ok(test_driver(&Arc::default(), &Arc::default())),
-        |_, _| {
-            opens += 1;
-            Ok(mock_port())
-        },
-    )
-    .err()
-    .unwrap()
-    .to_string();
-    assert!(
-        error.contains("ema128") && error.contains("invalid_instance"),
-        "{error}"
-    );
-    assert_eq!(opens, 0);
+    let files = ExperimentFiles::new();
+    for (config, file) in [
+        (config(&graph), None),
+        (external_config(&files, &graph), Some(files.experiment())),
+    ] {
+        let mut opens = 0;
+        let error = start_with(
+            &config,
+            |_| Ok(test_driver(&Arc::default(), &Arc::default())),
+            |_, _| {
+                opens += 1;
+                Ok(mock_port())
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("ema128") && error.contains("invalid_instance"),
+            "{error}"
+        );
+        if let Some(path) = file {
+            assert!(error.contains(&path.display().to_string()), "{error}");
+        }
+        assert_eq!(opens, 0);
+    }
 }
 
 struct CatalogDriver {
@@ -590,6 +666,18 @@ fn enable_recording(config: &mut ServerConfig, db: &Database) {
 
 #[test]
 fn invalid_graph_preserves_existing_database_and_leaves_tcp_and_websocket_addresses_free() {
+    let graph = GRAPH.replace("command_timeout_ms = 1000", "command_timeout_ms = 0");
+    check_no_resources_opened(config(&graph), None);
+}
+
+#[test]
+fn invalid_external_graph_is_rejected_before_opening_any_resources() {
+    let files = ExperimentFiles::new();
+    let graph = GRAPH.replace("command_timeout_ms = 1000", "command_timeout_ms = 0");
+    check_no_resources_opened(external_config(&files, &graph), Some(&files.experiment()));
+}
+
+fn check_no_resources_opened(mut config: ServerConfig, file: Option<&Path>) {
     let db = Database::new();
     let session = Recorder::open(&db.0, 8)
         .unwrap()
@@ -610,7 +698,6 @@ fn invalid_graph_preserves_existing_database_and_leaves_tcp_and_websocket_addres
     let original = std::fs::read(&db.0).unwrap();
 
     // Create smooth successfully in memory, then fail the later binding.
-    let mut config = config(&GRAPH.replace("command_timeout_ms = 1000", "command_timeout_ms = 0"));
     enable_recording(&mut config, &db);
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let websocket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -636,6 +723,9 @@ fn invalid_graph_preserves_existing_database_and_leaves_tcp_and_websocket_addres
             error.contains("loop") && error.contains("invalid_timeout"),
             "{error}"
         );
+        if let Some(path) = file {
+            assert!(error.contains(&path.display().to_string()), "{error}");
+        }
     };
     validate();
     drop((tcp, websocket));

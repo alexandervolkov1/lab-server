@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -127,9 +128,18 @@ fn next_ws(ws: &mut tungstenite::WebSocket<TcpStream>) -> Json {
 
 #[test]
 fn virtual_plant_serves_tcp_websocket_processing_and_sqlite_and_restarts_fresh() {
-    let db = db::Database::new();
     let input = include_str!("../examples/virtual-plant.toml");
-    let mut config = ServerConfig::from_toml(input).unwrap();
+    check_virtual_experiment(ServerConfig::from_toml(input).unwrap(), 20.0);
+}
+
+#[test]
+fn virtual_plant_runs_the_external_experiment_in_shadow() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/virtual-plant-external.toml");
+    check_virtual_experiment(ServerConfig::load(path).unwrap(), 35.0);
+}
+
+fn check_virtual_experiment(mut config: ServerConfig, setpoint: f64) {
+    let db = db::Database::new();
     config.tcp.bind.set_port(0);
     config
         .websocket
@@ -175,6 +185,14 @@ fn virtual_plant_serves_tcp_websocket_processing_and_sqlite_and_restarts_fresh()
     }
     assert_eq!(tcp.get(POWER), 0);
     assert_eq!(tcp.get(SAMPLE).as_f64(), Some(20.0));
+    assert_eq!(tcp.get(EMA).as_f64(), Some(20.0));
+    let proposal = tcp.get(PID).as_f64().unwrap();
+    if setpoint > 20.0 {
+        assert!(proposal > 0.0, "expected a positive Shadow proposal");
+    } else {
+        assert_eq!(proposal, 0.0);
+    }
+    assert_eq!(tcp.get(POWER), 0);
     assert_eq!(
         tcp.request(json!({"op":"set", "key":POWER, "value":101}))["status"],
         "error"
@@ -247,6 +265,7 @@ fn virtual_plant_serves_tcp_websocket_processing_and_sqlite_and_restarts_fresh()
         .unwrap();
     assert_eq!(pid["state"], "shadow");
     assert_eq!(pid["binding"]["target"], POWER);
+    assert_eq!(pid["configuration"]["parameters"]["setpoint"], setpoint);
     let outputs = tcp.request(json!({"op":"components", "command":{"action":"outputs"}}));
     let output = &outputs["data"][0];
     assert_eq!(output["mode"], "manual");
@@ -313,12 +332,21 @@ fn virtual_plant_serves_tcp_websocket_processing_and_sqlite_and_restarts_fresh()
     drop(tcp);
     running.shutdown().unwrap().unwrap();
     assert_eq!(restarted.stop_reason(), Some(StopReason::Shutdown));
+    let c = db.connect();
     assert_eq!(
         db::scalar(
-            &db.connect(),
+            &c,
             "SELECT count(*) FROM sessions WHERE ended_at_ns IS NOT NULL"
         ),
         2
+    );
+    // Only the test's explicit write reached a driver across both startups.
+    assert_eq!(
+        db::scalar(
+            &c,
+            "SELECT count(*) FROM audit_events WHERE kind='started' AND json_extract(context_json, '$.request.op')='set'"
+        ),
+        1
     );
 }
 
