@@ -1,8 +1,9 @@
+use std::fs;
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,9 @@ use tungstenite::http::HeaderValue;
 
 #[path = "support/recording_db.rs"]
 mod db;
+#[path = "support/experiment_files.rs"]
+mod experiment_files;
+use experiment_files::ExperimentFiles;
 
 const WAIT: Duration = Duration::from_secs(10);
 const POWER: &str = "furnace1/power";
@@ -126,6 +130,17 @@ fn next_ws(ws: &mut tungstenite::WebSocket<TcpStream>) -> Json {
     serde_json::from_str(&text).unwrap()
 }
 
+fn open_ws(addr: SocketAddr) -> tungstenite::WebSocket<TcpStream> {
+    let mut request = format!("ws://{addr}{PATH}").into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+    let (ws, handshake) = tungstenite::client(request, connect(addr)).unwrap();
+    assert_eq!(handshake.headers()["sec-websocket-protocol"], SUBPROTOCOL);
+    ws
+}
+
 #[test]
 fn virtual_plant_serves_tcp_websocket_processing_and_sqlite_and_restarts_fresh() {
     let input = include_str!("../examples/virtual-plant.toml");
@@ -202,15 +217,7 @@ fn check_virtual_experiment(mut config: ServerConfig, setpoint: f64) {
         "ok"
     );
 
-    let mut ws_request = format!("ws://{ws_addr}{PATH}")
-        .into_client_request()
-        .unwrap();
-    ws_request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static(SUBPROTOCOL),
-    );
-    let (mut ws, handshake) = tungstenite::client(ws_request, connect(ws_addr)).unwrap();
-    assert_eq!(handshake.headers()["sec-websocket-protocol"], SUBPROTOCOL);
+    let mut ws = open_ws(ws_addr);
     ws.send(Message::Text(
         json!({"id":1,"op":"subscribe","keys":[EMA, PID]})
             .to_string()
@@ -424,4 +431,330 @@ fn mixed_startup_injects_only_physical_ports_and_keeps_virtual_instances_indepen
     assert_eq!(tcp.get("furnace2/power"), 0);
     drop(tcp);
     running.shutdown().unwrap().unwrap();
+}
+
+fn components(tcp: &mut TcpClient, command: Json) -> Json {
+    let reply = tcp.request(json!({"op":"components", "command":command}));
+    assert_eq!(reply["status"], "ok", "{reply}");
+    reply["data"].clone()
+}
+
+fn instance<'a>(page: &'a Json, name: &str) -> &'a Json {
+    page["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["configuration"]["name"] == name)
+        .unwrap()
+}
+
+fn output<'a>(outputs: &'a Json, key: &str) -> &'a Json {
+    outputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == key)
+        .unwrap()
+}
+
+#[test]
+fn save_reloads_live_experiment_and_preserves_active_controller() {
+    const NEW_TARGET: &str = "furnace2/power";
+    let files = ExperimentFiles::new();
+    let main = include_str!("../examples/virtual-plant-external.toml");
+    fs::write(files.main(), format!("{main}\n[[virtual_ports]]\nid='second'\nmodel='thermal_plant'\n[[devices]]\nid='furnace2'\ndriver='virtual'\nport='second'\n")).unwrap();
+    let initial = include_str!("../examples/experiments/thermal-loop.toml");
+    fs::write(files.experiment(), initial).unwrap();
+    let db = db::Database::new();
+    let open_server = || {
+        let mut config = ServerConfig::load(files.main()).unwrap();
+        config.tcp.bind.set_port(0);
+        config
+            .websocket
+            .as_mut()
+            .unwrap()
+            .bind
+            .as_mut()
+            .unwrap()
+            .set_port(0);
+        config.recording.as_mut().unwrap().path = Some(db.0.clone());
+        config.devices[0]
+            .poll_periods_ms
+            .insert("sample_temperature".into(), 50);
+        start(&config).unwrap()
+    };
+    let server = open_server();
+    let addr = server.local_addr().unwrap();
+    let ws_addr = server.websocket_addr().unwrap().unwrap();
+    let mut running = Running::new(server);
+    let mut tcp = TcpClient::new(addr);
+
+    let rejected =
+        tcp.request(json!({"op":"components","command":{"action":"save","path":"ignored.toml"}}));
+    assert_eq!(rejected["status"], "error");
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `path`"),
+        "{rejected}"
+    );
+    assert_eq!(fs::read_to_string(files.experiment()).unwrap(), initial);
+
+    let mut page = components(
+        &mut tcp,
+        json!({"action":"parameter_set","name":"loop","parameter":"setpoint","value":46.5}),
+    );
+    page = components(
+        &mut tcp,
+        json!({"action":"parameter_set","name":"smooth","parameter":"tau","value":3.75,"expected_revision":page["revision"]}),
+    );
+    for name in ["alternate", "discarded"] {
+        page = components(
+            &mut tcp,
+            json!({"action":"create","configuration":{"name":name,"type_id":"ema","inputs":{"input":SAMPLE},"max_age_ms":5000},"expected_revision":page["revision"]}),
+        );
+    }
+    page = components(
+        &mut tcp,
+        json!({"action":"create","configuration":{"name":"monitor","type_id":"pid","inputs":{"input":"processing/alternate/value"},"max_age_ms":5000},"expected_revision":page["revision"]}),
+    );
+    let mut pid = instance(&page, "loop")["configuration"].clone();
+    pid["inputs"]["input"] = json!("processing/alternate/value");
+    pid["parameters"]["kp"] = json!(1.5);
+    pid["parameters"]["ki"] = json!(0.25);
+    pid["parameters"]["kd"] = json!(0.125);
+    page = components(
+        &mut tcp,
+        json!({"action":"configure","configuration":pid,"expected_revision":page["revision"]}),
+    );
+    page = components(
+        &mut tcp,
+        json!({"action":"state","name":"loop","state":"shadow","expected_revision":page["revision"]}),
+    );
+    page = components(
+        &mut tcp,
+        json!({"action":"bind","name":"loop","target":NEW_TARGET,"command_timeout_ms":1750,"expected_revision":page["revision"]}),
+    );
+    page = components(
+        &mut tcp,
+        json!({"action":"delete","name":"discarded","expected_revision":page["revision"]}),
+    );
+    let revision = page["revision"].as_u64().unwrap();
+    assert_eq!(
+        components(&mut tcp, json!({"action":"save"})),
+        json!({"revision":revision})
+    );
+    assert_eq!(components(&mut tcp, json!({"action":"list"})), page);
+    let saved = fs::read(files.experiment()).unwrap();
+    let loaded = ServerConfig::load(files.main())
+        .unwrap()
+        .processing
+        .unwrap()
+        .components;
+    let names: Vec<_> = loaded
+        .iter()
+        .map(|component| component.configuration.name.as_str())
+        .collect();
+    assert_eq!(names, ["alternate", "loop", "monitor", "smooth"]);
+    assert_eq!(loaded[0].configuration.parameters["tau"], 1.0);
+    assert_eq!(loaded[1].configuration.parameters["setpoint"], 46.5);
+    assert_eq!(loaded[1].configuration.parameters["kp"], 1.5);
+    assert_eq!(loaded[1].configuration.parameters["ki"], 0.25);
+    assert_eq!(loaded[1].configuration.parameters["kd"], 0.125);
+    assert_eq!(
+        loaded[1].configuration.inputs["input"],
+        "processing/alternate/value"
+    );
+    assert_eq!(loaded[1].configuration.max_age_ms, 5000);
+    let binding = loaded[1].binding.as_ref().unwrap();
+    assert_eq!(binding.target, NEW_TARGET);
+    assert_eq!(binding.command_timeout_ms, 1750);
+    assert_eq!(loaded[2].configuration.parameters["kp"], 1.0);
+    assert!(loaded[2].binding.is_none());
+    assert_eq!(loaded[3].configuration.parameters["tau"], 3.75);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(files.experiment())
+            .unwrap();
+        let response = tcp.request(json!({"op":"components","command":{"action":"save"}}));
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"], "experiment_write_failed");
+        drop(held);
+        assert_eq!(fs::read(files.experiment()).unwrap(), saved);
+        assert_eq!(
+            fs::read_dir(files.experiment().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    // One WebSocket and two TCP client threads save the same revision concurrently.
+    let barrier = Barrier::new(3);
+    thread::scope(|scope| {
+        let ws = scope.spawn(|| {
+            barrier.wait();
+            let mut ws = open_ws(ws_addr);
+            ws.send(Message::Text(
+                json!({"id":1,"op":"components","command":{"action":"save"}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+            let reply = next_ws(&mut ws);
+            assert_eq!(
+                reply,
+                json!({"id":1,"status":"ok","data":{"revision":revision}})
+            );
+        });
+        let tcp_saves: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    assert_eq!(
+                        components(&mut TcpClient::new(addr), json!({"action":"save"})),
+                        json!({"revision":revision})
+                    );
+                })
+            })
+            .collect();
+        ws.join().unwrap();
+        for save in tcp_saves {
+            save.join().unwrap();
+        }
+    });
+    assert_eq!(fs::read(files.experiment()).unwrap(), saved);
+    assert_eq!(
+        fs::read_dir(files.experiment().parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+
+    assert!(tcp.get(PID).as_f64().unwrap() > 0.0);
+    let auto = components(
+        &mut tcp,
+        json!({"action":"state","name":"loop","state":"auto","expected_revision":revision}),
+    );
+    assert_eq!(instance(&auto, "loop")["state"], "auto");
+    let before = components(&mut tcp, json!({"action":"outputs"}));
+    assert_eq!(output(&before, NEW_TARGET)["mode"], "auto");
+    assert_eq!(
+        components(&mut tcp, json!({"action":"save"}))["revision"],
+        auto["revision"]
+    );
+    assert_eq!(components(&mut tcp, json!({"action":"list"})), auto);
+    let after = components(&mut tcp, json!({"action":"outputs"}));
+    for field in ["mode", "owner", "generation"] {
+        assert_eq!(
+            output(&before, NEW_TARGET)[field],
+            output(&after, NEW_TARGET)[field]
+        );
+    }
+    assert_eq!(fs::read(files.experiment()).unwrap(), saved);
+
+    drop(tcp);
+    running.shutdown().unwrap().unwrap();
+    {
+        let c = db.connect();
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='save_result' AND json_extract(details_json, '$.status')='ok'"
+            ),
+            5
+        );
+        assert_eq!(
+            db::scalar(
+                &c,
+                "SELECT count(*) FROM audit_events WHERE kind='rejected' AND json_extract(context_json, '$.request.command.action')='save'"
+            ),
+            1
+        );
+        assert_eq!(
+            db::scalar(
+                &c,
+                &format!(
+                    "SELECT count(*) FROM audit_events WHERE kind='save_result' AND json_extract(context_json, '$.source')='websocket' AND json_extract(details_json, '$.revision')={revision}"
+                )
+            ),
+            1
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            db::scalar(
+                &c,
+                &format!(
+                    "SELECT count(*) FROM audit_events WHERE kind='save_result' AND json_extract(details_json, '$.status')='error' AND json_extract(details_json, '$.revision')={revision}"
+                )
+            ),
+            1
+        );
+    }
+
+    let server = open_server();
+    let addr = server.local_addr().unwrap();
+    let mut running = Running::new(server);
+    let mut tcp = TcpClient::new(addr);
+    let restarted = components(&mut tcp, json!({"action":"list"}));
+    assert_eq!(restarted["revision"], 5); // Four Creates and one Bind.
+    for name in names {
+        assert_eq!(
+            instance(&restarted, name)["configuration"],
+            instance(&page, name)["configuration"]
+        );
+    }
+    let pid = instance(&restarted, "loop");
+    assert_eq!(pid["state"], "shadow");
+    assert_eq!(
+        pid["binding"],
+        json!({"target":NEW_TARGET,"command_timeout_ms":1750})
+    );
+    assert_eq!(instance(&restarted, "monitor")["state"], "shadow");
+    let authority = components(&mut tcp, json!({"action":"outputs"}));
+    for key in [POWER, NEW_TARGET] {
+        assert_eq!(output(&authority, key)["mode"], "manual");
+        assert!(output(&authority, key)["owner"].is_null());
+        assert_eq!(tcp.get(key), 0);
+    }
+    drop(tcp);
+    running.shutdown().unwrap().unwrap();
+}
+
+#[test]
+fn inline_save_is_rejected_and_audited_without_rewriting_main_toml() {
+    let files = ExperimentFiles::new();
+    let input = include_str!("../examples/virtual-plant.toml");
+    fs::write(files.main(), input).unwrap();
+    let mut config = ServerConfig::load(files.main()).unwrap();
+    let db = db::Database::new();
+    config.recording.as_mut().unwrap().path = Some(db.0.clone());
+    config.tcp.bind.set_port(0);
+    config.websocket = None;
+    let server = start(&config).unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut running = Running::new(server);
+    let mut tcp = TcpClient::new(addr);
+    let reply = tcp.request(json!({"op":"components","command":{"action":"save"}}));
+    assert_eq!(
+        reply,
+        json!({"id":1,"status":"error","error":"no_experiment_file"})
+    );
+    assert_eq!(fs::read_to_string(files.main()).unwrap(), input);
+    drop(tcp);
+    running.shutdown().unwrap().unwrap();
+    assert_eq!(
+        db::scalar(
+            &db.connect(),
+            "SELECT count(*) FROM audit_events WHERE kind='rejected' AND json_extract(details_json, '$.error')='no_experiment_file' AND json_extract(details_json, '$.revision')=3"
+        ),
+        1
+    );
 }
