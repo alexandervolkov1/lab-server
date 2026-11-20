@@ -78,6 +78,12 @@ impl<T: Read + Write> DeviceIo for BufReader<T> {
     }
 }
 
+impl<T: DeviceIo + ?Sized> DeviceIo for Box<T> {
+    fn send(&mut self, request: &[u8]) -> io::Result<()> {
+        (**self).send(request)
+    }
+}
+
 pub trait Driver {
     fn parameters(&self) -> Vec<ParameterDescription>;
 

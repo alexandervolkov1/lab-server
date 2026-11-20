@@ -1,0 +1,53 @@
+# A hardware-free thermal plant. EMA starts Running and PID starts Shadow.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[websocket]
+enabled = true
+bind = "127.0.0.1:7241"
+allowed_origins = ["http://localhost:3000"]
+
+[recording]
+enabled = true
+audit_enabled = true
+path = "virtual-plant.sqlite3"
+
+[[virtual_ports]]
+id = "simulated_furnace"
+model = "thermal_plant"
+[virtual_ports.options]
+seed = 42
+# Optional overrides use SimulationConfig field names, with nested
+# [virtual_ports.options.parameters] and [virtual_ports.options.initial_state].
+
+[[devices]]
+id = "furnace1"
+driver = "virtual"
+port = "simulated_furnace"
+
+[[processing.components]]
+name = "smooth"
+type_id = "ema"
+max_age_ms = 5000
+[processing.components.inputs]
+input = "furnace1/sample_temperature"
+[processing.components.parameters]
+tau = 2.0
+
+[[processing.components]]
+name = "loop"
+type_id = "pid"
+max_age_ms = 5000
+[processing.components.inputs]
+input = "processing/smooth/value"
+[processing.components.parameters]
+setpoint = 20.0
+kp = 2.0
+ki = 0.1
+kd = 0.0
+output_min = 0.0
+output_max = 100.0
+max_gap = 5.0
+[processing.components.binding]
+target = "furnace1/power"
+command_timeout_ms = 1000

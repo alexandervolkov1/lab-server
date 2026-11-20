@@ -109,6 +109,81 @@ driver = "arduino"
 port = "link1"
 "#;
 
+const VIRTUAL_PORT: &str = r#"
+[[virtual_ports]]
+id = "sim1"
+model = "thermal_plant"
+[virtual_ports.options]
+seed = 42
+"#;
+
+#[test]
+fn virtual_ports_can_be_used_without_physical_ports() {
+    let example = ServerConfig::from_toml(include_str!("../examples/virtual-plant.toml")).unwrap();
+    assert!(example.ports.is_empty());
+    assert_eq!(example.virtual_ports[0].model, "thermal_plant");
+    assert_eq!(example.devices[0].driver, "virtual");
+    let second = VIRTUAL_PORT.replace("sim1", "sim2");
+    let first_device = device("furnace1", "virtual", "sim1");
+    let second_device = device("furnace2", "virtual", "sim2");
+    let mixed = format!("{TCP}{PORT}{VIRTUAL_PORT}{second}{first_device}{second_device}");
+    let config = ServerConfig::from_toml(&mixed).unwrap();
+    assert_eq!(config.ports.len(), 1);
+    assert_eq!(config.virtual_ports.len(), 2);
+}
+
+#[test]
+fn virtual_ports_require_unique_ids_and_matching_drivers_and_options() {
+    let virtual_device = device("furnace1", "virtual", "sim1");
+    let base = format!("{TCP}{VIRTUAL_PORT}{virtual_device}");
+    for (input, diagnostic) in [
+        (
+            base.replace("thermal_plant", "unknown"),
+            "unknown virtual model",
+        ),
+        (base.replace("seed = 42", "seed = -1"), "seed"),
+        (base.replace("seed = 42", "unused = 42"), "unknown field"),
+        (
+            base.replace(
+                "[virtual_ports.options]",
+                "unused = true\n[virtual_ports.options]",
+            ),
+            "unknown field",
+        ),
+        (
+            format!("{base}\n[devices.options]\nseed = 42"),
+            "devices[0].options",
+        ),
+        (format!("{base}{VIRTUAL_PORT}"), "virtual_ports[1].id"),
+        (
+            format!("{base}{}", PORT.replace("link1", "sim1")),
+            "virtual_ports[0].id",
+        ),
+        (
+            format!("{base}{}", device("furnace2", "virtual", "sim1")),
+            "already used",
+        ),
+        (
+            format!("{base}{}", device("furnace1", "virtual", "sim1")),
+            "devices[1].id",
+        ),
+        (
+            format!("devices = []\n{TCP}{VIRTUAL_PORT}"),
+            "must have one device",
+        ),
+        (
+            base.replace("driver = 'virtual'", "driver = 'arduino'"),
+            "devices[0].driver",
+        ),
+        (
+            format!("{TCP}{PORT}{}", device("furnace1", "virtual", "link1")),
+            "devices[0].driver",
+        ),
+    ] {
+        assert_invalid(&input, diagnostic);
+    }
+}
+
 fn single() -> String {
     format!("{TCP}{PORT}{DEVICE}")
 }
@@ -461,7 +536,6 @@ fn tcp_bind_must_be_a_numeric_loopback_socket_address() {
 fn missing_required_fields_have_useful_errors() {
     for (declaration, field) in [
         (TCP, "tcp"),
-        (PORT, "ports"),
         (DEVICE, "devices"),
         ("bind = '127.0.0.1:7240'\n", "bind"),
         ("id = \"link1\"\n", "id"),
@@ -480,6 +554,7 @@ fn missing_required_fields_have_useful_errors() {
         assert!(error.to_string().contains("missing field"), "{error}");
         assert!(error.source().is_some());
     }
+    assert_invalid(&single().replace(PORT, ""), "unknown port");
 }
 
 #[test]

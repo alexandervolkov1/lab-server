@@ -1,7 +1,6 @@
 //! Static configuration parsing and validation, without device or network I/O.
 //!
-//! Ports describe physical connections; devices select drivers independently.
-//! Sharing a port imposes no restrictions on driver names or driver options.
+//! Physical ports can be shared. A virtual port hosts one model and device.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -13,11 +12,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::virtual_device::{VirtualModel, create_model};
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub tcp: TcpConfig,
+    #[serde(default)]
     pub ports: Vec<PortConfig>,
+    #[serde(default)]
+    pub virtual_ports: Vec<VirtualPortConfig>,
     pub devices: Vec<DeviceConfig>,
     pub recording: Option<RecordingConfig>,
     pub websocket: Option<WebSocketConfig>,
@@ -112,6 +116,15 @@ pub struct PortConfig {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VirtualPortConfig {
+    pub id: String,
+    pub model: String,
+    #[serde(default)]
+    pub options: toml::Table,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Parity {
@@ -134,7 +147,7 @@ pub struct DeviceConfig {
     /// Device ID; `/` separates it from the local parameter in global keys.
     pub id: String,
     pub driver: String,
-    /// Reference to a PortConfig.id. Multiple devices may share this reference.
+    /// Physical or virtual port ID. Only physical ports can be shared.
     pub port: String,
     /// Opaque driver settings, including nested tables, arrays and datetimes.
     #[serde(default)]
@@ -193,8 +206,14 @@ impl ServerConfig {
     }
 
     /// Also usable after constructing or editing the public model in memory.
-    /// Returns the first error; no driver implementations or ports are consulted.
+    /// Returns the first error without opening any I/O resources.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_models().map(drop)
+    }
+
+    pub(crate) fn validate_with_models(
+        &self,
+    ) -> Result<HashMap<&str, Box<dyn VirtualModel>>, ConfigError> {
         if let Some(ws) = &self.websocket {
             if ws.enabled && ws.bind.is_none() {
                 return Err(invalid("websocket.bind", "required when enabled"));
@@ -256,13 +275,11 @@ impl ServerConfig {
             let object = format!("ports[{index}]");
             nonempty(&port.id, &format!("{object}.id"))?;
             nonempty(&port.name, &format!("{object}.name"))?;
-            if let Some(previous) = port_ids.insert(port.id.as_str(), index) {
+            if let Some((previous, _)) = port_ids.insert(port.id.as_str(), (object.clone(), false))
+            {
                 return Err(invalid(
                     format!("{object}.id"),
-                    format!(
-                        "duplicate {:?}; already declared in ports[{previous}].id",
-                        port.id
-                    ),
+                    format!("duplicate {:?}; already declared in {previous}.id", port.id),
                 ));
             }
             if let Some(previous) = port_names.insert(port.name.as_str(), index) {
@@ -297,7 +314,23 @@ impl ServerConfig {
             }
         }
 
+        let mut virtual_models = HashMap::new();
+        for (index, port) in self.virtual_ports.iter().enumerate() {
+            let object = format!("virtual_ports[{index}]");
+            nonempty(&port.id, &format!("{object}.id"))?;
+            if let Some((previous, _)) = port_ids.insert(port.id.as_str(), (object.clone(), true)) {
+                return Err(invalid(
+                    format!("{object}.id"),
+                    format!("duplicate {:?}; already declared in {previous}.id", port.id),
+                ));
+            }
+            let model = create_model(&port.model, &port.options)
+                .map_err(|reason| invalid(&object, format!("model {:?}: {reason}", port.model)))?;
+            virtual_models.insert(port.id.as_str(), model);
+        }
+
         let mut device_ids = HashMap::new();
+        let mut virtual_devices = HashMap::new();
         for (index, device) in self.devices.iter().enumerate() {
             let object = format!("devices[{index}]");
             nonempty(&device.id, &format!("{object}.id"))?;
@@ -315,11 +348,34 @@ impl ServerConfig {
             }
             nonempty(&device.driver, &format!("{object}.driver"))?;
             nonempty(&device.port, &format!("{object}.port"))?;
-            if !port_ids.contains_key(device.port.as_str()) {
+            let Some((_, virtual_port)) = port_ids.get(device.port.as_str()) else {
                 return Err(invalid(
                     format!("{object}.port"),
                     format!("unknown port {:?}", device.port),
                 ));
+            };
+            if *virtual_port != (device.driver == "virtual") {
+                return Err(invalid(
+                    format!("{object}.driver"),
+                    "virtual ports and driver = 'virtual' must be used together",
+                ));
+            }
+            if *virtual_port {
+                if !device.options.is_empty() {
+                    return Err(invalid(
+                        format!("{object}.options"),
+                        "configure the model in virtual_ports.options",
+                    ));
+                }
+                if let Some(previous) = virtual_devices.insert(device.port.as_str(), index) {
+                    return Err(invalid(
+                        format!("{object}.port"),
+                        format!(
+                            "virtual port {:?} already used by devices[{previous}]",
+                            device.port
+                        ),
+                    ));
+                }
             }
             for (signal, period) in &device.poll_periods_ms {
                 let field = format!("{object}.poll_periods_ms[{signal:?}]");
@@ -329,7 +385,15 @@ impl ServerConfig {
                 }
             }
         }
-        Ok(())
+        for (index, port) in self.virtual_ports.iter().enumerate() {
+            if !virtual_devices.contains_key(port.id.as_str()) {
+                return Err(invalid(
+                    format!("virtual_ports[{index}].id"),
+                    format!("virtual port {:?} must have one device", port.id),
+                ));
+            }
+        }
+        Ok(virtual_models)
     }
 }
 

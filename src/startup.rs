@@ -26,6 +26,7 @@ use crate::recorder::{
     DataError, Recorder, RecorderHandle, RecorderOptions, RecorderState, SubmitError,
 };
 use crate::tcp::MultiDeviceTcp;
+use crate::virtual_device::{VirtualDeviceIo, VirtualDriver};
 
 type StartupResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const IDLE_WAIT: Duration = Duration::from_millis(5);
@@ -49,7 +50,7 @@ pub struct DriverSetup {
     pub post_open_delay: Duration,
 }
 
-/// Central factory. New drivers validate their own typed/nested options here;
+/// Physical driver factory. New drivers validate their own typed/nested options here;
 /// adding one does not change port opening, worker or TCP lifecycle code.
 pub fn create_driver(device: &DeviceConfig) -> Result<DriverSetup, String> {
     match device.driver.as_str() {
@@ -130,8 +131,8 @@ pub fn start(config: &ServerConfig) -> StartupResult<StartedServer> {
     start_with(config, create_driver, open_serial)
 }
 
-/// Dependency injection for hardware-free integration tests. The factory must
-/// only build/validate a fresh driver; the opener configures I/O and applies the
+/// Dependency injection for physical ports and drivers. The factory must only
+/// build/validate a fresh driver; the opener configures I/O and applies the
 /// requested preparation delay before returning it. No retries are performed.
 pub fn start_with<P: DeviceIo + Send + 'static>(
     config: &ServerConfig,
@@ -139,10 +140,13 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     mut open: impl FnMut(&PortConfig, Duration) -> io::Result<P>,
 ) -> StartupResult<StartedServer> {
     let started_at = std::time::Instant::now();
-    config.validate()?;
+    let mut virtual_models = config.validate_with_models()?;
     let mut grouped = HashMap::<&str, (Vec<DeviceInstance>, Duration)>::new();
     let mut registry = DeviceRegistry::new();
     for port in &config.ports {
+        registry.register_unavailable_port(&port.id, "not opened")?;
+    }
+    for port in &config.virtual_ports {
         registry.register_unavailable_port(&port.id, "not opened")?;
     }
     for (index, device) in config.devices.iter().enumerate() {
@@ -150,7 +154,13 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
             field: format!("devices[{index}] ({:?})", device.id),
             message,
         };
-        let setup = factory(device).map_err(invalid)?;
+        let setup = match virtual_models.get(device.port.as_str()) {
+            Some(model) => DriverSetup {
+                driver: Box::new(VirtualDriver::new(model.as_ref())),
+                post_open_delay: Duration::ZERO,
+            },
+            None => factory(device).map_err(invalid)?,
+        };
         let mut instance = DeviceInstance::new_boxed(&device.id, setup.driver)
             .map_err(|error| invalid(error.to_string()))?;
         for (parameter, millis) in &device.poll_periods_ms {
@@ -198,12 +208,14 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
     // recorder is mandatory; construction failure also releases the listener.
     let mut recording = Recording::open(config)?;
     let prepared_server = (|| -> StartupResult<_> {
-        let mut ports = Vec::with_capacity(config.ports.len());
+        let mut ports = Vec::with_capacity(config.ports.len() + config.virtual_ports.len());
         let mut prepared = Vec::new();
         let mut sources = Vec::new();
-        for port in &config.ports {
-            let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
-            match open(port, delay) {
+        let mut prepare_port = |id: &str,
+                                io: Result<Box<dyn DeviceIo + Send>, String>,
+                                devices|
+         -> Result<(), crate::port_worker::BuildError> {
+            match io {
                 Ok(io) => {
                     let (worker, channels) = PortWorker::with_mode(
                         io,
@@ -212,16 +224,36 @@ pub fn start_with<P: DeviceIo + Send + 'static>(
                         OBSERVATION_QUEUE_CAPACITY,
                         PortMode::Managed(authority.clone()),
                     )?;
-                    ports.push((port.id.clone(), Ok(channels.commands.clone())));
-                    sources.push((port.id.clone(), channels.observations));
-                    prepared.push((port.id.clone(), channels.commands, worker));
+                    ports.push((id.to_owned(), Ok(channels.commands.clone())));
+                    sources.push((id.to_owned(), channels.observations));
+                    prepared.push((id.to_owned(), channels.commands, worker));
                 }
-                Err(error) => {
-                    let reason = format!("cannot open {:?}: {error}", port.name);
-                    eprintln!("Port {:?} unavailable: {reason}", port.id);
-                    ports.push((port.id.clone(), Err(reason)));
+                Err(reason) => {
+                    eprintln!("Port {id:?} unavailable: {reason}");
+                    ports.push((id.to_owned(), Err(reason)));
                 }
             }
+            Ok(())
+        };
+        for port in &config.ports {
+            let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
+            let io = open(port, delay)
+                .map(|io| Box::new(io) as Box<dyn DeviceIo + Send>)
+                .map_err(|error| format!("cannot open {:?}: {error}", port.name));
+            prepare_port(&port.id, io, devices)?;
+        }
+        for port in &config.virtual_ports {
+            let model = virtual_models
+                .remove(port.id.as_str())
+                .expect("validated virtual model");
+            let (devices, _) = grouped
+                .remove(port.id.as_str())
+                .expect("validated virtual device");
+            let io = VirtualDeviceIo::new(model).map_err(|message| ConfigError::Validation {
+                field: format!("virtual port {:?}", port.id),
+                message,
+            })?;
+            prepare_port(&port.id, Ok(Box::new(io)), devices)?;
         }
         tcp.attach_startup_ports(ports, OBSERVATION_QUEUE_CAPACITY);
         if let Some(handle) = &recording.handle {
