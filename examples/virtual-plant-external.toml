@@ -1,0 +1,27 @@
+# Hardware-free thermal plant with an experiment loaded at startup.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[websocket]
+enabled = true
+bind = "127.0.0.1:7241"
+allowed_origins = ["http://localhost:3000"]
+
+[recording]
+enabled = true
+audit_enabled = true
+path = "virtual-plant-external.sqlite3"
+
+[[virtual_ports]]
+id = "simulated_furnace"
+model = "thermal_plant"
+[virtual_ports.options]
+seed = 42
+
+[[devices]]
+id = "furnace1"
+driver = "virtual"
+port = "simulated_furnace"
+
+[processing]
+file = "experiments/thermal-loop.toml"

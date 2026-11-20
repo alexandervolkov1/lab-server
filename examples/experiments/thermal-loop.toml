@@ -1,0 +1,28 @@
+schema_version = 1
+
+[[components]]
+name = "smooth"
+type_id = "ema"
+max_age_ms = 5000
+[components.inputs]
+input = "furnace1/sample_temperature"
+[components.parameters]
+tau = 2.0
+
+[[components]]
+name = "loop"
+type_id = "pid"
+max_age_ms = 5000
+[components.inputs]
+input = "processing/smooth/value"
+[components.parameters]
+setpoint = 35.0
+kp = 2.0
+ki = 0.1
+kd = 0.0
+output_min = 0.0
+output_max = 100.0
+max_gap = 5.0
+[components.binding]
+target = "furnace1/power"
+command_timeout_ms = 1000

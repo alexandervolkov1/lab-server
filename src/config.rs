@@ -29,10 +29,95 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ProcessingSection")]
 pub struct ProcessingConfig {
-    #[serde(default)]
     pub components: Vec<StartupComponent>,
+    source: ProcessingSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ProcessingSource {
+    Inline,
+    Unresolved(PathBuf),
+    External(PathBuf),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessingSection {
+    components: Option<Vec<StartupComponent>>,
+    file: Option<PathBuf>,
+}
+
+impl TryFrom<ProcessingSection> for ProcessingConfig {
+    type Error = &'static str;
+
+    fn try_from(section: ProcessingSection) -> Result<Self, Self::Error> {
+        if section.file.is_some() && section.components.is_some() {
+            return Err("processing.file and processing.components are mutually exclusive");
+        }
+        Ok(Self {
+            components: section.components.unwrap_or_default(),
+            source: section
+                .file
+                .map_or(ProcessingSource::Inline, ProcessingSource::Unresolved),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentDocument {
+    schema_version: u64,
+    components: Vec<StartupComponent>,
+}
+
+impl ProcessingConfig {
+    fn resolve(&mut self, main_path: Option<&Path>) -> Result<(), ConfigError> {
+        let ProcessingSource::Unresolved(path) = &self.source else {
+            return Ok(());
+        };
+        nonempty(&path.to_string_lossy(), "processing.file")?;
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            // On Windows, drive-relative and root-only paths do not have a
+            // well-defined interpretation relative to the main file's directory.
+            if matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
+            ) {
+                return Err(invalid(
+                    "processing.file",
+                    format!(
+                        "{} must be absolute or relative to the main config directory",
+                        path.display()
+                    ),
+                ));
+            }
+            let base = main_path.and_then(Path::parent).ok_or_else(|| invalid(
+                "processing.file",
+                format!("relative path {} requires a main configuration path; use ServerConfig::load", path.display()),
+            ))?;
+            base.join(path)
+        };
+        let input = read_config(&path)?;
+        let document: ExperimentDocument = toml::from_str(&input)
+            .map_err(|error| ConfigError::Parse(error).in_processing_file(&path))?;
+        if document.schema_version != 1 {
+            return Err(invalid(
+                "schema_version",
+                format!(
+                    "unsupported version {}; expected 1",
+                    document.schema_version
+                ),
+            )
+            .in_processing_file(&path));
+        }
+        self.components = document.components;
+        self.source = ProcessingSource::External(path);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -160,9 +245,28 @@ pub struct DeviceConfig {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     Parse(toml::de::Error),
-    Validation { field: String, message: String },
+    Validation {
+        field: String,
+        message: String,
+    },
+    ProcessingFile {
+        path: PathBuf,
+        source: Box<ConfigError>,
+    },
+}
+
+impl ConfigError {
+    fn in_processing_file(self, path: &Path) -> Self {
+        Self::ProcessingFile {
+            path: path.to_owned(),
+            source: Box::new(self),
+        }
+    }
 }
 
 impl fmt::Display for ConfigError {
@@ -173,6 +277,9 @@ impl fmt::Display for ConfigError {
             }
             Self::Parse(source) => write!(f, "invalid TOML config: {source}"),
             Self::Validation { field, message } => write!(f, "{field}: {message}"),
+            Self::ProcessingFile { path, source } => {
+                write!(f, "processing file {}: {source}", path.display())
+            }
         }
     }
 }
@@ -183,14 +290,23 @@ impl Error for ConfigError {
             Self::Io { source, .. } => Some(source),
             Self::Parse(source) => Some(source),
             Self::Validation { .. } => None,
+            Self::ProcessingFile { source, .. } => Some(source),
         }
     }
 }
 
 impl ServerConfig {
-    /// Parse and validate a TOML document. Does not access hardware or bind TCP.
+    /// Parse and validate a TOML document. A processing file must have an
+    /// absolute path here; use `load` for a path relative to the main file.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(input).map_err(ConfigError::Parse)?;
+        Self::parse(input, None)
+    }
+
+    fn parse(input: &str, main_path: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut config: Self = toml::from_str(input).map_err(ConfigError::Parse)?;
+        if let Some(processing) = &mut config.processing {
+            processing.resolve(main_path)?;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -198,11 +314,18 @@ impl ServerConfig {
     /// Read a UTF-8 file, parse it and validate its contents.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let input = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_toml(&input)
+        Self::parse(&read_config(path)?, Some(path))
+    }
+
+    pub(crate) fn processing_error(&self, error: ConfigError) -> ConfigError {
+        match self
+            .processing
+            .as_ref()
+            .map(|processing| &processing.source)
+        {
+            Some(ProcessingSource::External(path)) => error.in_processing_file(path),
+            _ => error,
+        }
     }
 
     /// Also usable after constructing or editing the public model in memory.
@@ -215,6 +338,19 @@ impl ServerConfig {
         &self,
         mut model_factory: impl FnMut(&str, &toml::Table) -> Result<Box<dyn VirtualModel>, String>,
     ) -> Result<HashMap<&str, PreparedVirtualModel>, ConfigError> {
+        if let Some(ProcessingConfig {
+            source: ProcessingSource::Unresolved(path),
+            ..
+        }) = &self.processing
+        {
+            return Err(invalid(
+                "processing.file",
+                format!(
+                    "{} has not been loaded; use ServerConfig::load or ServerConfig::from_toml",
+                    path.display()
+                ),
+            ));
+        }
         if let Some(ws) = &self.websocket {
             if ws.enabled && ws.bind.is_none() {
                 return Err(invalid("websocket.bind", "required when enabled"));
@@ -397,6 +533,13 @@ impl ServerConfig {
         }
         Ok(virtual_models)
     }
+}
+
+fn read_config(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn invalid(field: impl Into<String>, message: impl Into<String>) -> ConfigError {

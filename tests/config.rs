@@ -3,6 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "support/experiment_files.rs"]
+mod experiment_files;
+use experiment_files::ExperimentFiles;
+
 #[test]
 fn processing_example_and_strict_startup_schema() {
     let example = include_str!("../examples/processing.toml");
@@ -47,6 +51,119 @@ fn processing_example_and_strict_startup_schema() {
 use lab_server::config::{ConfigError, FlowControl, Parity, ServerConfig};
 
 const TCP: &str = "[tcp]\nbind = '127.0.0.1:7240'\n";
+const EXPERIMENT: &str = include_str!("../examples/experiments/thermal-loop.toml");
+
+fn external_config(path: &str) -> String {
+    let quoted = serde_json::to_string(path).unwrap();
+    format!("{}\n[processing]\nfile = {quoted}\n", single())
+}
+
+#[test]
+fn loads_external_processing_relative_to_main_or_by_absolute_path() {
+    let files = ExperimentFiles::new();
+    fs::write(files.experiment(), EXPERIMENT).unwrap();
+    fs::write(files.main(), external_config(ExperimentFiles::RELATIVE)).unwrap();
+    let relative = ServerConfig::load(files.main()).unwrap();
+    let components = &relative.processing.as_ref().unwrap().components;
+    assert_eq!(components.len(), 2);
+    assert_eq!(components[0].configuration.name, "smooth");
+    assert_eq!(components[1].configuration.parameters["setpoint"], 35.0);
+    assert_eq!(
+        components[1].binding.as_ref().unwrap().target,
+        "furnace1/power"
+    );
+
+    let absolute_path = files.experiment();
+    assert!(absolute_path.is_absolute());
+    let absolute = external_config(absolute_path.to_str().unwrap());
+    fs::write(files.main(), &absolute).unwrap();
+    assert_eq!(ServerConfig::load(files.main()).unwrap(), relative);
+    assert_eq!(ServerConfig::from_toml(&absolute).unwrap(), relative);
+}
+
+#[test]
+fn string_api_rejects_relative_experiments_without_a_main_path() {
+    let input = external_config("examples/experiments/thermal-loop.toml");
+    let error = assert_invalid(&input, "requires a main configuration path");
+    assert!(error.to_string().contains("ServerConfig::load"));
+
+    let raw: ServerConfig = toml::from_str(&input).unwrap();
+    assert!(
+        raw.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("has not been loaded")
+    );
+}
+
+#[test]
+fn rejects_an_experiment_reference_with_inline_components_even_when_empty() {
+    let config = external_config("missing.toml");
+    for inline in [
+        "components = []",
+        "[[processing.components]]\nname='smooth'\ntype_id='ema'\nmax_age_ms=5000\n[processing.components.inputs]\ninput='furnace1/sample_temperature'",
+    ] {
+        assert_invalid(
+            &format!("{config}{inline}"),
+            "processing.file and processing.components are mutually exclusive",
+        );
+    }
+}
+
+#[test]
+fn external_errors_report_the_file_and_component_where_available() {
+    let files = ExperimentFiles::new();
+    let path = files.experiment();
+    fs::write(files.main(), external_config(ExperimentFiles::RELATIVE)).unwrap();
+    let error = ServerConfig::load(files.main()).unwrap_err();
+    assert!(matches!(&error, ConfigError::Io { path: missing, .. } if *missing == path));
+    assert!(error.to_string().contains(&path.display().to_string()));
+
+    for (document, diagnostic, component) in [
+        ("schema_version = [".into(), "invalid TOML config", None),
+        (
+            EXPERIMENT.replacen("schema_version = 1", "schema_version = 2", 1),
+            "unsupported version 2; expected 1",
+            None,
+        ),
+        (
+            EXPERIMENT.replacen("schema_version = 1", "", 1),
+            "missing field `schema_version`",
+            None,
+        ),
+        (
+            EXPERIMENT.replacen("schema_version = 1", "schema_version = 1\nextra = true", 1),
+            "unknown field `extra`",
+            None,
+        ),
+        (
+            EXPERIMENT.replacen("max_age_ms = 5000", "max_age_ms = 5000\nstate = 'auto'", 1),
+            "unknown field `state`",
+            Some("smooth"),
+        ),
+        (
+            EXPERIMENT.replace(
+                "command_timeout_ms = 1000",
+                "command_timeout_ms = 1000\nowner = 'unexpected'",
+            ),
+            "unknown field `owner`",
+            Some("loop"),
+        ),
+    ] {
+        fs::write(&path, document).unwrap();
+        let error = ServerConfig::load(files.main()).unwrap_err();
+        assert!(error.source().is_some());
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains(diagnostic), "{message}");
+        if let Some(name) = component {
+            assert!(
+                message.contains(&format!("component {name:?}")),
+                "{message}"
+            );
+        }
+    }
+}
 
 #[test]
 fn websocket_is_optional_and_requires_a_loopback_bind_when_enabled() {

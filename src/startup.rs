@@ -193,12 +193,14 @@ fn start_with_model_factory<P: DeviceIo + Send + 'static>(
         CommandRouter::with_authority(registry, authority.clone()),
         OBSERVATION_QUEUE_CAPACITY,
     );
-    let audit = configure_processing(config, &tcp)?;
-    tcp.validate_startup_catalog()
-        .map_err(|reason| ConfigError::Validation {
+    let audit =
+        configure_processing(config, &tcp).map_err(|error| config.processing_error(error))?;
+    tcp.validate_startup_catalog().map_err(|reason| {
+        config.processing_error(ConfigError::Validation {
             field: "describe catalog".into(),
             message: reason.into(),
-        })?;
+        })
+    })?;
 
     // Binding failure is fatal and happens before opening any equipment.
     let listener = TcpListener::bind(config.tcp.bind)?;
