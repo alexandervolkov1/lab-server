@@ -39,8 +39,9 @@ cargo run --release -- --config examples/virtual-plant-external.toml
 
 - **Arduino.** Проверьте фактический COM-порт и параметры линии. Шаблон использует 57600 бод и пустые `options`.
 - **МЕТАКОН.** Проверьте COM-порт, скорость, адрес, канал с отсчётом от нуля, масштаб и единицы.
-  Оставьте `write_enabled = false` для первого подключения. Драйвер проверен на эмуляторе,
-  испытания на физическом приборе ещё нужны. [Инструкция первого подключения](metakon-hardware-test.md)
+  Оставьте `write_enabled = false` для проверки чтения. Автоматические тесты используют
+  эмулятор. Подключение и поведение прибора требуют отдельной проверки.
+  [Инструкция проверки на физическом приборе](metakon-hardware-test.md).
 - **ThermalPlant.** В `[[virtual_ports]]` задайте `model = "thermal_plant"` и при необходимости `seed`
   в `[virtual_ports.options]`. Привяжите один прибор с `driver = "virtual"`. Модель выдаёт
   `heater_temperature`, `sample_temperature` и `room_temperature` в °C и принимает целое `power` от 0 до 100%.

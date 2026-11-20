@@ -3,7 +3,7 @@
 Режим фиксируется при создании worker и не имеет setter. Обычный TOML startup
 использует только Managed: после подготовки каталогов создаётся одна `Arc<Authority>`
 со всеми writable global keys, включая каталоги недоступных портов. Та же Authority
-передаётся всем worker и CommandRouter. Драйверы и алгоритмы компонентов не меняются.
+передаётся всем worker и CommandRouter.
 
 При самостоятельной композиции Rust-приложения:
 
@@ -17,19 +17,17 @@ let (worker, channels) = PortWorker::with_mode(
 let router = CommandRouter::with_authority(registry, authority);
 ```
 
-`PortWorker::new(...)` остаётся совместимым сокращением для Standalone. Этот режим
-предназначен для отдельных утилит и тестов драйверов: прямые `PortHandle::set` и
-`invoke_action` работают по прежним правилам без создания DeviceService/Authority.
-Standalone нельзя превратить в Managed после создания. `CommandRouter::new(registry)`
-сохраняет прежнее поведение — создаёт свою Authority; для Managed используйте
-`with_authority` с исходной общей Arc. Ошибочно выбранная другая Authority не даёт
+`PortWorker::new(...)` создаёт Standalone для отдельных утилит и тестов драйверов.
+Прямые `PortHandle::set` и `invoke_action` доступны без DeviceService и Authority.
+`CommandRouter::new(registry)` создаёт собственную Authority. Для Managed используйте
+`with_authority` с общей `Arc<Authority>`. Ошибочно выбранная другая Authority не даёт
 доступ к Managed I/O: worker отклонит такой Permit.
 
 В Managed прямой PortHandle-запрос без Permit может быть принят в ограниченную очередь,
 но завершится `CommandError::Unauthorized` (`output_not_authorized`) до вызова драйвера.
 Это одинаково действует в Manual и Auto, для set и action. Ошибка не останавливает порт,
-не считается outcome_unknown и не означает физическую потерю наблюдений. Read/shutdown
-сохраняют прежние правила; shutdown не является записью безопасной мощности.
+не считается outcome_unknown и не означает потерю наблюдений. Чтение и shutdown
+не требуют Permit. При shutdown команда записи безопасной мощности не отправляется.
 
 Permit содержит неизменяемые issuer identity и множество ключей. Worker самостоятельно
 выводит ожидаемые ключи из своего каталога: один global key для set, все writable-выходы
@@ -40,14 +38,12 @@ Permit содержит неизменяемые issuer identity и множес
 компонентов не анализируются.
 
 Проверка выполняется непосредственно перед `begin`/`SetExecution::try_start`.
-Там сохраняются прежние атомарные проверки deadline, поколений владельца и источников,
+Эта граница также атомарно проверяет deadline, поколения владельца и источников,
 source_alive и in-flight. Identity/scope неизменяемы, поэтому между их проверкой и
 try_start их нельзя подменить. Отзыв до начала отменяет команду. Начатый I/O удерживает
 выход до завершения; таймаут остаётся outcome_unknown, поздний ответ не снимает латч
-Auto и не вызывает повтор записи. Физический I/O остаётся только в существующем worker.
+Auto и не вызывает повтор записи. I/O выполняет worker, владеющий портом.
 
-Совместимость Rust API: сигнатуры существующих конструкторов, set и invoke_action
-сохранены; добавлены PortMode, with_mode и with_authority. В публичный CommandError
-добавлен Unauthorized: внешние исчерпывающие match должны обработать новый вариант.
-Сетевой формат — v1. Это контроль корректного использования
-доверенным Rust-кодом внутри процесса, а не изоляция злонамеренного native-кода.
+В исчерпывающем `match` по публичному `CommandError` учитывайте `Unauthorized`.
+Сетевой формат — v1. Permit предназначен для контроля вызовов доверенного Rust-кода
+внутри процесса.
