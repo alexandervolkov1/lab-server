@@ -1,6 +1,6 @@
 # Протокол lab-server v1
 
-[Краткий справочник и запуск](../README.md) · [Архитектура](architecture.md)
+[Краткий справочник и запуск](user-guide.md) · [Архитектура](architecture.md)
 
 Дополнительная операция `components` описана в [API компонентов](processing-api.md).
 Read-only операция `server_status` описана в [диагностике сервера](server-status.md)

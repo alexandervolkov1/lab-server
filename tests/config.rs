@@ -748,16 +748,15 @@ fn explicitly_empty_port_and_device_lists_are_allowed() {
 
 #[test]
 fn shipped_example_loads_and_matches_string_api() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/lab-server.toml");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/processing.toml");
     let config = ServerConfig::load(path).unwrap();
     assert_eq!(
         config,
-        ServerConfig::from_toml(include_str!("../examples/lab-server.toml")).unwrap()
+        ServerConfig::from_toml(include_str!("../examples/processing.toml")).unwrap()
     );
-    assert_eq!(config.ports.len(), 2);
-    assert_eq!(config.devices.len(), 3);
-    assert_eq!(config.devices[1].port, config.devices[2].port);
-    assert_ne!(config.devices[1].driver, config.devices[2].driver);
+    assert_eq!(config.ports.len(), 1);
+    assert_eq!(config.devices[0].driver, "arduino");
+    assert_eq!(config.processing.unwrap().components.len(), 2);
 }
 
 struct TestFile(PathBuf);

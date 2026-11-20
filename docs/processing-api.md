@@ -1,5 +1,7 @@
 # Общий API компонентов (TCP / WebSocket)
 
+[Краткое руководство пользователя](user-guide.md)
+
 Начальные экземпляры можно объявить в необязательной секции TOML
 `[[processing.components]]`: поля существующей `Configuration` (`name`, `type_id`,
 `inputs`, `parameters`, `max_age_ms`) и необязательная таблица `binding` с `target`
