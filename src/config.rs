@@ -266,6 +266,9 @@ pub struct PortConfig {
     pub stop_bits: u8,
     pub flow_control: FlowControl,
     pub timeout_ms: u64,
+    /// Minimum host-side gap before the next request. Zero disables the guard.
+    #[serde(default)]
+    pub bus_silence_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -11,12 +11,14 @@ use lab_server::driver::{DeviceIo, Driver, DriverError, PortState};
 use lab_server::model::{ParameterDescription, Spec, Value};
 use lab_server::pending::{Completion, Poll};
 use lab_server::port_worker::{DeviceInstance, PortHandle, PortWorker, StopReason};
+use lab_server::session::Session;
 use lab_server::startup::{create_driver, start_with};
 
 struct Exchange {
     request: Vec<u8>,
     reply: Vec<u8>,
     chunk_size: usize,
+    chunk_delay: Duration,
     read_error: Option<io::ErrorKind>,
     minimum_idle: Duration,
 }
@@ -27,6 +29,7 @@ impl Exchange {
             request: request.into(),
             reply: reply.into(),
             chunk_size: usize::MAX,
+            chunk_delay: Duration::ZERO,
             read_error: None,
             minimum_idle: Duration::ZERO,
         }
@@ -69,6 +72,9 @@ impl BufRead for Bus {
             && let Some(kind) = exchange.read_error
         {
             return Err(io::Error::from(kind));
+        }
+        if self.offset != 0 && !exchange.chunk_delay.is_zero() {
+            thread::sleep(exchange.chunk_delay);
         }
         Ok(&data[..data.len().min(exchange.chunk_size)])
     }
@@ -170,7 +176,7 @@ fn v1_frame(body: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn startup_opens_one_simulated_port_and_registers_both_drivers() {
+fn startup_paces_mixed_protocols_and_metakon_readback_on_one_port() {
     let config = ServerConfig::from_toml(
         r#"
 [tcp]
@@ -186,6 +192,7 @@ parity = "none"
 stop_bits = 1
 flow_control = "none"
 timeout_ms = 1000
+bus_silence_ms = 35
 [[devices]]
 id = "rrg"
 driver = "rrg12"
@@ -194,6 +201,18 @@ port = "bus"
 address = 3
 [devices.poll_periods_ms]
 flow_percent = 60000
+[[devices]]
+id = "meta"
+driver = "metakon"
+port = "bus"
+[devices.options]
+address = 10
+channel = 0
+process_value_scale = 1.0
+write_enabled = true
+[devices.poll_periods_ms]
+measurement = 60000
+output_power = 60000
 [[devices]]
 id = "vac"
 driver = "erstevak"
@@ -205,11 +224,37 @@ pressure = 60000
 "#,
     )
     .unwrap();
-    let script = Arc::new(Mutex::new(VecDeque::from([
+    let mut ack = Exchange::new(
+        metakon_frame(&[10, 0, 2, 1, 4, 123, 0]),
+        metakon_frame(&[10, 0, 2, 1]),
+    );
+    // The final ACK byte arrives after the guard measured from the request
+    // or the first ACK byte would have expired.
+    ack.chunk_size = 1;
+    ack.chunk_delay = Duration::from_millis(12);
+    let mut exchanges = VecDeque::from([
         Exchange::new(rtu_read(3, 3, 5), rtu_frame(&[3, 3, 2, 0, 100])),
+        Exchange::new(
+            metakon_frame(&[10, 0, 1, 0]),
+            metakon_frame(&[10, 0, 1, 0, 0x44, 42, 0]),
+        ),
         Exchange::new(b"001M^\r", b"001M982122V\r"),
+        Exchange::new(
+            metakon_frame(&[10, 0, 6, 0]),
+            metakon_frame(&[10, 0, 6, 0, 0xc2, 15]),
+        ),
         Exchange::new(rtu_read(3, 3, 1), rtu_frame(&[3, 3, 2, 0, 90])),
-    ])));
+        ack,
+        Exchange::new(
+            metakon_frame(&[10, 0, 2, 0]),
+            metakon_frame(&[10, 0, 2, 0, 0xc4, 123, 0]),
+        ),
+        Exchange::new(b"001M^\r", b"001M982122V\r"),
+    ]);
+    for exchange in exchanges.iter_mut().skip(1) {
+        exchange.minimum_idle = Duration::from_millis(35);
+    }
+    let script = Arc::new(Mutex::new(exchanges));
     let mut opened = 0;
     let server = start_with(&config, create_driver, |port, delay| {
         opened += 1;
@@ -228,13 +273,37 @@ pressure = 60000
         "bus"
     );
     assert_eq!(registry.parameter("vac/pressure").unwrap().port_id, "bus");
+    assert_eq!(
+        registry.parameter("meta/measurement").unwrap().port_id,
+        "bus"
+    );
     let handle = registry.port("bus").unwrap().handle().unwrap();
     let limit = Instant::now() + Duration::from_secs(5);
-    while script.lock().unwrap().len() > 1 {
+    while script.lock().unwrap().len() > 4 {
         assert!(Instant::now() < limit, "initial polls did not run");
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(read(handle, "rrg", "serial_number"), Ok(Value::Integer(90)));
+
+    let mut session = Session::new(8, 4096);
+    server
+        .backend()
+        .receive_message(
+            &mut session,
+            r#"{"id":1,"op":"set","key":"meta/setpoint","value":123}"#,
+            Instant::now(),
+        )
+        .unwrap();
+    let result = loop {
+        session.collect_ready(Instant::now()).unwrap();
+        if let Some(message) = session.next_message().unwrap() {
+            break serde_json::from_str::<serde_json::Value>(&message).unwrap();
+        }
+        assert!(Instant::now() < limit, "set and readback did not complete");
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(read(handle, "vac", "pressure"), Ok(Value::Float(982.1)));
     assert!(script.lock().unwrap().is_empty());
 }
 
@@ -527,5 +596,38 @@ fn cross_protocol_crc_overlap_is_possible_for_metakon_reads() {
         assert!(!rtu_crc_matches(&v1_frame(
             format!("{address:03}M").as_bytes()
         )));
+    }
+}
+
+#[test]
+fn misaligned_rtu_flow_replies_can_match_metakon_read_frames() {
+    let metakon_read = |frame: &[u8]| {
+        frame[1] <= 2 && frame[2] <= 14 && frame[3] == 0 && metakon_crc(&frame[..4]) == frame[4]
+    };
+    let mut overlaps = 0;
+    for address in 1..=247 {
+        for register in 0..=6 {
+            assert!(!rtu_read(address, 3, register).windows(5).any(metakon_read));
+        }
+        // Normal seven-byte FC03 replies can yield five-byte windows at offsets
+        // 0, 1 or 2. Offset 0 has a channel byte of 3. Negative flow encodings
+        // have a high data byte >= 128, ruling out offsets 1 and 2.
+        for raw in 0_u16..=13_000 {
+            let [high, low] = raw.to_be_bytes();
+            if !(high <= 14 && low == 0 || high <= 2 && low <= 14) {
+                continue;
+            }
+            let reply = rtu_frame(&[address, 3, 2, high, low]);
+            assert!(!metakon_read(&reply[..5]));
+            for frame in reply.windows(5).filter(|frame| metakon_read(frame)) {
+                assert!(matches!(frame[0], 2 | 3));
+                overlaps += 1;
+            }
+        }
+    }
+    assert_eq!(overlaps, 28);
+    for address in 1..=999 {
+        let request = v1_frame(format!("{address:03}M").as_bytes());
+        assert!(!request.windows(5).any(metakon_read));
     }
 }

@@ -1,0 +1,62 @@
+# Three METAKON 5X3 and one RRG-12 on a shared RS-485 port, read-only.
+# Confirm physical compatibility and replace the COM name, addresses and
+# METAKON channels/scales with the settings of the actual instruments.
+[tcp]
+bind = "127.0.0.1:7240"
+
+[recording]
+enabled = false
+
+[[ports]]
+id = "rs485"
+name = "REPLACE_WITH_ACTUAL_COM_PORT"
+# Candidate common format. The RRG-12 factory baud is 19200.
+baud = 9600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+flow_control = "none"
+timeout_ms = 1000
+bus_silence_ms = 20
+
+[[devices]]
+id = "metakon1"
+driver = "metakon"
+port = "rs485"
+
+[devices.options]
+address = 10
+channel = 0
+process_value_scale = 1.0 # raw counts
+write_enabled = false
+
+[[devices]]
+id = "metakon2"
+driver = "metakon"
+port = "rs485"
+
+[devices.options]
+address = 11
+channel = 0
+process_value_scale = 1.0 # raw counts
+write_enabled = false
+
+[[devices]]
+id = "metakon3"
+driver = "metakon"
+port = "rs485"
+
+[devices.options]
+address = 12
+channel = 0
+process_value_scale = 1.0 # raw counts
+write_enabled = false
+
+[[devices]]
+id = "rrg"
+driver = "rrg12"
+port = "rs485"
+
+[devices.options]
+address = 3
+write_enabled = false

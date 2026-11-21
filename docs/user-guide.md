@@ -23,6 +23,7 @@ cargo run --release -- --config examples/virtual-plant-external.toml
 | [arduino.toml](../examples/arduino.toml) | Физическая Arduino |
 | [processing.toml](../examples/processing.toml) | Arduino с EMA и PID |
 | [metakon-readonly.toml](../examples/metakon-readonly.toml) | Первый запуск МЕТАКОН в режиме чтения |
+| [rs485-readonly.toml](../examples/rs485-readonly.toml) | Три МЕТАКОН и РРГ-12 на общей RS-485, только чтение |
 | [websocket.toml](../examples/websocket.toml) | Проверка обоих транспортов с пустым каталогом |
 
 ## Файлы конфигурации и приборы
@@ -37,11 +38,24 @@ cargo run --release -- --config examples/virtual-plant-external.toml
 между совместимыми приборами. Необязательная таблица `[devices.poll_periods_ms]` переопределяет
 периоды опроса по локальным именам сигналов, в миллисекундах.
 
+В `[[ports]]` можно указать `bus_silence_ms = 20`. Перед каждым следующим запросом сервер
+дожидается остатка интервала от последнего байта, полученного драйвером. Пауза общая для всех
+приборов, включая последовательные запросы внутри драйвера. Если кадр ответа отсутствует,
+отсчёт начинается после возврата операции отправки. Отсутствующее поле или `0` отключает
+дополнительную паузу. Настройки UART общие для всех приборов на этом порту.
+[Границы программной проверки RS-485](erstevak-driver.md#совместная-rs-485)
+
 - **Arduino.** Проверьте фактический COM-порт и параметры линии. Шаблон использует 57600 бод и пустые `options`.
 - **МЕТАКОН.** Проверьте COM-порт, скорость, адрес, канал с отсчётом от нуля, масштаб и единицы.
   Оставьте `write_enabled = false` для проверки чтения. Автоматические тесты используют
   эмулятор. Подключение и поведение прибора требуют отдельной проверки.
   [Инструкция проверки на физическом приборе](metakon-hardware-test.md).
+- **РРГ-12 (`rrg12`).** Укажите `address` в `devices.options` и подтвердите режим РРГ и
+  UART. `flow_percent` читается по Modbus RTU и выражен в процентах полной шкалы.
+  [Руководство драйвера РРГ-12](rrg12-driver.md)
+- **Erstevak MTM9D-KF25 (`erstevak`).** Укажите в `devices.options` целочисленный
+  адрес `address`. Драйвер читает `pressure` в mbar. Подтвердите Thyracont V1 на вашей ревизии.
+  [Руководство драйвера Erstevak](erstevak-driver.md)
 - **ThermalPlant.** В `[[virtual_ports]]` задайте `model = "thermal_plant"` и при необходимости `seed`
   в `[virtual_ports.options]`. Привяжите один прибор с `driver = "virtual"`. Модель выдаёт
   `heater_temperature`, `sample_temperature` и `room_temperature` в °C и принимает целое `power` от 0 до 100%.

@@ -16,7 +16,8 @@ use crate::command_router::CommandRouter;
 use crate::config::{ConfigError, DeviceConfig, FlowControl, Parity, PortConfig, ServerConfig};
 use crate::device_registry::DeviceRegistry;
 use crate::driver::{
-    DeviceIo, Driver, arduino::Arduino, erstevak::Erstevak, metakon::Metakon, rrg12::Rrg12,
+    DeviceIo, Driver, arduino::Arduino, bus_silence::BusSilence, erstevak::Erstevak,
+    metakon::Metakon, rrg12::Rrg12,
 };
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::{
@@ -143,7 +144,8 @@ pub fn start(config: &ServerConfig) -> StartupResult<StartedServer> {
 
 /// Dependency injection for physical ports and drivers. The factory must only
 /// build/validate a fresh driver; the opener configures I/O and applies the
-/// requested preparation delay before returning it. No retries are performed.
+/// requested preparation delay before returning it. Startup applies optional
+/// bus silence to the returned I/O. No retries are performed.
 pub fn start_with<P: DeviceIo + Send + 'static>(
     config: &ServerConfig,
     factory: impl FnMut(&DeviceConfig) -> Result<DriverSetup, String>,
@@ -260,7 +262,16 @@ fn start_with_model_factory<P: DeviceIo + Send + 'static>(
         for port in &config.ports {
             let (devices, delay) = grouped.remove(port.id.as_str()).unwrap_or_default();
             let io = open(port, delay)
-                .map(|io| Box::new(io) as Box<dyn DeviceIo + Send>)
+                .map(|io| -> Box<dyn DeviceIo + Send> {
+                    if port.bus_silence_ms == 0 {
+                        Box::new(io)
+                    } else {
+                        Box::new(BusSilence::new(
+                            io,
+                            Duration::from_millis(port.bus_silence_ms),
+                        ))
+                    }
+                })
                 .map_err(|error| format!("cannot open {:?}: {error}", port.name));
             prepare_port(&port.id, io, devices)?;
         }

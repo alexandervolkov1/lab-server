@@ -332,12 +332,55 @@ fn one_arduino_on_one_port() {
     assert_eq!(port.stop_bits, 1);
     assert_eq!(port.flow_control, FlowControl::None);
     assert_eq!(port.timeout_ms, 3000);
+    assert_eq!(port.bus_silence_ms, 0);
     assert_eq!(config.devices.len(), 1);
     assert_eq!(config.devices[0].id, "furnace1");
     assert_eq!(config.devices[0].port, "link1");
     assert_eq!(config.devices[0].driver, "arduino");
     assert!(config.devices[0].options.is_empty());
     assert!(config.devices[0].poll_periods_ms.is_empty());
+}
+
+#[test]
+fn shared_rs485_example_has_one_paced_port_and_only_read_only_parameters() {
+    let example = include_str!("../examples/rs485-readonly.toml");
+    let config = ServerConfig::from_toml(example).unwrap();
+    assert_eq!(config.ports.len(), 1);
+    let port = &config.ports[0];
+    assert_eq!(port.bus_silence_ms, 20);
+    assert_eq!(config.devices.len(), 4);
+    assert_eq!(
+        config
+            .devices
+            .iter()
+            .filter(|d| d.driver == "metakon")
+            .count(),
+        3
+    );
+    assert_eq!(
+        config
+            .devices
+            .iter()
+            .filter(|d| d.driver == "rrg12")
+            .count(),
+        1
+    );
+    for device in config.devices {
+        assert_eq!(device.port, port.id);
+        let driver = lab_server::startup::create_driver(&device).unwrap().driver;
+        let parameters = driver.parameters();
+        assert!(!parameters.is_empty());
+        assert!(parameters.iter().all(|p| !p.writable));
+        assert!(driver.actions().is_empty());
+    }
+    for value in ["-1", "\"20\"", "1.5"] {
+        assert!(
+            ServerConfig::from_toml(
+                &example.replace("bus_silence_ms = 20", &format!("bus_silence_ms = {value}"))
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

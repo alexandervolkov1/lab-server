@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use crate::model::{ActionDescription, ParameterDescription, Value};
 
 pub mod arduino;
+pub(crate) mod bus_silence;
 pub mod erstevak;
 pub mod metakon;
 pub mod modbus_rtu;
