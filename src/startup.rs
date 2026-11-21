@@ -15,7 +15,9 @@ use crate::client_limit::MAX_CLIENTS;
 use crate::command_router::CommandRouter;
 use crate::config::{ConfigError, DeviceConfig, FlowControl, Parity, PortConfig, ServerConfig};
 use crate::device_registry::DeviceRegistry;
-use crate::driver::{DeviceIo, Driver, arduino::Arduino, metakon::Metakon};
+use crate::driver::{
+    DeviceIo, Driver, arduino::Arduino, erstevak::Erstevak, metakon::Metakon, rrg12::Rrg12,
+};
 use crate::observation_aggregator::{AggregatorEvent, ObservationAggregator};
 use crate::port_worker::{
     COMMAND_QUEUE_CAPACITY, DeviceInstance, DeviceObservation, OBSERVATION_QUEUE_CAPACITY,
@@ -73,6 +75,14 @@ pub fn create_driver(device: &DeviceConfig) -> Result<DriverSetup, String> {
         }
         "metakon" => Ok(DriverSetup {
             driver: Box::new(Metakon::from_options(&device.options)?),
+            post_open_delay: Duration::ZERO,
+        }),
+        "rrg12" => Ok(DriverSetup {
+            driver: Box::new(Rrg12::from_options(&device.options)?),
+            post_open_delay: Duration::ZERO,
+        }),
+        "erstevak" => Ok(DriverSetup {
+            driver: Box::new(Erstevak::from_options(&device.options)?),
             post_open_delay: Duration::ZERO,
         }),
         name => Err(format!("unknown driver {name:?}")),
